@@ -3,6 +3,18 @@ generator client {
   output   = "../src/generated/prisma"
 }
 
+// Auto-derived Zod schemas for every model + enum. Used as the source of
+// truth for input validation + OpenAPI request/response schemas. Picking
+// `pure` variants (no Prisma-client type helpers) keeps them usable from
+// any consumer — server routes, client bundles, migrations.
+generator zod {
+  provider       = "prisma-zod-generator"
+  output         = "../src/generated/zod"
+  useMultipleFiles = true
+  createInputTypes = false
+  createModelTypes = true
+}
+
 datasource db {
   provider = "postgresql"
 }

@@ -10,6 +10,21 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    # AOF + fsync-every-second keeps rate-limit counters durable across
+    # restarts at the cost of one extra write per request, which is
+    # negligible for this workload.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
   centrifugo:
     image: centrifugo/centrifugo:v6
     ports:
@@ -20,3 +35,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:

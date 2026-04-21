@@ -1,41 +1,97 @@
-function required(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing environment variable: ${name}`);
-  return value;
+import { z } from "zod";
+
+/**
+ * Single source of truth for environment configuration.
+ *
+ * Validated with Zod at boot so a malformed or missing value fails loudly
+ * before the server accepts any traffic. Production boot is `process.exit(1)`
+ * on validation failure — we do not want silent misconfiguration.
+ *
+ * Non-infra integration secrets (e.g. S3_*, VAPID_*, CENTRIFUGO_*) stay in
+ * this file for now because moving them demands a module registry refactor
+ * we're doing separately. When that ships, those fields migrate to per-
+ * module `*.config.ts` files.
+ */
+const EnvSchema = z.object({
+  NODE_ENV: z
+    .enum(["development", "test", "production"])
+    .default("development"),
+  PORT: z.coerce.number().int().positive().default(3001),
+
+  // Core infra (required)
+  DATABASE_URL: z.string().min(1),
+  BETTER_AUTH_SECRET: z.string().min(1),
+  BETTER_AUTH_URL: z.string().url(),
+  CENTRIFUGO_API_KEY: z.string().min(1),
+  CENTRIFUGO_TOKEN_SECRET: z.string().min(1),
+  CENTRIFUGO_URL: z.url(),
+
+  // Observability / runtime
+  LOG_LEVEL: z
+    .enum(["fatal", "error", "warn", "info", "debug", "trace"])
+    .optional(),
+  TRUST_PROXY: z.coerce.number().int().nonnegative().default(1),
+  SHUTDOWN_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(15_000),
+  DB_POOL_MAX: z.coerce.number().int().positive().default(10),
+
+  // Redis — used by rate limiter + (future) outbox worker + caches
+  REDIS_URL: z.string().min(1).default("redis://localhost:6379"),
+
+  // CORS allowlist (comma separated). Falls back to dev defaults.
+  CORS_ALLOWED_ORIGINS: z.string().optional(),
+
+  // Optional — S3-compatible object storage. Attachments endpoint
+  // throws a clear error if accessed without these set.
+  S3_ENDPOINT: z.string().optional(),
+  S3_REGION: z.string().optional(),
+  S3_BUCKET: z.string().optional(),
+  S3_ACCESS_KEY_ID: z.string().optional(),
+  S3_SECRET_ACCESS_KEY: z.string().optional(),
+  S3_PUBLIC_URL_BASE: z.string().optional(),
+
+  // Optional — Web Push (VAPID). Push endpoints 503 if missing.
+  VAPID_PUBLIC_KEY: z.string().optional(),
+  VAPID_PRIVATE_KEY: z.string().optional(),
+  VAPID_SUBJECT: z.string().optional(),
+});
+
+const parsed = EnvSchema.safeParse(process.env);
+if (!parsed.success) {
+  // Avoid leaking full env; print only the Zod error tree which names
+  // the invalid fields without their values.
+  console.error(
+    "Invalid environment variables:",
+    JSON.stringify(parsed.error.format(), null, 2),
+  );
+  process.exit(1);
 }
 
-function optional(name: string): string | undefined {
-  const value = process.env[name];
-  return value && value.length > 0 ? value : undefined;
+export const env = parsed.data;
+export const isProduction = env.NODE_ENV === "production";
+export const isTest = env.NODE_ENV === "test";
+
+/**
+ * Enforce UTC at startup. Consistent timezones keep logs + DB timestamps
+ * + cron schedules predictable across deploys. In prod we hard-fail;
+ * in dev we just warn so a developer can keep working.
+ */
+{
+  const requestedTz = process.env["TZ"];
+  const resolvedTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if (requestedTz !== "UTC" || resolvedTz !== "UTC") {
+    if (isProduction) {
+      console.error(
+        `[env] process must run with TZ=UTC (requested=${requestedTz ?? "unset"}, resolved=${resolvedTz}).`,
+      );
+      process.exit(1);
+    } else {
+      console.warn(
+        `[env] process timezone is not UTC (resolved=${resolvedTz}). Run with TZ=UTC for parity with production.`,
+      );
+    }
+  }
 }
-
-export const env = {
-  DATABASE_URL: required("DATABASE_URL"),
-  BETTER_AUTH_SECRET: required("BETTER_AUTH_SECRET"),
-  BETTER_AUTH_URL: required("BETTER_AUTH_URL"),
-  CENTRIFUGO_API_KEY: required("CENTRIFUGO_API_KEY"),
-  CENTRIFUGO_TOKEN_SECRET: required("CENTRIFUGO_TOKEN_SECRET"),
-  CENTRIFUGO_URL: required("CENTRIFUGO_URL"),
-  PORT: process.env.PORT || "3001",
-
-  // S3-compatible object storage for attachments. All optional — the
-  // upload-url endpoint fails loudly if any are missing, so the rest of
-  // the app can still boot before you configure a bucket.
-  S3_ENDPOINT: optional("S3_ENDPOINT"), // blank for AWS; set for R2/MinIO/B2.
-  S3_REGION: optional("S3_REGION"),
-  S3_BUCKET: optional("S3_BUCKET"),
-  S3_ACCESS_KEY_ID: optional("S3_ACCESS_KEY_ID"),
-  S3_SECRET_ACCESS_KEY: optional("S3_SECRET_ACCESS_KEY"),
-  S3_PUBLIC_URL_BASE: optional("S3_PUBLIC_URL_BASE"),
-
-  // Web Push (VAPID). All optional — push endpoints throw with a clear
-  // message if called without them set. Generate a fresh keypair with:
-  //   node -e "const w=require('web-push'); console.log(w.generateVAPIDKeys())"
-  VAPID_PUBLIC_KEY: optional("VAPID_PUBLIC_KEY"),
-  VAPID_PRIVATE_KEY: optional("VAPID_PRIVATE_KEY"),
-  VAPID_SUBJECT: optional("VAPID_SUBJECT"), // e.g. mailto:admin@example.com
-
-  // Comma-separated list of origins allowed by CORS + better-auth. Keeps
-  // dev defaults if unset. Production must set this explicitly.
-  CORS_ALLOWED_ORIGINS: optional("CORS_ALLOWED_ORIGINS"),
-};

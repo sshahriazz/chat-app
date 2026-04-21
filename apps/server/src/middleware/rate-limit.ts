@@ -1,17 +1,36 @@
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import RedisStore from "rate-limit-redis";
 import type { Request, Response, NextFunction } from "express";
 import type { AuthenticatedRequest } from "./auth";
+import { redis } from "../infra/redis";
 
 /**
- * In-process rate limiters. Good enough for single-instance deployment;
- * once we run N app instances, swap the store for Redis via
- * `rate-limit-redis` so the per-user quota is shared.
+ * Redis-backed rate limiters.
+ *
+ * Using a shared Redis store means per-user (and per-IP) quotas are
+ * enforced globally across all app instances — a user can't bypass the
+ * limit by landing on a different pod. Local memory store would let
+ * each pod serve its own N requests, multiplying the effective cap.
  *
  * Keys are user ids when an authenticated session is present (after
  * `requireAuth` has run), falling back to IP otherwise. IP alone is a
  * blunt instrument — NAT means many users share IPs — so the user-id
  * path is preferred.
  */
+
+// Keyspace prefix per limiter so counters from different endpoints
+// don't collide in Redis.
+function makeStore(prefix: string) {
+  return new RedisStore({
+    prefix: `rl:${prefix}:`,
+    // ioredis v5 exposes `call` directly; rate-limit-redis expects a
+    // function returning the Redis reply. We lose a little type fidelity
+    // here but the library only cares about shape, not precise nullability.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sendCommand: ((...args: string[]) =>
+      redis.call(args[0] as string, ...args.slice(1))) as any,
+  });
+}
 function userKey(req: Request, _res: Response): string {
   const userId = (req as AuthenticatedRequest).user?.id;
   if (userId) return `u:${userId}`;
@@ -37,6 +56,7 @@ export const sendMessageLimiter = rateLimit({
   standardHeaders: "draft-8",
   legacyHeaders: false,
   keyGenerator: userKey,
+  store: makeStore("send"),
   handler: (req, res, _next, options) =>
     json413(res, options.windowMs),
 });
@@ -48,6 +68,7 @@ export const typingLimiter = rateLimit({
   standardHeaders: false,
   legacyHeaders: false,
   keyGenerator: userKey,
+  store: makeStore("typing"),
   handler: (req, res, _next, options) =>
     json413(res, options.windowMs),
 });
@@ -59,6 +80,7 @@ export const uploadUrlLimiter = rateLimit({
   standardHeaders: "draft-8",
   legacyHeaders: false,
   keyGenerator: userKey,
+  store: makeStore("upload"),
   handler: (req, res, _next, options) =>
     json413(res, options.windowMs),
 });
@@ -70,6 +92,7 @@ export const searchLimiter = rateLimit({
   standardHeaders: false,
   legacyHeaders: false,
   keyGenerator: userKey,
+  store: makeStore("search"),
   handler: (req, res, _next, options) =>
     json413(res, options.windowMs),
 });
@@ -81,6 +104,7 @@ export const generalLimiter = rateLimit({
   standardHeaders: "draft-8",
   legacyHeaders: false,
   keyGenerator: userKey,
+  store: makeStore("gen"),
   handler: (req, res, _next, options) =>
     json413(res, options.windowMs),
 });
@@ -97,6 +121,7 @@ export const authLimiter = rateLimit({
   standardHeaders: "draft-8",
   legacyHeaders: false,
   keyGenerator: (req) => ipKeyGenerator(req.ip ?? ""),
+  store: makeStore("auth"),
   handler: (_req, res, _next, options) => json413(res, options.windowMs),
 });
 
