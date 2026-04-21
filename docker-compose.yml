@@ -18,11 +18,21 @@
 # evaluates `rewrites()` during `next build`). Supply them as build args
 # if you need anything other than the compose service-name defaults.
 
+# All services share `dokploy-network` so they can resolve each other
+# by compose service name (`server`, `redis`, `minio`, …). Dokploy's
+# Traefik lives on that same network; whichever services get domain
+# labels via the Dokploy UI become publicly routable — everyone else
+# stays internal.
+networks:
+  dokploy-network:
+    external: true
+
 services:
   # ─── Postgres (INTERNAL) ─────────────────────────────────────
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    networks: [dokploy-network]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-chatapp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatapp}
@@ -39,6 +49,7 @@ services:
   redis:
     image: redis:8-alpine
     restart: unless-stopped
+    networks: [dokploy-network]
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis_data:/data
@@ -52,6 +63,7 @@ services:
   centrifugo:
     image: centrifugo/centrifugo:v6
     restart: unless-stopped
+    networks: [dokploy-network]
     volumes:
       - ./centrifugo.json:/centrifugo/config.json:ro
     command: centrifugo -c config.json
@@ -76,6 +88,7 @@ services:
   minio:
     image: minio/minio:latest
     restart: unless-stopped
+    networks: [dokploy-network]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-chatapp}
       # Must be ≥ 8 chars.
@@ -91,6 +104,7 @@ services:
 
   minio-init:
     image: minio/mc:latest
+    networks: [dokploy-network]
     depends_on:
       minio:
         condition: service_healthy
@@ -110,6 +124,7 @@ services:
       dockerfile: apps/server/Dockerfile
     command: ["pnpm", "exec", "prisma", "migrate", "deploy"]
     restart: "no"
+    networks: [dokploy-network]
     depends_on:
       postgres:
         condition: service_healthy
@@ -122,6 +137,7 @@ services:
       context: .
       dockerfile: apps/server/Dockerfile
     restart: unless-stopped
+    networks: [dokploy-network]
     depends_on:
       postgres:
         condition: service_healthy
@@ -177,6 +193,7 @@ services:
         STORAGE_PROXY_URL: ${STORAGE_PROXY_URL:-http://minio:9000}
         STORAGE_BUCKET: ${MINIO_BUCKET:-chatapp}
     restart: unless-stopped
+    networks: [dokploy-network]
     depends_on:
       server:
         condition: service_healthy
