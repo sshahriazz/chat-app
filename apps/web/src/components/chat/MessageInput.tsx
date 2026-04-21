@@ -248,6 +248,10 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
                     <img
                       src={a.url}
                       alt={a.filename}
+                      width={40}
+                      height={40}
+                      loading="lazy"
+                      decoding="async"
                       style={{
                         width: 40,
                         height: 40,

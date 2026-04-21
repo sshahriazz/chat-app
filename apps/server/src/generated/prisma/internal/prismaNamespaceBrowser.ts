@@ -57,6 +57,7 @@ export const ModelName = {
   Verification: 'Verification',
   Conversation: 'Conversation',
   ConversationMember: 'ConversationMember',
+  Outbox: 'Outbox',
   PushSubscription: 'PushSubscription',
   Attachment: 'Attachment',
   Message: 'Message',
@@ -165,6 +166,17 @@ export const ConversationMemberScalarFieldEnum = {
 } as const
 
 export type ConversationMemberScalarFieldEnum = (typeof ConversationMemberScalarFieldEnum)[keyof typeof ConversationMemberScalarFieldEnum]
+
+
+export const OutboxScalarFieldEnum = {
+  id: 'id',
+  method: 'method',
+  payload: 'payload',
+  partition: 'partition',
+  createdAt: 'createdAt'
+} as const
+
+export type OutboxScalarFieldEnum = (typeof OutboxScalarFieldEnum)[keyof typeof OutboxScalarFieldEnum]
 
 
 export const PushSubscriptionScalarFieldEnum = {

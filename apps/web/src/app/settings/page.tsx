@@ -130,7 +130,13 @@ export default function SettingsPage() {
         <Stack>
           <Group align="center">
             <div style={{ position: "relative" }}>
-              <Avatar src={image} name={name} size={96} radius={96} />
+              <Avatar
+                src={image}
+                name={name}
+                size={96}
+                radius={96}
+                imageProps={{ loading: "lazy", decoding: "async" }}
+              />
               {uploading && (
                 <Loader
                   size="sm"

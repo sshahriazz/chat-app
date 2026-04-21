@@ -113,7 +113,14 @@ export interface Conversation {
 
 export interface InitResponse {
   conversations: Conversation[];
+  /** ISO timestamp cursor for loading older conversations; null = no more. */
+  nextCursor: string | null;
   centrifugoToken: string;
+}
+
+export interface ConversationsPage {
+  conversations: Conversation[];
+  nextCursor: string | null;
 }
 
 export interface MessagesResponse {

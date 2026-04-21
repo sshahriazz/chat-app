@@ -10,9 +10,21 @@ interface PublishIntent {
 
 /**
  * `RealtimeTx` is handed to the callback passed to `withRealtime`. It exposes
- * the Prisma transaction client plus an `enqueue` method. Enqueued publishes
- * are NOT sent to Centrifugo until the surrounding DB transaction commits —
- * which guarantees subscribers never see events for writes that rolled back.
+ * the Prisma transaction client plus an `enqueue` method.
+ *
+ * Enqueued publishes are inserted into `chat_outbox` **inside the surrounding
+ * transaction**. Centrifugo's native Postgres consumer polls the table and
+ * dispatches them, so:
+ *   - If the transaction rolls back, the outbox row vanishes with it — no
+ *     phantom events.
+ *   - If the app crashes between commit and publish, the row still exists
+ *     and Centrifugo will pick it up when it next polls.
+ *   - If Centrifugo is briefly unreachable, rows queue in the outbox until
+ *     it recovers. No event is lost.
+ *
+ * The Centrifugo tutorial uses the `broadcast` method shape (channels +
+ * data + idempotency_key at the payload root); we match that so rows are
+ * readable by the default PG consumer config.
  */
 export interface RealtimeTx {
   tx: Prisma.TransactionClient;
@@ -28,6 +40,23 @@ export interface RealtimeTx {
     senderId: string,
     content: string,
   ) => Promise<{ id: string; seq: number; createdAt: Date }>;
+}
+
+async function flushToOutbox(tx: Prisma.TransactionClient, queue: PublishIntent[]) {
+  if (queue.length === 0) return;
+  await tx.outbox.createMany({
+    data: queue.map((q) => ({
+      method: "broadcast",
+      payload: {
+        channels: q.channels,
+        data: q.data as Prisma.InputJsonValue,
+        idempotency_key: q.idempotencyKey,
+      } as Prisma.InputJsonValue,
+      // Single-partition is the default; bump later if/when Centrifugo is
+      // configured with multiple partitions for parallel draining.
+      partition: 0,
+    })),
+  });
 }
 
 export async function withRealtime<T>(
@@ -108,24 +137,14 @@ export async function withRealtime<T>(
         return { id: msg.id, seq: msg.seq, createdAt: msg.createdAt };
       },
     };
-    return fn(rt);
-  });
 
-  // Transaction committed. Flush publishes. Each has an idempotency key so
-  // retries inside `centrifugo.broadcast` are safe. A failure here is logged
-  // but not propagated — the HTTP request already succeeded.
-  for (const intent of queue) {
-    try {
-      await centrifugo.broadcast(intent.channels, intent.data, {
-        idempotencyKey: intent.idempotencyKey,
-      });
-    } catch (err) {
-      console.error("[realtime] broadcast failed:", err, {
-        key: intent.idempotencyKey,
-        channelCount: intent.channels.length,
-      });
-    }
-  }
+    const value = await fn(rt);
+    // Insert all queued publishes into the outbox as the final step of the
+    // transaction. If anything above throws, the outbox writes roll back
+    // with the business data — no split-brain.
+    await flushToOutbox(tx, queue);
+    return value;
+  });
 
   return result;
 }

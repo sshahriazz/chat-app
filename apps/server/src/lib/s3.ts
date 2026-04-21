@@ -2,6 +2,7 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { env } from "../env";
@@ -120,6 +121,16 @@ export async function createDownloadUrl(params: {
 
   const url = await getSignedUrl(client, cmd, { expiresIn });
   return { url, expiresIn };
+}
+
+/**
+ * Delete an object by key. Used by the orphan-attachment GC. Missing
+ * objects resolve cleanly (S3 delete is idempotent).
+ */
+export async function deleteObject(key: string): Promise<void> {
+  const cfg = requireS3Config();
+  const client = getClient();
+  await client.send(new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }));
 }
 
 /**

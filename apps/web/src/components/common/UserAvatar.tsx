@@ -23,7 +23,16 @@ export function UserAvatar({
     .toUpperCase();
 
   const avatar = (
-    <Avatar src={image} alt={name} size={size} radius="xl" color="blue">
+    <Avatar
+      src={image}
+      alt={name}
+      size={size}
+      radius="xl"
+      color="blue"
+      // Avatars live inside virtualized lists; lazy-loading lets off-screen
+      // ones skip the network until they're actually scrolled into view.
+      imageProps={{ loading: "lazy", decoding: "async" }}
+    >
       {initials}
     </Avatar>
   );

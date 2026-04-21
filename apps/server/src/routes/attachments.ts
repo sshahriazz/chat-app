@@ -8,6 +8,7 @@ import {
   createDownloadUrl,
   keyFromPublicUrl,
 } from "../lib/s3";
+import { uploadUrlLimiter } from "../middleware/rate-limit";
 
 const router: Router = Router();
 
@@ -17,12 +18,14 @@ const MAX_SIZE = 50 * 1024 * 1024;
 // POST /api/attachments/upload-url
 // Client sends file metadata; server mints a signed PUT URL, creates the
 // Attachment row (with messageId:null — linked later on message send).
-router.post("/upload-url", requireAuth, async (req, res) => {
+router.post("/upload-url", requireAuth, uploadUrlLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
-  const { filename, contentType, size } = req.body as {
+  const { filename, contentType, size, width, height } = req.body as {
     filename?: string;
     contentType?: string;
     size?: number;
+    width?: number;
+    height?: number;
   };
 
   if (!filename || !contentType || typeof size !== "number") {
@@ -31,6 +34,17 @@ router.post("/upload-url", requireAuth, async (req, res) => {
       .json({ error: "filename, contentType and size are required" });
     return;
   }
+
+  // Clamp dimension values: only accept finite positive integers below a
+  // sanity ceiling (>16k × 16k is almost certainly a hostile client).
+  const validDim = (n: unknown): number | null => {
+    if (typeof n !== "number" || !Number.isFinite(n)) return null;
+    const v = Math.floor(n);
+    if (v <= 0 || v > 16384) return null;
+    return v;
+  };
+  const attWidth = validDim(width);
+  const attHeight = validDim(height);
   if (size <= 0 || size > MAX_SIZE) {
     res.status(400).json({ error: `size must be between 1 and ${MAX_SIZE}` });
     return;
@@ -59,6 +73,8 @@ router.post("/upload-url", requireAuth, async (req, res) => {
       contentType,
       filename,
       size,
+      width: attWidth,
+      height: attHeight,
     },
   });
 

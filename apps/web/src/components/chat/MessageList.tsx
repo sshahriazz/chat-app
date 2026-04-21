@@ -1,20 +1,25 @@
 "use client";
 
-import { useEffect, useRef, useCallback, useState } from "react";
 import {
-  ScrollArea,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
   Center,
   Loader,
   Button,
-  Stack,
   Text,
   Group,
   Tooltip,
   ActionIcon,
-  Affix,
   Transition,
+  Box,
 } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { useChat } from "@/context/ChatContext";
 import { useAuth } from "@/context/AuthContext";
 import { MessageBubble } from "./MessageBubble";
@@ -53,6 +58,22 @@ function formatDaySeparator(date: Date): string {
   );
 }
 
+/** Flat row model for the virtualizer — every day-header, divider and
+ *  message is its own sibling row, so Virtuoso can height-measure them
+ *  independently. */
+type Row =
+  | { kind: "load-more" }
+  | { kind: "date"; key: string; label: string }
+  | { kind: "unread-divider"; count: number }
+  | {
+      kind: "message";
+      msg: Message;
+      compact: boolean;
+      readBy?: { name: string; image: string | null }[];
+    };
+
+const LOAD_MORE_ROW: Row = { kind: "load-more" };
+
 export function MessageList({ isGroupChat, onReply }: MessageListProps) {
   const { user } = useAuth();
   const {
@@ -66,105 +87,119 @@ export function MessageList({ isGroupChat, onReply }: MessageListProps) {
     highlightedMessageId,
   } = useChat();
 
-  const viewportRef = useRef<HTMLDivElement>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const prevMessageCountRef = useRef(0);
-  const isAtBottomRef = useRef(true);
-  const [showScrollDown, setShowScrollDown] = useState(false);
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const [atBottom, setAtBottom] = useState(true);
 
-  // Scroll to bottom on new messages if at bottom
-  useEffect(() => {
-    if (messages.length > prevMessageCountRef.current && isAtBottomRef.current) {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  // --- Read-by map (who has last-read-message-id pointing here) ---
+  const readByMessage = useMemo(() => {
+    const map = new Map<string, { name: string; image: string | null }[]>();
+    for (const rp of readPositions) {
+      if (rp.userId === user?.id || !rp.lastReadMessageId) continue;
+      const existing = map.get(rp.lastReadMessageId) ?? [];
+      existing.push({ name: rp.name, image: rp.image });
+      map.set(rp.lastReadMessageId, existing);
     }
-    prevMessageCountRef.current = messages.length;
-  }, [messages.length]);
+    return map;
+  }, [readPositions, user?.id]);
 
-  // Initial scroll to bottom
-  useEffect(() => {
-    if (!isLoadingMessages && messages.length > 0) {
-      bottomRef.current?.scrollIntoView();
+  // --- Unread divider placement (frozen per open) ---
+  const { dividerBeforeMessageId, newFromOthersCount } = useMemo(() => {
+    const anchorIdx = unreadAnchorId
+      ? messages.findIndex((m) => m.id === unreadAnchorId)
+      : -1;
+    const firstUnreadIdx =
+      unreadAnchorId === null && messages.length > 0
+        ? 0
+        : anchorIdx >= 0
+          ? anchorIdx + 1
+          : -1;
+    const count =
+      firstUnreadIdx >= 0
+        ? messages
+            .slice(firstUnreadIdx)
+            .filter((m) => m.senderId !== user?.id).length
+        : 0;
+    return {
+      dividerBeforeMessageId:
+        count > 0 && firstUnreadIdx < messages.length
+          ? messages[firstUnreadIdx].id
+          : null,
+      newFromOthersCount: count,
+    };
+  }, [messages, unreadAnchorId, user?.id]);
+
+  // --- Flatten to virtualizer rows ---
+  const rows = useMemo<Row[]>(() => {
+    const out: Row[] = [];
+    if (hasMoreMessages) out.push(LOAD_MORE_ROW);
+    let currentKey = "";
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const date = new Date(msg.createdAt);
+      const key = date.toDateString();
+      if (key !== currentKey) {
+        currentKey = key;
+        out.push({ kind: "date", key, label: formatDaySeparator(date) });
+      }
+      if (dividerBeforeMessageId === msg.id) {
+        out.push({ kind: "unread-divider", count: newFromOthersCount });
+      }
+      const prev = i > 0 ? messages[i - 1] : null;
+      const isConsecutive =
+        !!prev &&
+        prev.senderId === msg.senderId &&
+        prev.type !== "system" &&
+        msg.type !== "system" &&
+        !msg.deletedAt &&
+        !prev.deletedAt &&
+        new Date(msg.createdAt).getTime() -
+          new Date(prev.createdAt).getTime() <
+          120_000;
+      const readBy = readByMessage.get(msg.id);
+      out.push({
+        kind: "message",
+        msg,
+        compact: isConsecutive,
+        readBy,
+      });
     }
-  }, [isLoadingMessages]);
+    return out;
+  }, [
+    messages,
+    hasMoreMessages,
+    dividerBeforeMessageId,
+    newFromOthersCount,
+    readByMessage,
+  ]);
 
-  // Mark as read when visible
-  useEffect(() => {
-    if (messages.length > 0 && isAtBottomRef.current) {
-      markAsRead();
-    }
-  }, [messages.length, markAsRead]);
-
-  // Scroll the highlighted message into view when jumpToMessage fires.
-  useEffect(() => {
-    if (!highlightedMessageId) return;
-    const el = document.querySelector(
-      `[data-message-id="${CSS.escape(highlightedMessageId)}"]`,
-    );
-    el?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [highlightedMessageId, messages.length]);
-
-  const handleScroll = useCallback(
-    ({ y }: { x: number; y: number }) => {
-      const viewport = viewportRef.current;
-      if (!viewport) return;
-      const atBottom =
-        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 50;
-      isAtBottomRef.current = atBottom;
-      setShowScrollDown(!atBottom);
-      if (atBottom) markAsRead();
-    },
-    [markAsRead],
+  // --- Auto-scroll to bottom on new messages if we're already at bottom ---
+  // Virtuoso passes the current atBottom into `followOutput` — return
+  // "smooth" only when the user is pinned, so incoming bursts don't yank
+  // them mid-scroll if they've scrolled up.
+  const followOutput = useCallback(
+    (isAtBottom: boolean) =>
+      isAtBottom ? ("smooth" as const) : (false as const),
+    [],
   );
 
-  const scrollToBottom = () => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  // --- markAsRead when new messages arrive while at the bottom ---
+  useEffect(() => {
+    if (atBottom && messages.length > 0) markAsRead();
+  }, [messages.length, atBottom, markAsRead]);
 
-  // Build read-by map
-  const readByMessage = new Map<string, { name: string; image: string | null }[]>();
-  for (const rp of readPositions) {
-    if (rp.userId === user?.id || !rp.lastReadMessageId) continue;
-    const existing = readByMessage.get(rp.lastReadMessageId) || [];
-    existing.push({ name: rp.name, image: rp.image });
-    readByMessage.set(rp.lastReadMessageId, existing);
-  }
-
-  // "N new messages" divider sits right before the first message the user
-  // hadn't read when they opened this conversation. The anchor is captured
-  // once per open, so the line stays put while subsequent reads fire.
-  const anchorIdx = unreadAnchorId
-    ? messages.findIndex((m) => m.id === unreadAnchorId)
-    : -1;
-  const firstUnreadIdx =
-    unreadAnchorId === null && messages.length > 0
-      ? 0
-      : anchorIdx >= 0
-        ? anchorIdx + 1
-        : -1;
-  const newFromOthersCount =
-    firstUnreadIdx >= 0
-      ? messages
-          .slice(firstUnreadIdx)
-          .filter((m) => m.senderId !== user?.id).length
-      : 0;
-  const dividerBeforeMessageId =
-    newFromOthersCount > 0 && firstUnreadIdx < messages.length
-      ? messages[firstUnreadIdx].id
-      : null;
-
-  // Group messages by calendar day, labelled relative to today.
-  const groupedMessages: { key: string; label: string; messages: Message[] }[] =
-    [];
-  let currentKey = "";
-  for (const msg of messages) {
-    const date = new Date(msg.createdAt);
-    const key = date.toDateString(); // stable per calendar day
-    if (key !== currentKey) {
-      currentKey = key;
-      groupedMessages.push({ key, label: formatDaySeparator(date), messages: [] });
-    }
-    groupedMessages[groupedMessages.length - 1].messages.push(msg);
-  }
+  // --- Jump-to-message: scroll to the row index for the target id ---
+  useEffect(() => {
+    if (!highlightedMessageId) return;
+    const idx = rows.findIndex(
+      (r) => r.kind === "message" && r.msg.id === highlightedMessageId,
+    );
+    if (idx < 0) return;
+    virtuosoRef.current?.scrollToIndex({
+      index: idx,
+      align: "center",
+      behavior: "smooth",
+    });
+  }, [highlightedMessageId, rows]);
 
   if (isLoadingMessages) {
     return (
@@ -184,133 +219,147 @@ export function MessageList({ isGroupChat, onReply }: MessageListProps) {
     );
   }
 
+  const renderRow = (_index: number, row: Row) => {
+    switch (row.kind) {
+      case "load-more":
+        return (
+          <Center py="sm" px="md">
+            <Button variant="subtle" size="xs" onClick={loadMoreMessages}>
+              Load older messages
+            </Button>
+          </Center>
+        );
+      case "date":
+        return (
+          <Text size="xs" c="dimmed" ta="center" py="sm" fw={500} px="md">
+            {row.label}
+          </Text>
+        );
+      case "unread-divider":
+        return (
+          <Group
+            gap="xs"
+            my="xs"
+            mx="md"
+            wrap="nowrap"
+            align="center"
+            style={{ color: "var(--mantine-color-blue-6)" }}
+          >
+            <div
+              style={{
+                flex: 1,
+                height: 1,
+                background: "var(--mantine-color-blue-3)",
+              }}
+            />
+            <Text size="xs" fw={600} c="blue.6">
+              {row.count} new message{row.count === 1 ? "" : "s"}
+            </Text>
+            <div
+              style={{
+                flex: 1,
+                height: 1,
+                background: "var(--mantine-color-blue-3)",
+              }}
+            />
+          </Group>
+        );
+      case "message": {
+        const { msg, compact, readBy } = row;
+        return (
+          <div
+            data-message-id={msg.id}
+            className={
+              highlightedMessageId === msg.id ? "message-highlight" : undefined
+            }
+            style={{ padding: "0 var(--mantine-spacing-md)" }}
+          >
+            <MessageBubble
+              message={msg}
+              isGroupChat={isGroupChat}
+              onReply={onReply}
+              compact={compact}
+            />
+            {readBy && (
+              <Group
+                gap={4}
+                justify={msg.senderId === user?.id ? "flex-end" : "flex-start"}
+                px="xs"
+                pb={4}
+              >
+                <Text size="xs" c="dimmed">
+                  Seen by
+                </Text>
+                {readBy.map((r) => (
+                  <Tooltip key={r.name} label={r.name}>
+                    <UserAvatar name={r.name} image={r.image} size={16} />
+                  </Tooltip>
+                ))}
+              </Group>
+            )}
+          </div>
+        );
+      }
+    }
+  };
+
+  const computeItemKey = (index: number, row: Row): string => {
+    switch (row.kind) {
+      case "load-more":
+        return "load-more";
+      case "date":
+        return `date:${row.key}`;
+      case "unread-divider":
+        return "unread-divider";
+      case "message":
+        return `msg:${row.msg.id}`;
+      default:
+        return String(index);
+    }
+  };
+
   return (
-    <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
-      <ScrollArea
-        h="100%"
-        viewportRef={viewportRef}
-        onScrollPositionChange={handleScroll}
-      >
-        <Stack gap={0} px="md" py="sm">
-          {hasMoreMessages && (
-            <Center py="sm">
-              <Button variant="subtle" size="xs" onClick={loadMoreMessages}>
-                Load older messages
-              </Button>
-            </Center>
-          )}
+    <Box style={{ flex: 1, position: "relative", minHeight: 0 }}>
+      <Virtuoso
+        ref={virtuosoRef}
+        data={rows}
+        itemContent={renderRow}
+        computeItemKey={computeItemKey}
+        initialTopMostItemIndex={Math.max(0, rows.length - 1)}
+        followOutput={followOutput}
+        atBottomStateChange={setAtBottom}
+        atBottomThreshold={40}
+        style={{ height: "100%" }}
+        increaseViewportBy={{ top: 400, bottom: 400 }}
+      />
 
-          {groupedMessages.map((group) => (
-            <div key={group.key}>
-              <Text size="xs" c="dimmed" ta="center" py="sm" fw={500}>
-                {group.label}
-              </Text>
-              {group.messages.map((msg, i) => {
-                const prevMsg = i > 0 ? group.messages[i - 1] : null;
-                const isConsecutive =
-                  prevMsg &&
-                  prevMsg.senderId === msg.senderId &&
-                  prevMsg.type !== "system" &&
-                  msg.type !== "system" &&
-                  !msg.deletedAt &&
-                  !prevMsg.deletedAt &&
-                  new Date(msg.createdAt).getTime() -
-                    new Date(prevMsg.createdAt).getTime() <
-                    120000; // 2 min
-
-                return (
-                  <div
-                    key={msg.id}
-                    data-message-id={msg.id}
-                    className={
-                      highlightedMessageId === msg.id
-                        ? "message-highlight"
-                        : undefined
-                    }
-                  >
-                    {msg.id === dividerBeforeMessageId && (
-                      <Group
-                        gap="xs"
-                        my="xs"
-                        wrap="nowrap"
-                        align="center"
-                        style={{ color: "var(--mantine-color-blue-6)" }}
-                      >
-                        <div
-                          style={{
-                            flex: 1,
-                            height: 1,
-                            background: "var(--mantine-color-blue-3)",
-                          }}
-                        />
-                        <Text size="xs" fw={600} c="blue.6">
-                          {newFromOthersCount} new message
-                          {newFromOthersCount === 1 ? "" : "s"}
-                        </Text>
-                        <div
-                          style={{
-                            flex: 1,
-                            height: 1,
-                            background: "var(--mantine-color-blue-3)",
-                          }}
-                        />
-                      </Group>
-                    )}
-                    <MessageBubble
-                      message={msg}
-                      isGroupChat={isGroupChat}
-                      onReply={onReply}
-                      compact={!!isConsecutive}
-                    />
-                    {readByMessage.has(msg.id) && (
-                      <Group
-                        gap={4}
-                        justify={msg.senderId === user?.id ? "flex-end" : "flex-start"}
-                        px="xs"
-                        pb={4}
-                      >
-                        <Text size="xs" c="dimmed">
-                          Seen by
-                        </Text>
-                        {readByMessage.get(msg.id)!.map((r) => (
-                          <Tooltip key={r.name} label={r.name}>
-                            <div>
-                              <UserAvatar name={r.name} image={r.image} size={16} />
-                            </div>
-                          </Tooltip>
-                        ))}
-                      </Group>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-
-          <div ref={bottomRef} />
-        </Stack>
-      </ScrollArea>
-
-      {/* Scroll to bottom button */}
-      <Transition mounted={showScrollDown} transition="slide-up" duration={200}>
+      <Transition mounted={!atBottom} transition="fade" duration={150}>
         {(styles) => (
           <ActionIcon
+            onClick={() =>
+              virtuosoRef.current?.scrollToIndex({
+                index: rows.length - 1,
+                align: "end",
+                behavior: "smooth",
+              })
+            }
+            variant="filled"
+            color="blue"
+            radius="xl"
+            size="lg"
+            aria-label="Scroll to latest"
             style={{
               ...styles,
               position: "absolute",
+              right: 16,
               bottom: 16,
-              right: 24,
-              zIndex: 10,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
             }}
-            size="lg"
-            radius="xl"
-            variant="filled"
-            onClick={scrollToBottom}
           >
             <IconArrowDown size={18} />
           </ActionIcon>
         )}
       </Transition>
-    </div>
+    </Box>
   );
 }

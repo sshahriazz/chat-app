@@ -18,6 +18,7 @@ import { useAuth } from "./AuthContext";
 import type {
   Attachment,
   Conversation,
+  ConversationsPage,
   Message,
   MessageContent,
   ReadPosition,
@@ -57,6 +58,7 @@ interface ChatStateSlice {
   isLoadingConversations: boolean;
   isLoadingMessages: boolean;
   hasMoreMessages: boolean;
+  hasMoreConversations: boolean;
   connectionLost: boolean;
   /**
    * Message id the current user had read *up to* at the moment this
@@ -71,6 +73,8 @@ interface ChatStateSlice {
 
 export interface ChatActions {
   setActiveConversation: (id: string | null) => void;
+  /** Appends the next page of conversations to the sidebar. */
+  loadMoreConversations: () => Promise<void>;
   sendMessage: (
     content: MessageContent,
     replyToId?: string,
@@ -106,6 +110,9 @@ const ChatActionsContext = createContext<ChatActions | null>(null);
 export function ChatProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationsCursor, setConversationsCursor] = useState<string | null>(
+    null,
+  );
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [readPositions, setReadPositions] = useState<ReadPosition[]>([]);
@@ -510,6 +517,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         if (!mounted) return;
 
         setConversations(data.conversations);
+        setConversationsCursor(data.nextCursor);
         setIsLoadingConversations(false);
 
         centrifugo.connect({
@@ -541,6 +549,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               .then((fresh) => {
                 if (!mounted) return;
                 setConversations(fresh.conversations);
+                setConversationsCursor(fresh.nextCursor);
               })
               .catch(() => {});
 
@@ -928,9 +937,31 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   );
 
   const refreshConversations = useCallback(async () => {
-    const convos = await api.get<Conversation[]>("/api/conversations");
-    setConversations(convos);
+    const page = await api.get<ConversationsPage>("/api/conversations");
+    setConversations(page.conversations);
+    setConversationsCursor(page.nextCursor);
   }, []);
+
+  const loadMoreConversations = useCallback(async () => {
+    // Fall-through if we've already loaded the tail.
+    const cursor = conversationsCursor;
+    if (!cursor) return;
+    const page = await api.get<ConversationsPage>(
+      `/api/conversations?before=${encodeURIComponent(cursor)}`,
+    );
+    setConversations((prev) => {
+      // De-dupe on id — a realtime `conversation_updated` could've already
+      // bumped one of the older conversations into `prev` while we were
+      // fetching this page.
+      const seen = new Set(prev.map((c) => c.id));
+      const merged = [...prev];
+      for (const c of page.conversations) {
+        if (!seen.has(c.id)) merged.push(c);
+      }
+      return merged;
+    });
+    setConversationsCursor(page.nextCursor);
+  }, [conversationsCursor]);
 
   const muteConversation = useCallback(
     async (muted: boolean) => {
@@ -1008,6 +1039,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     leaveGroup,
     refreshConversations,
     setActiveConversation,
+    loadMoreConversations,
   };
 
   // Frozen proxy object — its identity never changes, so consumers of
@@ -1040,6 +1072,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       refreshConversations: () => actionsRef.current!.refreshConversations(),
       setActiveConversation: (id) =>
         actionsRef.current!.setActiveConversation(id),
+      loadMoreConversations: () =>
+        actionsRef.current!.loadMoreConversations(),
     }),
     [],
   );
@@ -1054,6 +1088,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     isLoadingConversations,
     isLoadingMessages,
     hasMoreMessages: nextCursor !== null,
+    hasMoreConversations: conversationsCursor !== null,
     connectionLost,
     unreadAnchorId,
     highlightedMessageId,

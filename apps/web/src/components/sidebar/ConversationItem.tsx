@@ -1,5 +1,6 @@
 "use client";
 
+import { memo } from "react";
 import { Group, Stack, Text, Badge, UnstyledButton, Box } from "@mantine/core";
 import { UserAvatar } from "@/components/common/UserAvatar";
 import { useAuth } from "@/context/AuthContext";
@@ -11,7 +12,7 @@ interface ConversationItemProps {
   onClick: () => void;
 }
 
-export function ConversationItem({
+function ConversationItemImpl({
   conversation,
   active,
   onClick,
@@ -75,6 +76,24 @@ export function ConversationItem({
     </UnstyledButton>
   );
 }
+
+/**
+ * Conversations state is a single array — any change (new message, typing
+ * event reshuffling sort, etc.) re-renders the whole list. Memoizing here
+ * skips renders for rows whose content hasn't changed.
+ *
+ * The comparator relies on:
+ *  - conversation — replaced (not mutated) on every update, so reference
+ *    equality is a valid staleness check.
+ *  - onClick — the parent should stabilize via useCallback(..., [id]).
+ */
+export const ConversationItem = memo(
+  ConversationItemImpl,
+  (prev, next) =>
+    prev.conversation === next.conversation &&
+    prev.active === next.active &&
+    prev.onClick === next.onClick,
+);
 
 function formatTime(dateStr: string) {
   const date = new Date(dateStr);

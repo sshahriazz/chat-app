@@ -106,11 +106,20 @@ function AttachmentPreview({ attachment }: { attachment: Attachment }) {
           <img
             src={attachment.url}
             alt={attachment.filename}
+            // Intrinsic size when we know it — prevents layout shift as
+            // thumbnails stream in during scroll. Legacy rows without
+            // dimensions fall back to auto.
+            width={attachment.width ?? undefined}
+            height={attachment.height ?? undefined}
+            loading="lazy"
+            decoding="async"
             style={{
               maxWidth: 280,
               maxHeight: 280,
               borderRadius: 8,
               display: "block",
+              height: "auto",
+              width: "auto",
             }}
           />
         </a>
@@ -175,7 +184,7 @@ interface MessageBubbleProps {
   compact?: boolean;
 }
 
-export function MessageBubble({
+function MessageBubbleImpl({
   message,
   isGroupChat,
   onReply,
@@ -451,6 +460,24 @@ export function MessageBubble({
   );
 }
 
+/**
+ * MessageBubble renders hundreds at a time in active conversations. With
+ * the ChatContext split, actions are stable — so memoizing here cuts
+ * per-bubble re-renders on typing/presence churn to zero.
+ *
+ * Custom comparator: message objects are replaced (not mutated) on every
+ * server update, so reference equality is a correct + cheap staleness check.
+ * The other props are primitives / stable callbacks from the parent.
+ */
+export const MessageBubble = memo(
+  MessageBubbleImpl,
+  (prev, next) =>
+    prev.message === next.message &&
+    prev.isGroupChat === next.isGroupChat &&
+    prev.compact === next.compact &&
+    prev.onReply === next.onReply,
+);
+
 function ReactionBadge({
   emoji,
   names,
@@ -462,7 +489,7 @@ function ReactionBadge({
   hasOwn: boolean;
   messageId: string;
 }) {
-  const { toggleReaction } = useChat();
+  const { toggleReaction } = useChatActions();
 
   return (
     <Tooltip label={names.join(", ")}>

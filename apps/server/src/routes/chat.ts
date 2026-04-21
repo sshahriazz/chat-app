@@ -16,6 +16,11 @@ import {
   MAX_MESSAGE_PLAIN_CHARS,
   type MessageContentJson,
 } from "../lib/message-content";
+import {
+  sendMessageLimiter,
+  typingLimiter,
+  searchLimiter,
+} from "../middleware/rate-limit";
 
 const router: Router = Router();
 
@@ -81,9 +86,10 @@ async function broadcastToConversation(
 
 router.get("/init", requireAuth, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
+  const limit = Number(req.query.limit) || 50;
 
-  const [conversations, token] = await Promise.all([
-    getConversationsWithUnread(user.id),
+  const [page, token] = await Promise.all([
+    getConversationsWithUnread(user.id, { limit }),
     Promise.resolve(
       centrifugo.generateConnectionToken(user.id, {
         name: user.name,
@@ -92,7 +98,11 @@ router.get("/init", requireAuth, async (req, res) => {
     ),
   ]);
 
-  res.json({ conversations, centrifugoToken: token });
+  res.json({
+    conversations: page.conversations,
+    nextCursor: page.nextCursor,
+    centrifugoToken: token,
+  });
 });
 
 // ─── Create conversation ──────────────────────────────────────
@@ -188,8 +198,11 @@ router.post("/conversations", requireAuth, async (req, res) => {
 
 router.get("/conversations", requireAuth, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
-  const conversations = await getConversationsWithUnread(user.id);
-  res.json(conversations);
+  const limit = Number(req.query.limit) || 50;
+  const before =
+    typeof req.query.before === "string" ? req.query.before : undefined;
+  const page = await getConversationsWithUnread(user.id, { limit, before });
+  res.json(page);
 });
 
 // ─── Get conversation ─────────────────────────────────────────
@@ -483,7 +496,7 @@ const MESSAGE_INCLUDE = {
   },
 } as const;
 
-router.post("/conversations/:id/messages", requireAuth, async (req, res) => {
+router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { content, replyToId, clientMessageId, attachmentIds } = req.body as {
@@ -749,7 +762,7 @@ function shapeSearchResults(rows: SearchRow[]) {
   }));
 }
 
-router.get("/conversations/:id/search", requireAuth, async (req, res) => {
+router.get("/conversations/:id/search", requireAuth, searchLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const q = ((req.query.q as string) || "").trim();
@@ -796,7 +809,7 @@ router.get("/conversations/:id/search", requireAuth, async (req, res) => {
 
 // Global search — all conversations the user is a member of.
 // Intended as the foundation for a global Cmd+K modal later.
-router.get("/search", requireAuth, async (req, res) => {
+router.get("/search", requireAuth, searchLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const q = ((req.query.q as string) || "").trim();
 
@@ -1251,7 +1264,7 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
 
 // ─── Typing indicator ─────────────────────────────────────────
 
-router.post("/conversations/:id/typing", requireAuth, async (req, res) => {
+router.post("/conversations/:id/typing", requireAuth, typingLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
 
@@ -1333,15 +1346,45 @@ router.post("/me/broadcast-profile", requireAuth, async (req, res) => {
 
 // ─── Helpers ──────────────────────────────────────────────────
 
-async function getConversationsWithUnread(userId: string) {
+interface ConversationPageParams {
+  limit?: number;
+  /** ISO timestamp: return only conversations with `updatedAt < before`. */
+  before?: string;
+}
+
+async function getConversationsWithUnread(
+  userId: string,
+  { limit = 50, before }: ConversationPageParams = {},
+) {
+  // Cap the page so a malicious client can't ask for 1M rows.
+  const take = Math.min(Math.max(limit, 1), 100);
+  const beforeDate = before ? new Date(before) : null;
+  // Ignore malformed cursors instead of 400ing — safer default.
+  const useBefore = beforeDate && !Number.isNaN(beforeDate.getTime());
+
   const memberships = await prisma.conversationMember.findMany({
-    where: { userId },
+    where: {
+      userId,
+      ...(useBefore
+        ? { conversation: { updatedAt: { lt: beforeDate } } }
+        : {}),
+    },
+    orderBy: { conversation: { updatedAt: "desc" } },
+    take: take + 1, // over-fetch by one to detect "has more"
     include: {
       conversation: {
         include: {
           members: {
             include: {
-              user: { select: { id: true, name: true, email: true, image: true, lastActiveAt: true } },
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  email: true,
+                  image: true,
+                  lastActiveAt: true,
+                },
+              },
             },
           },
           messages: {
@@ -1357,24 +1400,22 @@ async function getConversationsWithUnread(userId: string) {
     },
   });
 
-  // unreadCount is now a denormalized column on conversation_members,
-  // maintained by the message-send transaction and zeroed on read. The
-  // previous N+1 COUNT(*) per conversation is gone.
-  const results = memberships.map((m) => ({
+  const hasMore = memberships.length > take;
+  const pageRows = hasMore ? memberships.slice(0, take) : memberships;
+
+  const conversations = pageRows.map((m) => ({
     ...m.conversation,
     unreadCount: m.unreadCount,
     muted: m.muted,
-    lastMessage: m.conversation.messages[0] || null,
+    lastMessage: m.conversation.messages[0] ?? null,
   }));
 
-  // Sort by most recent activity
-  results.sort((a, b) => {
-    const aTime = a.lastMessage?.createdAt ?? a.createdAt;
-    const bTime = b.lastMessage?.createdAt ?? b.createdAt;
-    return new Date(bTime).getTime() - new Date(aTime).getTime();
-  });
+  const nextCursor =
+    hasMore && pageRows.length > 0
+      ? pageRows[pageRows.length - 1].conversation.updatedAt.toISOString()
+      : null;
 
-  return results;
+  return { conversations, nextCursor };
 }
 
 export default router;

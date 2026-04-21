@@ -137,6 +137,25 @@ model ConversationMember {
   @@map("conversation_members")
 }
 
+/// Outbox for Centrifugo's native PostgreSQL consumer.
+///
+/// Rows are inserted inside the same transaction as the business write
+/// (message create, edit, reaction, etc). Centrifugo polls this table,
+/// executes the indicated `method` (e.g. "broadcast") with the payload,
+/// and deletes the row. Guarantees at-least-once event delivery that
+/// survives both app-server crashes and Centrifugo downtime without
+/// losing the atomic property of the underlying write.
+model Outbox {
+  id        BigInt   @id @default(autoincrement())
+  method    String   @default("broadcast")
+  payload   Json
+  partition BigInt   @default(0)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([partition, id])
+  @@map("chat_outbox")
+}
+
 model PushSubscription {
   id        String   @id @default(uuid())
   userId    String   @map("user_id")

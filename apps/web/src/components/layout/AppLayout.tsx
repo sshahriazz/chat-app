@@ -96,6 +96,7 @@ function AppContent() {
                     name={user?.name}
                     size={32}
                     radius={32}
+                    imageProps={{ loading: "lazy", decoding: "async" }}
                   />
                 </UnstyledButton>
               </Menu.Target>

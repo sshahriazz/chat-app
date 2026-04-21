@@ -38,3 +38,24 @@ app.use("/api", chatRoutes);
 app.listen(env.PORT, () => {
   console.log(`Server running on http://localhost:${env.PORT}`);
 });
+
+// Background jobs — only register when this process owns them. Under a
+// multi-instance deploy this is safe per-instance because gcOrphanAttachments
+// is idempotent (row deletes race harmlessly).
+import("node-cron").then(({ default: cron }) => {
+  import("./lib/attachments-gc").then(({ gcOrphanAttachments }) => {
+    // Every 6 hours at :05 past the hour.
+    cron.schedule("5 */6 * * *", async () => {
+      try {
+        const result = await gcOrphanAttachments();
+        if (result.deleted > 0 || result.s3Errors > 0) {
+          console.log(
+            `[cron] orphan-attachments: deleted=${result.deleted} s3Errors=${result.s3Errors}`,
+          );
+        }
+      } catch (err) {
+        console.error("[cron] orphan-attachments failed:", err);
+      }
+    });
+  });
+});

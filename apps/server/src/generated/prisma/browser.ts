@@ -48,6 +48,18 @@ export type Conversation = Prisma.ConversationModel
  */
 export type ConversationMember = Prisma.ConversationMemberModel
 /**
+ * Model Outbox
+ * Outbox for Centrifugo's native PostgreSQL consumer.
+ * 
+ * Rows are inserted inside the same transaction as the business write
+ * (message create, edit, reaction, etc). Centrifugo polls this table,
+ * executes the indicated `method` (e.g. "broadcast") with the payload,
+ * and deletes the row. Guarantees at-least-once event delivery that
+ * survives both app-server crashes and Centrifugo downtime without
+ * losing the atomic property of the underlying write.
+ */
+export type Outbox = Prisma.OutboxModel
+/**
  * Model PushSubscription
  * 
  */

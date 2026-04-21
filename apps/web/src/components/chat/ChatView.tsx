@@ -69,7 +69,7 @@ export function ChatView() {
           <ChatHeader onInfoClick={() => setInfoOpen(true)} />
           <MessageList
             isGroupChat={isGroupChat ?? false}
-            onReply={(msg) => setReplyTo(msg)}
+            onReply={setReplyTo}
           />
           <TypingIndicator />
           {/* `key` forces a remount on conversation switch. Tiptap's useEditor

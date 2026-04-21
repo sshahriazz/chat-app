@@ -390,6 +390,7 @@ export const ModelName = {
   Verification: 'Verification',
   Conversation: 'Conversation',
   ConversationMember: 'ConversationMember',
+  Outbox: 'Outbox',
   PushSubscription: 'PushSubscription',
   Attachment: 'Attachment',
   Message: 'Message',
@@ -409,7 +410,7 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
     omit: GlobalOmitOptions
   }
   meta: {
-    modelProps: "user" | "session" | "account" | "verification" | "conversation" | "conversationMember" | "pushSubscription" | "attachment" | "message" | "reaction"
+    modelProps: "user" | "session" | "account" | "verification" | "conversation" | "conversationMember" | "outbox" | "pushSubscription" | "attachment" | "message" | "reaction"
     txIsolationLevel: TransactionIsolationLevel
   }
   model: {
@@ -857,6 +858,80 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
         }
       }
     }
+    Outbox: {
+      payload: Prisma.$OutboxPayload<ExtArgs>
+      fields: Prisma.OutboxFieldRefs
+      operations: {
+        findUnique: {
+          args: Prisma.OutboxFindUniqueArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload> | null
+        }
+        findUniqueOrThrow: {
+          args: Prisma.OutboxFindUniqueOrThrowArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>
+        }
+        findFirst: {
+          args: Prisma.OutboxFindFirstArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload> | null
+        }
+        findFirstOrThrow: {
+          args: Prisma.OutboxFindFirstOrThrowArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>
+        }
+        findMany: {
+          args: Prisma.OutboxFindManyArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>[]
+        }
+        create: {
+          args: Prisma.OutboxCreateArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>
+        }
+        createMany: {
+          args: Prisma.OutboxCreateManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        createManyAndReturn: {
+          args: Prisma.OutboxCreateManyAndReturnArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>[]
+        }
+        delete: {
+          args: Prisma.OutboxDeleteArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>
+        }
+        update: {
+          args: Prisma.OutboxUpdateArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>
+        }
+        deleteMany: {
+          args: Prisma.OutboxDeleteManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        updateMany: {
+          args: Prisma.OutboxUpdateManyArgs<ExtArgs>
+          result: BatchPayload
+        }
+        updateManyAndReturn: {
+          args: Prisma.OutboxUpdateManyAndReturnArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>[]
+        }
+        upsert: {
+          args: Prisma.OutboxUpsertArgs<ExtArgs>
+          result: runtime.Types.Utils.PayloadToResult<Prisma.$OutboxPayload>
+        }
+        aggregate: {
+          args: Prisma.OutboxAggregateArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.AggregateOutbox>
+        }
+        groupBy: {
+          args: Prisma.OutboxGroupByArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.OutboxGroupByOutputType>[]
+        }
+        count: {
+          args: Prisma.OutboxCountArgs<ExtArgs>
+          result: runtime.Types.Utils.Optional<Prisma.OutboxCountAggregateOutputType> | number
+        }
+      }
+    }
     PushSubscription: {
       payload: Prisma.$PushSubscriptionPayload<ExtArgs>
       fields: Prisma.PushSubscriptionFieldRefs
@@ -1280,6 +1355,17 @@ export const ConversationMemberScalarFieldEnum = {
 export type ConversationMemberScalarFieldEnum = (typeof ConversationMemberScalarFieldEnum)[keyof typeof ConversationMemberScalarFieldEnum]
 
 
+export const OutboxScalarFieldEnum = {
+  id: 'id',
+  method: 'method',
+  payload: 'payload',
+  partition: 'partition',
+  createdAt: 'createdAt'
+} as const
+
+export type OutboxScalarFieldEnum = (typeof OutboxScalarFieldEnum)[keyof typeof OutboxScalarFieldEnum]
+
+
 export const PushSubscriptionScalarFieldEnum = {
   id: 'id',
   userId: 'userId',
@@ -1461,6 +1547,20 @@ export type ListEnumMemberRoleFieldRefInput<$PrismaModel> = FieldRefInputType<$P
 
 
 /**
+ * Reference to a field of type 'BigInt'
+ */
+export type BigIntFieldRefInput<$PrismaModel> = FieldRefInputType<$PrismaModel, 'BigInt'>
+    
+
+
+/**
+ * Reference to a field of type 'BigInt[]'
+ */
+export type ListBigIntFieldRefInput<$PrismaModel> = FieldRefInputType<$PrismaModel, 'BigInt[]'>
+    
+
+
+/**
  * Reference to a field of type 'Json'
  */
 export type JsonFieldRefInput<$PrismaModel> = FieldRefInputType<$PrismaModel, 'Json'>
@@ -1602,6 +1702,7 @@ export type GlobalOmitConfig = {
   verification?: Prisma.VerificationOmit
   conversation?: Prisma.ConversationOmit
   conversationMember?: Prisma.ConversationMemberOmit
+  outbox?: Prisma.OutboxOmit
   pushSubscription?: Prisma.PushSubscriptionOmit
   attachment?: Prisma.AttachmentOmit
   message?: Prisma.MessageOmit

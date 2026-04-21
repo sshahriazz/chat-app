@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Stack,
   TextInput,
@@ -11,6 +11,7 @@ import {
   Loader,
   Center,
   Tooltip,
+  Button,
 } from "@mantine/core";
 import {
   IconSearch,
@@ -38,6 +39,8 @@ export function ConversationList({ onSelect }: ConversationListProps) {
     activeConversationId,
     setActiveConversation,
     isLoadingConversations,
+    hasMoreConversations,
+    loadMoreConversations,
   } = useChat();
   const [search, setSearch] = useState("");
   const [newChatOpen, setNewChatOpen] = useState(false);
@@ -48,6 +51,28 @@ export function ConversationList({ onSelect }: ConversationListProps) {
     if (c.name?.toLowerCase().includes(q)) return true;
     return c.members.some((m) => m.user.name.toLowerCase().includes(q));
   });
+
+  // Stable per-id click handlers so memoized ConversationItem rows don't
+  // invalidate on every parent render. onSelect is pinned to a ref because
+  // it's a prop (potentially changes identity) but we never want a click
+  // handler's identity to flip for that reason.
+  const onSelectRef = useRef(onSelect);
+  onSelectRef.current = onSelect;
+  const clickersRef = useRef(new Map<string, () => void>());
+  const getClicker = useCallback(
+    (id: string) => {
+      let fn = clickersRef.current.get(id);
+      if (!fn) {
+        fn = () => {
+          setActiveConversation(id);
+          onSelectRef.current?.(id);
+        };
+        clickersRef.current.set(id, fn);
+      }
+      return fn;
+    },
+    [setActiveConversation],
+  );
 
   return (
     <>
@@ -93,12 +118,23 @@ export function ConversationList({ onSelect }: ConversationListProps) {
                   key={c.id}
                   conversation={c}
                   active={c.id === activeConversationId}
-                  onClick={() => {
-                    setActiveConversation(c.id);
-                    onSelect?.(c.id);
-                  }}
+                  onClick={getClicker(c.id)}
                 />
               ))}
+              {/* Only show "Load more" when there's no search filter active —
+                  the filter lives entirely in client state so more-results
+                  would only matter once the user clears it. */}
+              {!search && hasMoreConversations && (
+                <Center py="sm">
+                  <Button
+                    variant="subtle"
+                    size="xs"
+                    onClick={() => void loadMoreConversations()}
+                  >
+                    Load more
+                  </Button>
+                </Center>
+              )}
             </Stack>
           )}
         </ScrollArea>
