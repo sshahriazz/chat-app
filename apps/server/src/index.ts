@@ -24,12 +24,39 @@ import { outboxDepth, outboxOldestAgeSeconds, registry as metricsRegistry } from
 
 const app = express();
 
+/**
+ * CORS allowlist resolution order:
+ *   1. `CORS_ALLOWED_ORIGINS` env (comma-separated) — explicit override
+ *   2. `BETTER_AUTH_URL` — the app's public URL, which is required and
+ *      must also be the browser's origin since everything is same-origin
+ *      behind the Next.js proxy. Falling back to it means "I set the
+ *      public URL, origins Just Work"
+ *   3. Dev fallback
+ *
+ * env.ts already hard-fails at boot if CORS_ALLOWED_ORIGINS is unset
+ * AND NODE_ENV=production, so in prod we always have an explicit value.
+ * The fallback chain below covers the dev + mis-configured cases.
+ */
 const allowedOrigins: string[] = (
-  env.CORS_ALLOWED_ORIGINS ?? "http://localhost:3000,http://192.168.0.103:3000"
+  env.CORS_ALLOWED_ORIGINS ??
+  env.BETTER_AUTH_URL ??
+  "http://localhost:3000,http://192.168.0.103:3000"
 )
   .split(",")
   .map((s: string) => s.trim())
   .filter(Boolean);
+
+logger.info(
+  {
+    nodeEnv: env.NODE_ENV,
+    publicUrl: env.BETTER_AUTH_URL,
+    corsAllowedOrigins: allowedOrigins,
+    trustProxy: env.TRUST_PROXY,
+    s3Endpoint: env.S3_ENDPOINT,
+    s3PublicUrlBase: env.S3_PUBLIC_URL_BASE,
+  },
+  "startup config",
+);
 
 // --- Boot-time hardening ----------------------------------------------------
 

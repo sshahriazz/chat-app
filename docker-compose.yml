@@ -77,7 +77,11 @@ services:
       CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
       CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:-admin}
       CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:-dev-admin-secret}
-      CENTRIFUGO_CLIENT_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      # Must include the browser-facing origin — Centrifugo rejects the
+      # WebSocket upgrade otherwise, breaking presence + live events.
+      # Falls back to BETTER_AUTH_URL for the same reason as the server's
+      # CORS allowlist.
+      CENTRIFUGO_CLIENT_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-${BETTER_AUTH_URL:-http://localhost:3000}}
     depends_on:
       postgres:
         condition: service_healthy
@@ -158,7 +162,15 @@ services:
       CENTRIFUGO_URL: http://centrifugo:8000
       CENTRIFUGO_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
       CENTRIFUGO_TOKEN_SECRET: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      # Fall back to BETTER_AUTH_URL so users who only configure the
+      # public URL don't end up with Express rejecting cross-origin
+      # requests from their own domain.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-${BETTER_AUTH_URL:-http://localhost:3000}}
+      # Two proxy hops in the Dokploy/compose deploy: Traefik → web (Next)
+      # → server. `trust proxy: 2` makes Express honor X-Forwarded-* and
+      # report req.ip as the real client — critical for rate limiting
+      # and for better-auth's secure-cookie detection.
+      TRUST_PROXY: ${TRUST_PROXY:-2}
       # S3 split clients (see apps/server/src/lib/s3.ts):
       #   S3_ENDPOINT        — internal, used for HEAD/DELETE/etc.
       #   S3_PUBLIC_URL_BASE — public, used to mint presigned PUT/GET
