@@ -83,6 +83,10 @@ function bufferToBase64(buf: ArrayBuffer | null): string {
  * times — re-subscribe replaces the existing record by endpoint.
  *
  * Throws on any hard failure so the caller can surface a toast.
+ *
+ * Each step is logged to `console.debug` so a stuck subscription can be
+ * traced in DevTools — "which step did we get to?" is the first question
+ * when notifications aren't firing.
  */
 export async function enablePushSubscription(): Promise<void> {
   if (typeof window === "undefined") return;
@@ -90,18 +94,51 @@ export async function enablePushSubscription(): Promise<void> {
     throw new Error("Push not supported in this browser");
   }
 
+  console.debug("[push] 1/5 registering /sw.js");
   const reg =
     (await navigator.serviceWorker.getRegistration("/sw.js")) ??
     (await navigator.serviceWorker.register("/sw.js"));
   await navigator.serviceWorker.ready;
+  console.debug("[push] 2/5 service worker ready", {
+    scope: reg.scope,
+    state:
+      reg.active?.state ?? reg.installing?.state ?? reg.waiting?.state ?? "none",
+  });
 
   // Lazy import so this file stays tree-shakable for SSR.
   const { api } = await import("./api");
   const { key } = await api.get<{ key: string }>("/api/push/vapid-public-key");
+  console.debug("[push] 3/5 fetched VAPID public key", { keyLength: key.length });
 
-  const subscription = await reg.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: urlBase64ToArrayBuffer(key),
+  // `pushManager.subscribe` throws if an existing subscription was minted
+  // with a different applicationServerKey (e.g. you rotated VAPID keys).
+  // Try once; on `InvalidStateError` or `InvalidAccessError`, unsubscribe
+  // the stale one and retry fresh.
+  let subscription: PushSubscription;
+  try {
+    subscription = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToArrayBuffer(key),
+    });
+  } catch (err) {
+    const name = (err as Error).name;
+    if (name === "InvalidStateError" || name === "InvalidAccessError") {
+      console.warn(
+        "[push] stale subscription detected — unsubscribing and retrying",
+        name,
+      );
+      const existing = await reg.pushManager.getSubscription();
+      if (existing) await existing.unsubscribe().catch(() => {});
+      subscription = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToArrayBuffer(key),
+      });
+    } else {
+      throw err;
+    }
+  }
+  console.debug("[push] 4/5 got PushSubscription", {
+    endpointHead: subscription.endpoint.slice(0, 60),
   });
 
   await api.post("/api/push/subscribe", {
@@ -111,6 +148,7 @@ export async function enablePushSubscription(): Promise<void> {
       auth: bufferToBase64(subscription.getKey("auth")),
     },
   });
+  console.debug("[push] 5/5 server registered the subscription");
 }
 
 export async function disablePushSubscription(): Promise<void> {

@@ -19,6 +19,8 @@ import attachmentRoutes from "./routes/attachments";
 import pushRoutes from "./routes/push";
 import { apiReference } from "@scalar/express-api-reference";
 import { getOpenApiDocument } from "./http/openapi";
+import { httpMetrics } from "./middleware/metrics";
+import { outboxDepth, outboxOldestAgeSeconds, registry as metricsRegistry } from "./infra/metrics";
 
 const app = express();
 
@@ -41,6 +43,11 @@ app.set("trust proxy", env.TRUST_PROXY);
 
 // Request id first, before the logger so every log line carries it.
 app.use(requestId);
+
+// HTTP timing + count Prometheus metrics. Mounted before all routers so
+// the observer catches the full handler duration, including middleware
+// like auth + validate.
+app.use(httpMetrics);
 
 // Structured request logs via pino-http, piggy-backing on our pino
 // instance so there's a single log stream. Health probes are noisy; drop
@@ -92,6 +99,15 @@ app.use(
 // and bypass every middleware that could 401 or fail.
 app.use(healthRoutes);
 
+// Prometheus scrape target. Unauthenticated on purpose (standard
+// convention); protect by binding to an internal network, firewall, or
+// service-mesh mTLS in production. Kept next to health probes so it's
+// available without auth or body parsing running first.
+app.get("/metrics", async (_req, res) => {
+  res.set("Content-Type", metricsRegistry.contentType);
+  res.end(await metricsRegistry.metrics());
+});
+
 // --- API documentation ------------------------------------------------------
 //
 // Zod schemas → OpenAPI 3.1 document → Scalar UI. Registered before auth so
@@ -101,29 +117,22 @@ app.use(healthRoutes);
 app.get("/openapi.json", (_req, res) => {
   res.json(getOpenApiDocument());
 });
-// Scalar's shell pulls its bundle from jsdelivr and injects an inline
-// bootstrap script; the app-wide strict CSP blocks both. Scope a relaxed
-// CSP to `/docs` only so the rest of the server keeps the hardened default.
+// Scalar's shell pulls its bundle from jsdelivr, uses eval internally,
+// fetches source maps, and (by default) talks to api.scalar.com for a
+// curated registry. The app-wide strict CSP blocks all of that. Disable
+// CSP on `/docs` alone — every real API route keeps the hardened default,
+// and the docs page is a third-party renderer whose attack surface is
+// already a function of trusting Scalar's CDN.
 app.use(
   "/docs",
-  helmet({
-    contentSecurityPolicy: {
-      useDefaults: true,
-      directives: {
-        "script-src": ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
-        "script-src-elem": [
-          "'self'",
-          "'unsafe-inline'",
-          "https://cdn.jsdelivr.net",
-        ],
-        "style-src": ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
-        "img-src": ["'self'", "data:", "https:"],
-        "font-src": ["'self'", "data:", "https://cdn.jsdelivr.net"],
-        "connect-src": ["'self'"],
-        "worker-src": ["'self'", "blob:"],
-      },
-    },
-  }),
+  (_req, res, next) => {
+    // The global helmet() above already stamped CSP; per-route helmet
+    // can't un-set a header an upstream middleware added. Strip it here
+    // so Scalar's CDN bundle + inline bootstrap + eval-based runtime
+    // + api.scalar.com fetches all work.
+    res.removeHeader("Content-Security-Policy");
+    next();
+  },
   apiReference({
     url: "/openapi.json",
     theme: "default",
@@ -135,35 +144,103 @@ app.use(
 app.use(["/api/auth/sign-in", "/api/auth/sign-up"], authLimiter);
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
-// Body cap = 1 MB. Anything bigger than a chat message with attachments
-// already rejects server-side; this is the outer envelope.
-app.use(express.json({ limit: "1mb" }));
-
 // --- Route tree -------------------------------------------------------------
-
-app.use("/api/centrifugo", centrifugoRoutes);
-app.use("/api/users", userRoutes);
-app.use("/api/attachments", attachmentRoutes);
-app.use("/api/push", pushRoutes);
-app.use("/api", chatRoutes);
+//
+// Body-size limits are tuned per route-tree rather than a single global
+// cap. A tight limit on low-churn endpoints (push subs, tokens, user
+// search) costs nothing and shrinks the DoS surface if the app-level
+// rate limiter ever fails open. Only the chat catch-all gets a 512 KB
+// ceiling because rich Tiptap JSON for a long message can legitimately
+// serialize above the global default.
+app.use("/api/centrifugo", express.json({ limit: "4kb" }), centrifugoRoutes);
+app.use("/api/users", express.json({ limit: "32kb" }), userRoutes);
+app.use("/api/attachments", express.json({ limit: "8kb" }), attachmentRoutes);
+app.use("/api/push", express.json({ limit: "4kb" }), pushRoutes);
+// Chat catch-all registered last so more specific prefixes above match
+// first. 512 KB covers the worst-case serialized Tiptap doc (50K plain
+// chars × ~3× markup overhead) plus request-shape overhead.
+app.use("/api", express.json({ limit: "512kb" }), chatRoutes);
 
 // --- Terminal error sink ----------------------------------------------------
 //
-// A minimal fallback handler — the full DomainError → AppError pipeline
-// from the bootstrap guide is a separate sprint (module refactor). For
-// now we ensure uncaught errors are JSON-shaped, logged with request
-// correlation, and don't leak stacks to clients.
+// Any error thrown (or passed to `next(err)`) by a handler lands here.
+// DomainError subclasses carry their own status/code/details; everything
+// else is treated as an unhandled 500 and logged with full context so the
+// stack is still reachable in logs without leaking to clients.
+import { isDomainError } from "./http/errors";
+import { ERROR_CODES } from "./http/openapi-shared";
+
 app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
-  const e = err as { status?: number; message?: string; name?: string };
-  const status = typeof e.status === "number" ? e.status : 500;
+  const requestId =
+    typeof req.headers["x-request-id"] === "string"
+      ? (req.headers["x-request-id"] as string)
+      : undefined;
+
+  if (isDomainError(err)) {
+    // 4xx is a warn, 5xx is an error. DomainError should never be 5xx
+    // under normal use — if we add one, update this branch.
+    const logLevel = err.httpStatus >= 500 ? "error" : "warn";
+    req.log?.[logLevel](
+      {
+        err: { name: err.name, code: err.code, message: err.message },
+        status: err.httpStatus,
+      },
+      "domain error",
+    );
+    res.status(err.httpStatus).json({
+      status: err.httpStatus,
+      error: err.message,
+      code: err.code,
+      requestId,
+      ...(err.details ? { details: err.details } : {}),
+    });
+    return;
+  }
+
+  // Recognize errors thrown by built-in middleware (express.json's
+  // body-parser, for example) that carry a numeric status. Map to the
+  // canonical envelope rather than leaking a 500.
+  const e = err as {
+    message?: string;
+    name?: string;
+    stack?: string;
+    status?: number;
+    statusCode?: number;
+    type?: string;
+  };
+  const parserStatus = e.status ?? e.statusCode;
+  if (typeof parserStatus === "number" && parserStatus >= 400 && parserStatus < 500) {
+    const code =
+      parserStatus === 413
+        ? ERROR_CODES.PAYLOAD_TOO_LARGE
+        : parserStatus === 415
+          ? ERROR_CODES.UNSUPPORTED_MEDIA_TYPE
+          : ERROR_CODES.BAD_REQUEST;
+    req.log?.warn(
+      { err: { name: e.name, message: e.message, type: e.type }, status: parserStatus },
+      "framework error",
+    );
+    if (!res.headersSent) {
+      res.status(parserStatus).json({
+        status: parserStatus,
+        error: e.message ?? "Bad request",
+        code,
+        requestId,
+      });
+    }
+    return;
+  }
+
   req.log?.error(
-    { err: { name: e.name, message: e.message }, status },
+    { err: { name: e.name, message: e.message, stack: e.stack }, status: 500 },
     "unhandled error",
   );
   if (!res.headersSent) {
-    res.status(status).json({
-      status,
-      error: status >= 500 ? "Internal Server Error" : (e.message ?? "Error"),
+    res.status(500).json({
+      status: 500,
+      error: "Internal Server Error",
+      code: ERROR_CODES.INTERNAL_ERROR,
+      requestId,
     });
   }
 });
@@ -243,3 +320,33 @@ import("node-cron").then(({ default: cron }) => {
     });
   });
 });
+
+// --- Outbox depth sampler ---------------------------------------------------
+//
+// Samples `chat_outbox` every 10s into Prometheus gauges so we can page
+// when Centrifugo's PG consumer falls behind. Healthy steady state is
+// depth ≈ 0 and oldest-age ≈ 0; sustained non-zero values indicate the
+// consumer is down or lagging.
+setInterval(async () => {
+  try {
+    const rows = await prisma.$queryRaw<
+      { depth: bigint; oldest_age_seconds: number | null }[]
+    >`
+      SELECT COUNT(*)::bigint AS depth,
+             EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::float AS oldest_age_seconds
+      FROM chat_outbox
+    `;
+    const row = rows[0];
+    if (row) {
+      outboxDepth.set(Number(row.depth));
+      outboxOldestAgeSeconds.set(row.oldest_age_seconds ?? 0);
+    }
+  } catch (err) {
+    // Sampler failures are non-fatal; they'd be visible as gauges
+    // going stale rather than the app falling over.
+    logger.warn(
+      { err: { message: (err as Error).message } },
+      "outbox sampler failed",
+    );
+  }
+}, 10_000).unref();

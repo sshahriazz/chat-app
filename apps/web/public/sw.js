@@ -1,22 +1,32 @@
 // Chat app service worker — only handles Web Push + notification clicks.
 // No caching / no offline mode (yet).
+//
+// SW_VERSION: bump this string whenever the file logic changes so the
+// browser re-checks and replaces a stale worker.
+const SW_VERSION = "2026-04-21-b";
 
 self.addEventListener("install", () => {
+  console.log("[sw]", SW_VERSION, "install");
   self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
+  console.log("[sw]", SW_VERSION, "activate");
   event.waitUntil(self.clients.claim());
 });
 
 self.addEventListener("push", (event) => {
-  if (!event.data) return;
+  if (!event.data) {
+    console.warn("[sw] push event had no data");
+    return;
+  }
   let data;
   try {
     data = event.data.json();
   } catch {
     data = { title: "Message", body: event.data.text() };
   }
+  console.log("[sw] push received", { title: data.title, tag: data.tag });
 
   event.waitUntil(
     (async () => {
@@ -29,8 +39,18 @@ self.addEventListener("push", (event) => {
       const hasVisibleTab = clients.some(
         (c) => c.visibilityState === "visible" && c.focused,
       );
-      if (hasVisibleTab) return;
+      if (hasVisibleTab) {
+        console.log(
+          "[sw] push suppressed — an app tab is currently focused (in-app toast will fire)",
+          clients.map((c) => ({
+            visibilityState: c.visibilityState,
+            focused: c.focused,
+          })),
+        );
+        return;
+      }
 
+      console.log("[sw] showing OS notification");
       await self.registration.showNotification(data.title || "New message", {
         body: data.body || "",
         tag: data.tag,

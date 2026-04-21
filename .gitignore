@@ -4,4 +4,6 @@ dist
 .turbo
 *.tsbuildinfo
 .env
+./src/generated
 src/generated
+apps/server/src/generated

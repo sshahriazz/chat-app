@@ -3,6 +3,13 @@ import { prismaAdapter } from "better-auth/adapters/prisma";
 import { createAuthMiddleware, APIError } from "better-auth/api";
 import { prisma } from "./db";
 import { env } from "./env";
+import { invalidateUserProfile } from "./lib/user-cache";
+import {
+  clearAuthFailures,
+  isAccountLocked,
+  recordAuthFailure,
+} from "./lib/auth-lockout";
+import { authLockoutsTotal } from "./infra/metrics";
 
 /**
  * Only accept avatar URLs that originate from our own object-storage
@@ -41,7 +48,51 @@ export const auth = betterAuth({
     updateAge: 60 * 60 * 24, // refresh every 24h
   },
   hooks: {
+    after: createAuthMiddleware(async (ctx) => {
+      // Bust the profile cache whenever better-auth mutates the user row.
+      // The `before` hook validates the inputs; this one fires after
+      // persistence so replicas read the fresh data on next lookup.
+      if (ctx.path === "/update-user") {
+        const userId = ctx.context?.session?.user?.id;
+        if (userId) await invalidateUserProfile(userId);
+      }
+
+      // Account-lockout bookkeeping. We only get here on a non-thrown
+      // response — better-auth already produced a payload. Inspect the
+      // context to decide success vs. failure. Successful sign-in
+      // populates `newSession`; failures don't.
+      if (ctx.path === "/sign-in/email") {
+        const email = (ctx.body as { email?: unknown })?.email;
+        if (typeof email === "string" && email.length > 0) {
+          const returned = ctx.context?.returned as
+            | { newSession?: unknown }
+            | undefined;
+          if (returned?.newSession) {
+            await clearAuthFailures(email);
+          } else {
+            await recordAuthFailure(email);
+          }
+        }
+      }
+    }),
     before: createAuthMiddleware(async (ctx) => {
+      // Check the account lockout counter before better-auth does any
+      // DB work. Rejecting here keeps the timing side-channel consistent
+      // (locked email fails with the same shape as a wrong password)
+      // and spares the DB a lookup per attempt.
+      if (ctx.path === "/sign-in/email") {
+        const email = (ctx.body as { email?: unknown })?.email;
+        if (typeof email === "string" && email.length > 0) {
+          if (await isAccountLocked(email)) {
+            authLockoutsTotal.inc();
+            throw new APIError("TOO_MANY_REQUESTS", {
+              message:
+                "Too many failed sign-in attempts. Try again in 15 minutes.",
+            });
+          }
+        }
+      }
+
       // Defense-in-depth for avatar updates. Client-side validation in
       // settings/page.tsx covers the happy path; this rejects direct
       // `authClient.updateUser({ image: "…" })` calls from the console.

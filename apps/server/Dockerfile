@@ -44,6 +44,18 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
   CMD wget -q --spider http://localhost:3001/livez || exit 1
 
 WORKDIR /app/apps/server
-# Migrations run on startup so every deploy is consistent; the server
-# only binds after they complete.
-CMD ["sh", "-c", "pnpm exec prisma migrate deploy && node dist/index.mjs"]
+
+# Migrations run as a ONE-SHOT step before rolling deploys, not on every
+# container start. Starting them inline would make N replicas race on
+# the same `prisma migrate deploy`, which occasionally corrupts state
+# (two replicas picking the same pending migration, partial writes, etc).
+#
+# Recommended orchestration:
+#   k8s:    Job (or initContainer with leader election) using the same
+#           image — `docker run <image> pnpm exec prisma migrate deploy`.
+#   ECS:    One-off task pre-deploy.
+#   docker: `./scripts/migrate.sh` before `docker compose up -d`.
+#
+# The advisory-lock wrapper at `scripts/migrate.sh` is safe to invoke
+# from every replica — only one will acquire the lock and run migrations.
+CMD ["node", "dist/index.mjs"]

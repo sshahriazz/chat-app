@@ -75,6 +75,26 @@ export const isProduction = env.NODE_ENV === "production";
 export const isTest = env.NODE_ENV === "test";
 
 /**
+ * Production hard-fail: CORS_ALLOWED_ORIGINS must be set explicitly. The
+ * dev fallback in `auth.ts` / `index.ts` hardcodes localhost origins,
+ * which would silently accept cross-origin requests from any localhost-
+ * served attacker tool when shipped to prod. Exiting here forces the
+ * operator to set an explicit allowlist at deploy time.
+ */
+if (isProduction) {
+  const origins = (env.CORS_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (origins.length === 0) {
+    console.error(
+      "[env] CORS_ALLOWED_ORIGINS is required in production (comma-separated list of origins).",
+    );
+    process.exit(1);
+  }
+}
+
+/**
  * Enforce UTC at startup. Consistent timezones keep logs + DB timestamps
  * + cron schedules predictable across deploys. In prod we hard-fail;
  * in dev we just warn so a developer can keep working.

@@ -5,6 +5,9 @@ import {
   generateSubscriptionToken,
 } from "../lib/centrifugo";
 import { prisma } from "../db";
+import { validate } from "../http/validate";
+import { SubscriptionTokenBodySchema } from "../http/schemas";
+import { ForbiddenError } from "../http/errors";
 
 const router: Router = Router();
 
@@ -29,34 +32,28 @@ router.post("/connection-token", requireAuth, (req, res) => {
 // `user:{userId}` channel is auto-subscribed via the connection
 // token's `subs` claim, so it does not go through here.
 
-router.post("/subscription-token", requireAuth, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
-  const { channel } = req.body as { channel?: string };
+router.post(
+  "/subscription-token",
+  requireAuth,
+  validate({ body: SubscriptionTokenBodySchema }),
+  async (req, res) => {
+    const { user } = req as AuthenticatedRequest;
+    const { channel } = req.body as { channel: string };
 
-  if (!channel) {
-    res.status(400).json({ error: "channel is required" });
-    return;
-  }
+    const match = channel.match(/^presence:conv_(.+)$/);
+    if (!match) throw new ForbiddenError("forbidden channel");
 
-  const match = channel.match(/^presence:conv_(.+)$/);
-  if (!match) {
-    res.status(403).json({ error: "forbidden channel" });
-    return;
-  }
+    const conversationId = match[1];
 
-  const conversationId = match[1];
+    const member = await prisma.conversationMember.findUnique({
+      where: { conversationId_userId: { conversationId, userId: user.id } },
+    });
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId, userId: user.id } },
-  });
+    if (!member) throw new ForbiddenError("not a member");
 
-  if (!member) {
-    res.status(403).json({ error: "not a member" });
-    return;
-  }
-
-  const token = generateSubscriptionToken(user.id, channel);
-  res.json({ token });
-});
+    const token = generateSubscriptionToken(user.id, channel);
+    res.json({ token });
+  },
+);
 
 export default router;

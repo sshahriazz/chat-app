@@ -585,16 +585,22 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     };
   }, [user, handleUserEvent]);
 
-  // ─── Load messages + presence sub for the active conversation ──────
-
+  // ─── Load messages for the active conversation ──────────────
+  //
+  // Fires when the conversation id changes (or on first login). NOT gated
+  // on centrifugoReady — the HTTP fetch doesn't need the socket, and
+  // gating on it caused a visible full-chat reload every time the tab
+  // refocused (WS reconnect → centrifugoReady flips → effect re-ran →
+  // setMessages([]) + refetch). With `force_recovery: true` set on the
+  // `user` namespace in centrifugo.json, the broker replays any missed
+  // events on reconnect, so there's nothing for us to re-pull over HTTP.
   useEffect(() => {
-    if (!activeConversationId || !user || !centrifugoReady) return;
+    if (!activeConversationId || !user) return;
 
     setIsLoadingMessages(true);
     setMessages([]);
     setReadPositions([]);
     setTypingUsers([]);
-    setActiveUserIds(new Set());
     setUnreadAnchorId(null);
 
     lastSeqActiveRef.current = 0;
@@ -630,6 +636,22 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => setIsLoadingMessages(false));
 
+    setConversations((prev) =>
+      prev.map((c) => (c.id === activeConversationId ? { ...c, unreadCount: 0 } : c)),
+    );
+
+    api.post("/api/me/active").catch(() => {});
+  }, [activeConversationId, user]);
+
+  // ─── Presence subscription ──────────────────────────────────
+  //
+  // Re-runs on conversation change AND on WS reconnect, but only touches
+  // `activeUserIds` (+ typing timeout cleanup). Message state is untouched.
+  useEffect(() => {
+    if (!activeConversationId || !centrifugoReady) return;
+
+    setActiveUserIds(new Set());
+
     centrifugo.subscribePresence(activeConversationId, {
       getToken: async (channel) => {
         const res = await api.post<{ token: string }>(
@@ -653,19 +675,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       },
     });
 
-    setConversations((prev) =>
-      prev.map((c) => (c.id === activeConversationId ? { ...c, unreadCount: 0 } : c)),
-    );
-
-    api.post("/api/me/active").catch(() => {});
-
     const convId = activeConversationId;
     return () => {
       centrifugo.unsubscribePresence(convId);
       typingTimeoutsRef.current.forEach((t) => clearTimeout(t));
       typingTimeoutsRef.current.clear();
     };
-  }, [activeConversationId, user, centrifugoReady]);
+  }, [activeConversationId, centrifugoReady]);
 
   // ─── Actions ────────────────────────────────────────────────
 

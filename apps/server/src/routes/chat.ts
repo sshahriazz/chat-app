@@ -7,6 +7,8 @@ import {
   getConversationMemberIds,
   invalidateConversation,
 } from "../lib/member-cache";
+import { invalidateConversationMeta } from "../lib/conversation-cache";
+import { invalidateUserProfile } from "../lib/user-cache";
 import { pushToUsers } from "../lib/push";
 import { logger } from "../lib/logger";
 import { headObjectSize, deleteObject, keyFromPublicUrl } from "../lib/s3";
@@ -25,6 +27,26 @@ import {
   searchLimiter,
   generalLimiter,
 } from "../middleware/rate-limit";
+import { validate } from "../http/validate";
+import {
+  BadRequestError,
+  ForbiddenError,
+  NotFoundError,
+  PayloadTooLargeError,
+} from "../http/errors";
+import {
+  AddMembersBodySchema,
+  CreateConversationBodySchema,
+  EditMessageBodySchema,
+  ListConversationsQuerySchema,
+  ListMessagesQuerySchema,
+  MarkReadBodySchema,
+  MuteBodySchema,
+  ReactionBodySchema,
+  RenameConversationBodySchema,
+  SearchQuerySchema,
+  SendMessageBodySchema,
+} from "../http/schemas";
 
 const router: Router = Router();
 
@@ -111,7 +133,11 @@ router.get("/init", requireAuth, async (req, res) => {
 
 // ─── Create conversation ──────────────────────────────────────
 
-router.post("/conversations", requireAuth, async (req, res) => {
+router.post(
+  "/conversations",
+  requireAuth,
+  validate({ body: CreateConversationBodySchema }),
+  async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const { type, name, memberIds } = req.body as {
     type: "direct" | "group";
@@ -120,14 +146,12 @@ router.post("/conversations", requireAuth, async (req, res) => {
   };
 
   if (!type || !memberIds?.length) {
-    res.status(400).json({ error: "type and memberIds are required" });
-    return;
+    throw new BadRequestError("type and memberIds are required");
   }
 
   if (type === "direct") {
     if (memberIds.length !== 1) {
-      res.status(400).json({ error: "Direct chats require exactly one other member" });
-      return;
+      throw new BadRequestError("Direct chats require exactly one other member");
     }
 
     // Check for existing direct conversation
@@ -193,14 +217,17 @@ router.post("/conversations", requireAuth, async (req, res) => {
 
   // Cache warms lazily on next read, but invalidate pre-emptively in case a
   // prior (e.g. ghost) entry lingered.
-  invalidateConversation(conversation.id);
+  await Promise.all([
+    invalidateConversation(conversation.id),
+    invalidateConversationMeta(conversation.id),
+  ]);
 
   res.status(201).json(conversation);
 });
 
 // ─── List conversations ───────────────────────────────────────
 
-router.get("/conversations", requireAuth, async (req, res) => {
+router.get("/conversations", requireAuth, validate({ query: ListConversationsQuerySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const limit = Number(req.query.limit) || 50;
   const before =
@@ -230,8 +257,7 @@ router.get("/conversations/:id", requireAuth, async (req, res) => {
   });
 
   if (!conversation) {
-    res.status(404).json({ error: "Conversation not found" });
-    return;
+    throw new NotFoundError("Conversation not found");
   }
 
   res.json(conversation);
@@ -239,7 +265,7 @@ router.get("/conversations/:id", requireAuth, async (req, res) => {
 
 // ─── Update conversation (rename group) ───────────────────────
 
-router.put("/conversations/:id", requireAuth, async (req, res) => {
+router.put("/conversations/:id", requireAuth, validate({ body: RenameConversationBodySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { name } = req.body as { name: string };
@@ -250,18 +276,15 @@ router.put("/conversations/:id", requireAuth, async (req, res) => {
   });
 
   if (!member) {
-    res.status(404).json({ error: "Conversation not found" });
-    return;
+    throw new NotFoundError("Conversation not found");
   }
 
   if (member.conversation.type !== "group") {
-    res.status(400).json({ error: "Cannot rename a direct conversation" });
-    return;
+    throw new BadRequestError("Cannot rename a direct conversation");
   }
 
   if (member.role !== "owner" && member.role !== "admin") {
-    res.status(403).json({ error: "Only owners and admins can rename groups" });
-    return;
+    throw new ForbiddenError("Only owners and admins can rename groups");
   }
 
   const oldName = member.conversation.name;
@@ -293,14 +316,13 @@ router.put("/conversations/:id", requireAuth, async (req, res) => {
 
 // ─── Add members (promotes a direct chat to a group when expanding) ──
 
-router.post("/conversations/:id/members", requireAuth, async (req, res) => {
+router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembersBodySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { userIds, name } = req.body as { userIds: string[]; name?: string };
 
   if (!userIds?.length) {
-    res.status(400).json({ error: "userIds is required" });
-    return;
+    throw new BadRequestError("userIds is required");
   }
 
   const member = await prisma.conversationMember.findUnique({
@@ -309,8 +331,7 @@ router.post("/conversations/:id/members", requireAuth, async (req, res) => {
   });
 
   if (!member) {
-    res.status(404).json({ error: "Conversation not found" });
-    return;
+    throw new NotFoundError("Conversation not found");
   }
 
   const wasDirect = member.conversation.type === "direct";
@@ -395,7 +416,10 @@ router.post("/conversations/:id/members", requireAuth, async (req, res) => {
     return { added: newUsers.length, promoted: wasDirect };
   });
 
-  invalidateConversation(id);
+  await Promise.all([
+    invalidateConversation(id),
+    invalidateConversationMeta(id),
+  ]);
 
   res.json(result);
 });
@@ -414,13 +438,11 @@ router.delete("/conversations/:id/members/:userId", requireAuth, async (req, res
   });
 
   if (!member || member.conversation.type !== "group") {
-    res.status(404).json({ error: "Group not found" });
-    return;
+    throw new NotFoundError("Group not found");
   }
 
   if (!isSelf && member.role !== "owner" && member.role !== "admin") {
-    res.status(403).json({ error: "Only owners and admins can remove members" });
-    return;
+    throw new ForbiddenError("Only owners and admins can remove members");
   }
 
   await withRealtime(async (rt) => {
@@ -470,7 +492,10 @@ router.delete("/conversations/:id/members/:userId", requireAuth, async (req, res
     );
   });
 
-  invalidateConversation(id);
+  await Promise.all([
+    invalidateConversation(id),
+    invalidateConversationMeta(id),
+  ]);
 
   res.json({ ok: true });
 });
@@ -500,7 +525,7 @@ const MESSAGE_INCLUDE = {
   },
 } as const;
 
-router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, async (req, res) => {
+router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, validate({ body: SendMessageBodySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { content, replyToId, clientMessageId, attachmentIds } = req.body as {
@@ -522,22 +547,19 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
       canonJson = canonicalizeFromJson(content);
       plainText = extractPlainText(canonJson);
     } catch {
-      res.status(400).json({ error: "content must be a Tiptap JSON document" });
-      return;
+      throw new BadRequestError("content must be a Tiptap JSON document");
     }
   }
 
   if (plainText.length > MAX_MESSAGE_PLAIN_CHARS) {
-    res.status(413).json({
-      error: `content exceeds ${MAX_MESSAGE_PLAIN_CHARS} characters`,
-    });
-    return;
+    throw new PayloadTooLargeError(
+      `content exceeds ${MAX_MESSAGE_PLAIN_CHARS} characters`,
+    );
   }
 
   const hasBody = canonJson !== null && !isEmptyContent(canonJson);
   if (!hasBody && attachmentIdList.length === 0) {
-    res.status(400).json({ error: "content or attachments required" });
-    return;
+    throw new BadRequestError("content or attachments required");
   }
 
   const member = await prisma.conversationMember.findUnique({
@@ -545,8 +567,7 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
   });
 
   if (!member) {
-    res.status(403).json({ error: "Not a member of this conversation" });
-    return;
+    throw new ForbiddenError("Not a member of this conversation");
   }
 
   // Retry-safe dedup: if the client already sent this message and we stored
@@ -554,8 +575,7 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
   // also protects against two concurrent inserts with the same key.
   if (clientMessageId !== undefined) {
     if (typeof clientMessageId !== "string" || clientMessageId.length > 256) {
-      res.status(400).json({ error: "clientMessageId must be ≤256 chars" });
-      return;
+      throw new BadRequestError("clientMessageId must be ≤256 chars");
     }
   }
   if (clientMessageId) {
@@ -579,8 +599,7 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
       where: { id: replyToId, conversationId: id, deletedAt: null },
     });
     if (!replyTarget) {
-      res.status(404).json({ error: "Reply target message not found" });
-      return;
+      throw new NotFoundError("Reply target message not found");
     }
   }
 
@@ -596,8 +615,7 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
       return !row || row.uploaderId !== user.id || row.messageId !== null;
     });
     if (bad) {
-      res.status(400).json({ error: `invalid attachment: ${bad}` });
-      return;
+      throw new BadRequestError(`invalid attachment: ${bad}`);
     }
   }
 
@@ -828,14 +846,13 @@ function shapeSearchResults(rows: SearchRow[]) {
   }));
 }
 
-router.get("/conversations/:id/search", requireAuth, searchLimiter, async (req, res) => {
+router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ query: SearchQuerySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const q = ((req.query.q as string) || "").trim();
 
   if (q.length < 2 || q.length > 128) {
-    res.status(400).json({ error: "q must be 2-128 characters" });
-    return;
+    throw new BadRequestError("q must be 2-128 characters");
   }
 
   const member = await prisma.conversationMember.findUnique({
@@ -843,8 +860,7 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, async (req, 
     select: { id: true },
   });
   if (!member) {
-    res.status(403).json({ error: "Not a member of this conversation" });
-    return;
+    throw new ForbiddenError("Not a member of this conversation");
   }
 
   const likePattern = `%${q}%`;
@@ -875,13 +891,12 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, async (req, 
 
 // Global search — all conversations the user is a member of.
 // Intended as the foundation for a global Cmd+K modal later.
-router.get("/search", requireAuth, searchLimiter, async (req, res) => {
+router.get("/search", requireAuth, searchLimiter, validate({ query: SearchQuerySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const q = ((req.query.q as string) || "").trim();
 
   if (q.length < 2 || q.length > 128) {
-    res.status(400).json({ error: "q must be 2-128 characters" });
-    return;
+    throw new BadRequestError("q must be 2-128 characters");
   }
 
   const likePattern = `%${q}%`;
@@ -916,7 +931,7 @@ router.get("/search", requireAuth, searchLimiter, async (req, res) => {
 
 // ─── Get messages (paginated, cursor-based by ID) ─────────────
 
-router.get("/conversations/:id/messages", requireAuth, generalLimiter, async (req, res) => {
+router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate({ query: ListMessagesQuerySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const before = req.query.before as string | undefined;
@@ -928,8 +943,7 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, async (re
   });
 
   if (!member) {
-    res.status(403).json({ error: "Not a member of this conversation" });
-    return;
+    throw new ForbiddenError("Not a member of this conversation");
   }
 
   const take = Math.min(parseInt(limit || "50", 10) || 50, 100);
@@ -1029,7 +1043,7 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, async (re
 
 // ─── Edit message ─────────────────────────────────────────────
 
-router.put("/conversations/:id/messages/:messageId", requireAuth, async (req, res) => {
+router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ body: EditMessageBodySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
@@ -1041,8 +1055,7 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, async (req, re
     canonJson = canonicalizeFromJson(content);
     plainText = extractPlainText(canonJson);
   } catch {
-    res.status(400).json({ error: "content must be a Tiptap JSON document" });
-    return;
+    throw new BadRequestError("content must be a Tiptap JSON document");
   }
 
   if (plainText.length > MAX_MESSAGE_PLAIN_CHARS) {
@@ -1053,8 +1066,7 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, async (req, re
   }
 
   if (isEmptyContent(canonJson)) {
-    res.status(400).json({ error: "content is required" });
-    return;
+    throw new BadRequestError("content is required");
   }
 
   const message = await prisma.message.findFirst({
@@ -1068,8 +1080,7 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, async (req, re
   });
 
   if (!message) {
-    res.status(404).json({ error: "Message not found or not yours" });
-    return;
+    throw new NotFoundError("Message not found or not yours");
   }
 
   const updated = await withRealtime(async (rt) => {
@@ -1129,8 +1140,7 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
   });
 
   if (!message) {
-    res.status(404).json({ error: "Message not found or not yours" });
-    return;
+    throw new NotFoundError("Message not found or not yours");
   }
 
   await withRealtime(async (rt) => {
@@ -1160,14 +1170,13 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
 
 // ─── Mark conversation as read ────────────────────────────────
 
-router.post("/conversations/:id/read", requireAuth, async (req, res) => {
+router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBodySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { messageId } = req.body as { messageId: string };
 
   if (!messageId) {
-    res.status(400).json({ error: "messageId is required" });
-    return;
+    throw new BadRequestError("messageId is required");
   }
 
   // Verify message exists in this conversation
@@ -1176,8 +1185,7 @@ router.post("/conversations/:id/read", requireAuth, async (req, res) => {
   });
 
   if (!message) {
-    res.status(404).json({ error: "Message not found" });
-    return;
+    throw new NotFoundError("Message not found");
   }
 
   await withRealtime(async (rt) => {
@@ -1212,14 +1220,13 @@ router.post("/conversations/:id/read", requireAuth, async (req, res) => {
 
 // ─── Mute / unmute conversation ───────────────────────────────
 
-router.post("/conversations/:id/mute", requireAuth, async (req, res) => {
+router.post("/conversations/:id/mute", requireAuth, validate({ body: MuteBodySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { muted } = req.body as { muted: boolean };
 
   if (typeof muted !== "boolean") {
-    res.status(400).json({ error: "muted (boolean) is required" });
-    return;
+    throw new BadRequestError("muted (boolean) is required");
   }
 
   const member = await prisma.conversationMember.findUnique({
@@ -1227,8 +1234,7 @@ router.post("/conversations/:id/mute", requireAuth, async (req, res) => {
   });
 
   if (!member) {
-    res.status(404).json({ error: "Conversation not found" });
-    return;
+    throw new NotFoundError("Conversation not found");
   }
 
   await withRealtime(async (rt) => {
@@ -1253,7 +1259,7 @@ router.post("/conversations/:id/mute", requireAuth, async (req, res) => {
 
 // ─── Add reaction ─────────────────────────────────────────────
 
-router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, async (req, res) => {
+router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, validate({ body: ReactionBodySchema }), async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
@@ -1261,15 +1267,13 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, asy
   const trimmedEmoji = emoji?.trim() ?? "";
 
   if (!trimmedEmoji) {
-    res.status(400).json({ error: "emoji is required" });
-    return;
+    throw new BadRequestError("emoji is required");
   }
   // A grapheme cluster is rarely more than 16 UTF-16 code units (flag
   // emojis, skin tones, ZWJ sequences). Reject anything longer —
   // attacker could otherwise stuff the unique-index with huge strings.
   if (trimmedEmoji.length > 16) {
-    res.status(400).json({ error: "emoji must be ≤16 chars" });
-    return;
+    throw new BadRequestError("emoji must be ≤16 chars");
   }
 
   // Verify membership and message exists
@@ -1283,8 +1287,7 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, asy
   });
 
   if (!message) {
-    res.status(404).json({ error: "Message not found" });
-    return;
+    throw new NotFoundError("Message not found");
   }
 
   const reaction = await withRealtime(async (rt) => {
@@ -1329,8 +1332,7 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
   const emoji = decodeURIComponent(param(req.params.emoji));
 
   if (emoji.length > 16 || emoji.length === 0) {
-    res.status(400).json({ error: "emoji must be 1-16 chars" });
-    return;
+    throw new BadRequestError("emoji must be 1-16 chars");
   }
 
   const deleted = await prisma.reaction.deleteMany({
@@ -1338,8 +1340,7 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
   });
 
   if (deleted.count === 0) {
-    res.status(404).json({ error: "Reaction not found" });
-    return;
+    throw new NotFoundError("Reaction not found");
   }
 
   await withRealtime(async (rt) => {
@@ -1370,8 +1371,7 @@ router.post("/conversations/:id/typing", requireAuth, typingLimiter, async (req,
   });
 
   if (!member) {
-    res.status(403).json({ error: "Not a member of this conversation" });
-    return;
+    throw new ForbiddenError("Not a member of this conversation");
   }
 
   // Typing is ephemeral; dupe keys collide by design so retries within the
@@ -1410,13 +1410,18 @@ router.post("/me/active", requireAuth, generalLimiter, async (req, res) => {
 router.post("/me/broadcast-profile", requireAuth, generalLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
 
+  // Bust the cache first so the next read downstream gets fresh data.
+  // The client has already written to the DB through better-auth by the
+  // time it calls this endpoint; we're only responsible for fan-out +
+  // cache coherence.
+  await invalidateUserProfile(user.id);
+
   const fresh = await prisma.user.findUnique({
     where: { id: user.id },
     select: { id: true, name: true, image: true },
   });
   if (!fresh) {
-    res.status(404).json({ error: "User not found" });
-    return;
+    throw new NotFoundError("User not found");
   }
 
   // Distinct peer user ids — everyone who shares at least one conversation

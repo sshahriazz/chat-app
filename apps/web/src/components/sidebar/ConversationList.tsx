@@ -157,12 +157,18 @@ function NotificationsToggle() {
 
   // If the user has already granted permission in a past session, make sure
   // the browser is still registered for Web Push. Idempotent — re-subscribing
-  // on an already-subscribed endpoint just refreshes the server row.
+  // on an already-subscribed endpoint just refreshes the server row. Errors
+  // are logged to the console (not toasted, to avoid nagging users whose
+  // server doesn't have VAPID configured — those failures are expected and
+  // not actionable by the user).
   useEffect(() => {
     if (perm !== "granted") return;
-    enablePushSubscription().catch(() => {
-      // Swallow — most likely reason is VAPID not configured server-side,
-      // which we've already surfaced on first enable.
+    enablePushSubscription().catch((err) => {
+      console.error(
+        "[push] re-subscribe on mount failed:",
+        (err as Error)?.message ?? err,
+        err,
+      );
     });
   }, [perm]);
 
