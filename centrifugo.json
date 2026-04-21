@@ -41,7 +41,7 @@
       "name": "postgresql",
       "type": "postgresql",
       "postgresql": {
-        "dsn": "postgres://chatapp:chatapp@host.docker.internal:5433/chatapp",
+        "dsn": "postgres://chatapp:chatapp@postgres:5432/chatapp",
         "outbox_table_name": "chat_outbox",
         "num_partitions": 1,
         "partition_select_limit": 100,

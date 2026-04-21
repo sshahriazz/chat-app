@@ -45,25 +45,67 @@ function requireS3Config() {
   };
 }
 
-let cachedClient: S3Client | null = null;
+/**
+ * Two S3 clients with different endpoints:
+ *
+ *   getOpsClient()     → internal endpoint (`http://minio:9000`). Used
+ *                        for HEAD/DELETE/anything the server runs itself.
+ *                        Cheap intra-cluster calls, no public round-trip.
+ *
+ *   getSigningClient() → public endpoint (derived from S3_PUBLIC_URL_BASE).
+ *                        Used ONLY to mint presigned PUT/GET URLs. The
+ *                        Host in the signed URL must match what the
+ *                        browser will send when uploading — otherwise
+ *                        SigV4 validation fails on MinIO's side.
+ *
+ * When only one URL is set (S3_PUBLIC_URL_BASE points directly at an
+ * internet-reachable MinIO), both clients share the same endpoint and
+ * the split is a no-op.
+ */
 
-function getClient() {
-  if (cachedClient) return cachedClient;
+function getSigningEndpoint(publicUrlBase: string, bucket: string): string {
+  // Strip the `/<bucket>` suffix so the SDK appends its own path-style
+  // `/<bucket>/<key>`. Works for `http://host:port/bucket` and for
+  // `https://host/subpath/bucket`.
+  const u = new URL(publicUrlBase);
+  const trimmed = u.pathname.replace(new RegExp(`/${bucket}/?$`), "");
+  u.pathname = trimmed;
+  return u.toString().replace(/\/$/, "");
+}
+
+let opsClient: S3Client | null = null;
+let signingClient: S3Client | null = null;
+
+function getOpsClient() {
+  if (opsClient) return opsClient;
   const cfg = requireS3Config();
-  cachedClient = new S3Client({
+  opsClient = new S3Client({
     region: cfg.region,
     endpoint: cfg.endpoint,
-    // R2 / MinIO prefer virtual-hosted-style off; AWS is happier with on.
-    // The SDK default (undefined → auto) is usually right; override only
-    // when explicitly needed via endpoint style hints.
     credentials: {
       accessKeyId: cfg.accessKeyId,
       secretAccessKey: cfg.secretAccessKey,
     },
-    // Custom endpoints (R2/MinIO) need path-style addressing for safety.
+    // Custom endpoints (R2/MinIO) need path-style addressing.
     forcePathStyle: !!cfg.endpoint,
   });
-  return cachedClient;
+  return opsClient;
+}
+
+function getSigningClient() {
+  if (signingClient) return signingClient;
+  const cfg = requireS3Config();
+  const signingEndpoint = getSigningEndpoint(cfg.publicUrlBase, cfg.bucket);
+  signingClient = new S3Client({
+    region: cfg.region,
+    endpoint: signingEndpoint,
+    credentials: {
+      accessKeyId: cfg.accessKeyId,
+      secretAccessKey: cfg.secretAccessKey,
+    },
+    forcePathStyle: true,
+  });
+  return signingClient;
 }
 
 export interface UploadUrlResult {
@@ -81,7 +123,7 @@ export async function createUploadUrl(params: {
   expiresIn?: number;
 }): Promise<UploadUrlResult> {
   const cfg = requireS3Config();
-  const client = getClient();
+  const client = getSigningClient();
   const expiresIn = params.expiresIn ?? 5 * 60; // 5 min
 
   const cmd = new PutObjectCommand({
@@ -107,7 +149,7 @@ export async function createDownloadUrl(params: {
   expiresIn?: number;
 }): Promise<{ url: string; expiresIn: number }> {
   const cfg = requireS3Config();
-  const client = getClient();
+  const client = getSigningClient();
   const expiresIn = params.expiresIn ?? 60; // 1 min
 
   // RFC 5987 encoding so non-ASCII filenames survive.
@@ -130,7 +172,7 @@ export async function createDownloadUrl(params: {
  */
 export async function deleteObject(key: string): Promise<void> {
   const cfg = requireS3Config();
-  const client = getClient();
+  const client = getOpsClient();
   await client.send(new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }));
 }
 
@@ -141,7 +183,7 @@ export async function deleteObject(key: string): Promise<void> {
  */
 export async function headObjectSize(key: string): Promise<number | null> {
   const cfg = requireS3Config();
-  const client = getClient();
+  const client = getOpsClient();
   try {
     const res = await client.send(
       new HeadObjectCommand({ Bucket: cfg.bucket, Key: key }),

@@ -11,10 +11,21 @@ let connected = false;
 const presenceSubs = new Map<string, Subscription>();
 
 function getWsUrl() {
+  // Same-origin by default: `ws(s)://<page-host>/connection/websocket`
+  // is proxied to Centrifugo by the custom Next server (`server.mjs`).
+  // Keeping the browser on one origin means one TLS cert and no CORS;
+  // the Centrifugo container doesn't need a public host port at all.
+  //
+  // Override with `NEXT_PUBLIC_CENTRIFUGO_URL` if you want the browser
+  // to connect to Centrifugo directly (e.g. dedicated subdomain +
+  // Traefik route).
+  const explicit = process.env.NEXT_PUBLIC_CENTRIFUGO_URL;
+  if (explicit) return explicit;
   if (typeof window !== "undefined") {
-    return `ws://${window.location.hostname}:8000/connection/websocket`;
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${protocol}://${window.location.host}/connection/websocket`;
   }
-  return "ws://localhost:8000/connection/websocket";
+  return "ws://localhost:3000/connection/websocket";
 }
 
 export interface ConnectOptions {

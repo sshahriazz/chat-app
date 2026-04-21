@@ -33,6 +33,9 @@ RUN pnpm install --frozen-lockfile --prod --filter @chat-app/server...
 
 COPY --from=build /app/apps/server/dist ./apps/server/dist
 COPY --from=build /app/apps/server/src/generated ./apps/server/src/generated
+# `prisma migrate deploy` needs prisma.config.ts at runtime to resolve
+# DATABASE_URL (Prisma 7 moved connection config out of schema.prisma).
+COPY --from=build /app/apps/server/prisma.config.ts ./apps/server/prisma.config.ts
 
 ENV NODE_ENV=production \
     TZ=UTC \

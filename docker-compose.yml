@@ -1,66 +1,85 @@
+# Full-stack compose used by Dokploy for deployment.
+#
+# Network topology — only `web` is bound to a host port. Every other
+# service (postgres, redis, centrifugo, minio, server, migrate) talks
+# via the internal compose network and is unreachable from outside
+# Docker. Browser traffic hits web, which proxies through Next.js
+# rewrites (see apps/web/next.config.ts):
+#
+#   /api/*                → server    (HTTP)
+#   /connection/websocket → centrifugo (WebSocket upgrade)
+#   /chatapp/*            → minio     (presigned attachments)
+#
+# Next.js's built-in rewrites proxy both HTTP and WS upgrades via
+# `http-proxy` internally — no custom server / external reverse proxy
+# needed.
+#
+# Rewrite destinations are baked into the web image at build time (Next
+# evaluates `rewrites()` during `next build`). Supply them as build args
+# if you need anything other than the compose service-name defaults.
+
 services:
+  # ─── Postgres (INTERNAL) ─────────────────────────────────────
   postgres:
     image: postgres:17-alpine
-    ports:
-      - "5433:5432"
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: chatapp
-      POSTGRES_PASSWORD: chatapp
-      POSTGRES_DB: chatapp
+      POSTGRES_USER: ${POSTGRES_USER:-chatapp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatapp}
+      POSTGRES_DB: ${POSTGRES_DB:-chatapp}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatapp} -d ${POSTGRES_DB:-chatapp}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
+  # ─── Redis (INTERNAL) ────────────────────────────────────────
   redis:
     image: redis:8-alpine
-    ports:
-      - "6379:6379"
-    # AOF + fsync-every-second keeps rate-limit counters durable across
-    # restarts at the cost of one extra write per request, which is
-    # negligible for this workload.
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 3s
-      retries: 3
+      retries: 10
 
+  # ─── Centrifugo (INTERNAL — browser reaches via /connection/websocket on web) ─
   centrifugo:
     image: centrifugo/centrifugo:v6
-    ports:
-      - "8000:8000"
+    restart: unless-stopped
     volumes:
       - ./centrifugo.json:/centrifugo/config.json:ro
     command: centrifugo -c config.json
+    environment:
+      # Centrifugo env vars override matching keys in the config JSON.
+      # Keeping secrets in env (driven by the root `.env`) means the
+      # committed `centrifugo.json` only holds non-sensitive structure
+      # (namespaces, engine choice, etc) and Dokploy rotates secrets
+      # without editing the file.
+      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
+      CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
+      CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:-admin}
+      CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:-dev-admin-secret}
+      CENTRIFUGO_CLIENT_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
 
-  # ─── MinIO: S3-compatible object storage ─────────────────────
-  #
-  # Local dev substitute for AWS S3 / Cloudflare R2. The existing
-  # `apps/server/src/lib/s3.ts` talks to any S3-compatible endpoint when
-  # `S3_ENDPOINT` is set — no server-code changes needed.
-  #
-  # Set in apps/server/.env (overwriting the R2 placeholder values):
-  #   S3_ENDPOINT=http://localhost:9000
-  #   S3_REGION=us-east-1
-  #   S3_BUCKET=chatapp
-  #   S3_ACCESS_KEY_ID=chatapp
-  #   S3_SECRET_ACCESS_KEY=chatapp-dev-only
-  #   S3_PUBLIC_URL_BASE=http://localhost:9000/chatapp
-  #
-  # Console available at http://localhost:9001 (login chatapp/chatapp-dev-only).
+  # ─── MinIO (INTERNAL — browser reaches via /chatapp/* on web) ─
   minio:
     image: minio/minio:latest
-    ports:
-      - "9000:9000"  # S3 API
-      - "9001:9001"  # Web console
+    restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: chatapp
-      # Must be ≥ 8 chars — MinIO rejects shorter passwords at boot.
-      MINIO_ROOT_PASSWORD: chatapp-dev-only
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-chatapp}
+      # Must be ≥ 8 chars.
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-chatapp-dev-only}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -70,10 +89,6 @@ services:
       timeout: 3s
       retries: 5
 
-  # One-shot: create the `chatapp` bucket and set it anonymously readable
-  # so the attachment URLs embedded in message events (served as image src
-  # by the browser) resolve without signing. Uploads still require a
-  # presigned PUT; only GETs are public.
   minio-init:
     image: minio/mc:latest
     depends_on:
@@ -81,12 +96,96 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 chatapp chatapp-dev-only &&
-      mc mb --ignore-existing local/chatapp &&
-      mc anonymous set download local/chatapp &&
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-chatapp} ${MINIO_ROOT_PASSWORD:-chatapp-dev-only} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET:-chatapp} &&
+      mc anonymous set download local/${MINIO_BUCKET:-chatapp} &&
       echo '[minio-init] bucket ready'
       "
     restart: "no"
+
+  # ─── Prisma migrations (one-shot, INTERNAL) ──────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    command: ["pnpm", "exec", "prisma", "migrate", "deploy"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
+
+  # ─── Server / Express (INTERNAL) ─────────────────────────────
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      TZ: UTC
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-secret-change-in-production-min-32-chars}
+      # The server is only reachable through the web proxy; its self-URL
+      # should be the PUBLIC URL of the web app.
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      CENTRIFUGO_URL: http://centrifugo:8000
+      CENTRIFUGO_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
+      CENTRIFUGO_TOKEN_SECRET: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      # S3 split clients (see apps/server/src/lib/s3.ts):
+      #   S3_ENDPOINT        — internal, used for HEAD/DELETE/etc.
+      #   S3_PUBLIC_URL_BASE — public, used to mint presigned PUT/GET
+      #                        URLs that the browser can actually reach
+      #                        (routed back to MinIO via web's /chatapp
+      #                        rewrite). Must include the bucket name.
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${MINIO_BUCKET:-chatapp}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-chatapp}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-chatapp-dev-only}
+      S3_PUBLIC_URL_BASE: ${S3_PUBLIC_URL_BASE:-http://localhost:3000/chatapp}
+      # Web Push (optional — endpoints 503 if unset)
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-}
+
+  # ─── Web / Next.js (PUBLIC — the only host-bound service) ────
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Client-bundle env (browser-facing).
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+        NEXT_PUBLIC_CENTRIFUGO_URL: ${NEXT_PUBLIC_CENTRIFUGO_URL:-}
+        # Rewrite destinations — baked into the Next routes manifest at
+        # build time. Defaults in the Dockerfile match the compose DNS
+        # names, so no overrides are needed for out-of-the-box `compose up`.
+        API_PROXY_URL: ${API_PROXY_URL:-http://server:3001}
+        WS_PROXY_URL: ${WS_PROXY_URL:-http://centrifugo:8000}
+        STORAGE_PROXY_URL: ${STORAGE_PROXY_URL:-http://minio:9000}
+        STORAGE_BUCKET: ${MINIO_BUCKET:-chatapp}
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "${WEB_PORT:-3000}:3000"
 
 volumes:
   postgres_data:

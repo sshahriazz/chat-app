@@ -1,7 +1,17 @@
-const BASE_URL =
-  typeof window !== "undefined"
-    ? `${window.location.protocol}//${window.location.hostname}:3001`
-    : "http://localhost:3001";
+/**
+ * API client base URL.
+ *
+ * Defaults to empty string → same-origin. Requests go to `/api/...` and
+ * Next.js rewrites (next.config.ts) proxy them to the backend at
+ * `API_PROXY_URL`. Benefits: no CORS, the session cookie lives on one
+ * domain, and Dokploy only needs one domain routed at the web service.
+ *
+ * Override via `NEXT_PUBLIC_API_BASE_URL` if you need cross-origin
+ * requests (e.g. local dev without the rewrite, or a split deployment
+ * where web and server live on separate domains). Value is baked into
+ * the client bundle at build time.
+ */
+const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
 export const API_BASE_URL = BASE_URL;
 
