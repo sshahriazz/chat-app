@@ -1,0 +1,44 @@
+{
+  "name": "@chat-app/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsdown",
+    "start": "node dist/index.mjs",
+    "type-check": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1032.0",
+    "@aws-sdk/s3-request-presigner": "^3.1032.0",
+    "@prisma/adapter-pg": "^7.7.0",
+    "@prisma/client": "^7.7.0",
+    "@tiptap/core": "^3.22.3",
+    "@tiptap/extension-mention": "^3.22.4",
+    "@tiptap/html": "^3.22.4",
+    "@tiptap/starter-kit": "^3.22.3",
+    "better-auth": "^1.6.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^5",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.20.0",
+    "prisma": "^7.7.0",
+    "sanitize-html": "^2.17.3",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22",
+    "@types/pg": "^8.20.0",
+    "@types/sanitize-html": "^2.16.1",
+    "@types/web-push": "^3.6.4",
+    "tsdown": "^0.21.9",
+    "tsx": "^4",
+    "typescript": "^5.7"
+  }
+}

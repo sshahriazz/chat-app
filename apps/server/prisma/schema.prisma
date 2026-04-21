@@ -1,0 +1,228 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Better Auth tables ───────────────────────────────────────
+
+model User {
+  id            String    @id
+  name          String
+  email         String    @unique
+  emailVerified Boolean   @map("email_verified")
+  image         String?
+  lastActiveAt  DateTime? @map("last_active_at")
+  createdAt     DateTime  @map("created_at")
+  updatedAt     DateTime  @map("updated_at")
+
+  sessions            Session[]
+  accounts            Account[]
+  conversationMembers ConversationMember[]
+  messages            Message[]
+  reactions           Reaction[]
+  attachments         Attachment[]
+  pushSubscriptions   PushSubscription[]
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime @map("expires_at")
+  token     String   @unique
+  createdAt DateTime @map("created_at")
+  updatedAt DateTime @map("updated_at")
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+  userId    String   @map("user_id")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String    @map("account_id")
+  providerId            String    @map("provider_id")
+  userId                String    @map("user_id")
+  accessToken           String?   @map("access_token")
+  refreshToken          String?   @map("refresh_token")
+  idToken               String?   @map("id_token")
+  accessTokenExpiresAt  DateTime? @map("access_token_expires_at")
+  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at")
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @map("created_at")
+  updatedAt             DateTime  @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("account")
+}
+
+model Verification {
+  id         String    @id
+  identifier String
+  value      String
+  expiresAt  DateTime  @map("expires_at")
+  createdAt  DateTime? @map("created_at")
+  updatedAt  DateTime? @map("updated_at")
+
+  @@map("verification")
+}
+
+// ─── Chat tables ──────────────────────────────────────────────
+
+enum ConversationType {
+  direct
+  group
+}
+
+enum MemberRole {
+  owner
+  admin
+  member
+}
+
+enum MessageType {
+  text
+  system
+  image
+}
+
+model Conversation {
+  id         String           @id @default(uuid())
+  type       ConversationType
+  name       String?
+  createdBy  String           @map("created_by")
+  createdAt  DateTime         @default(now()) @map("created_at")
+  updatedAt  DateTime         @updatedAt @map("updated_at")
+  // Bumped on any membership/meta change so clients can reject stale events.
+  version    Int              @default(0)
+  // Per-conversation monotonic counter; incremented atomically when a message
+  // is inserted to produce `Message.seq`.
+  currentSeq Int              @default(0) @map("current_seq")
+
+  members  ConversationMember[]
+  messages Message[]
+
+  @@map("conversations")
+}
+
+model ConversationMember {
+  id                String     @id @default(uuid())
+  conversationId    String     @map("conversation_id")
+  userId            String     @map("user_id")
+  role              MemberRole @default(member)
+  joinedAt          DateTime   @default(now()) @map("joined_at")
+  lastReadMessageId String?    @map("last_read_message_id")
+  lastReadAt        DateTime?  @map("last_read_at")
+  muted             Boolean    @default(false)
+  // Denormalized running count of unread messages from others. Incremented
+  // in the message-send transaction for every non-sender member; zeroed when
+  // the member marks the conversation read. Avoids an N+1 count query on
+  // every /init + /conversations request.
+  unreadCount       Int        @default(0) @map("unread_count")
+
+  conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastReadMessage Message?     @relation("LastReadMessage", fields: [lastReadMessageId], references: [id], onDelete: SetNull)
+
+  @@unique([conversationId, userId])
+  @@map("conversation_members")
+}
+
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  // Unique per browser: the endpoint is the browser's Push service URL plus
+  // a client-specific path. Upserting on it avoids duplicates when the same
+  // browser re-subscribes.
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
+
+model Attachment {
+  id          String   @id @default(uuid())
+  // Nullable so the upload flow can mint the row before the user hits "send".
+  // Orphan attachments (messageId remains null past some TTL) can be GC'd.
+  messageId   String?  @map("message_id")
+  uploaderId  String   @map("uploader_id")
+  url         String
+  contentType String   @map("content_type")
+  filename    String
+  size        Int
+  width       Int?
+  height      Int?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  message  Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  uploader User     @relation(fields: [uploaderId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@index([uploaderId, createdAt])
+  @@map("attachments")
+}
+
+model Message {
+  id              String      @id @default(uuid())
+  conversationId  String      @map("conversation_id")
+  senderId        String      @map("sender_id")
+  // Tiptap AST — stored as jsonb so we never ship HTML over the wire or
+  // trust client-supplied HTML. Canonicalized server-side at write time.
+  content         Json
+  // Flattened text for trigram search + sidebar previews. Maintained
+  // alongside `content` in the same transaction; GIN trgm index lives on
+  // this column (`messages_plain_content_trgm_idx`).
+  plainContent    String      @default("") @map("plain_content")
+  type            MessageType @default(text)
+  replyToId       String?     @map("reply_to_id")
+  editedAt        DateTime?   @map("edited_at")
+  deletedAt       DateTime?   @map("deleted_at")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  // Per-conversation monotonic sequence. Generated atomically on insert by
+  // incrementing `Conversation.currentSeq` inside the message-create
+  // transaction. Used for ordering + gap detection on the client.
+  seq             Int
+  // Optional dedup key provided by clients for optimistic UI + retries.
+  clientMessageId String?     @map("client_message_id")
+
+  conversation Conversation       @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User               @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  replyTo      Message?           @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies      Message[]          @relation("MessageReplies")
+  readBy       ConversationMember[] @relation("LastReadMessage")
+  reactions    Reaction[]
+  attachments  Attachment[]
+
+  @@unique([conversationId, seq])
+  @@unique([conversationId, clientMessageId])
+  @@index([conversationId, createdAt])
+  @@map("messages")
+}
+
+model Reaction {
+  id        String   @id @default(uuid())
+  messageId String   @map("message_id")
+  userId    String   @map("user_id")
+  emoji     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+  @@map("reactions")
+}

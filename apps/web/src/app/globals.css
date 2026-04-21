@@ -1,0 +1,70 @@
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+/* --- @mentions ------------------------------------------------------------ */
+
+/* Rendered inside message bubbles via dangerouslySetInnerHTML. Also used by
+   Tiptap while composing. */
+.mention {
+  background: var(--mantine-color-blue-light);
+  color: var(--mantine-color-blue-6);
+  border-radius: 6px;
+  padding: 1px 4px;
+  font-weight: 500;
+}
+
+/* Floating suggestion list, anchored to the caret by the Tiptap extension. */
+.mention-popover {
+  position: absolute;
+  z-index: 1000;
+  background: var(--mantine-color-body);
+  border: 1px solid var(--mantine-color-default-border);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: var(--mantine-shadow-md);
+  min-width: 180px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 14px;
+}
+
+.mention-popover .mention-item {
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mention-popover .mention-item:hover,
+.mention-popover .mention-item.selected {
+  background: var(--mantine-color-default-hover);
+}
+
+.mention-popover .mention-empty {
+  padding: 8px;
+  color: var(--mantine-color-dimmed);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* --- Jump-to-message flash ----------------------------------------------- */
+
+@keyframes message-highlight-flash {
+  0% {
+    background-color: var(--mantine-color-yellow-2);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.message-highlight {
+  animation: message-highlight-flash 2s ease-out;
+  border-radius: 10px;
+}

@@ -1,0 +1,1380 @@
+import { Router } from "express";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/auth";
+import { prisma } from "../db";
+import * as centrifugo from "../lib/centrifugo";
+import { withRealtime } from "../lib/realtime";
+import {
+  getConversationMemberIds,
+  invalidateConversation,
+} from "../lib/member-cache";
+import { pushToUsers } from "../lib/push";
+import {
+  canonicalizeFromJson,
+  extractMentions,
+  extractPlainText,
+  isEmptyContent,
+  MAX_MESSAGE_PLAIN_CHARS,
+  type MessageContentJson,
+} from "../lib/message-content";
+
+const router: Router = Router();
+
+/** Extract a single string param (Express 5 params can be string | string[]) */
+function param(value: string | string[]): string {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+
+/**
+ * Selects and shapes the conversation payload used by `conversation_updated`
+ * and `conversation_joined` events. The shape matches what the client expects
+ * for a conversation list entry (minus per-user fields: unreadCount, muted).
+ */
+const CONVERSATION_EVENT_SELECT = {
+  id: true,
+  type: true,
+  name: true,
+  createdBy: true,
+  createdAt: true,
+  updatedAt: true,
+  version: true,
+  members: {
+    include: {
+      user: {
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          image: true,
+          lastActiveAt: true,
+        },
+      },
+    },
+  },
+} as const;
+
+/**
+ * Broadcast an event to every member of a conversation via their personal
+ * `user:{userId}` channel. Each member's client dispatches by event.type and
+ * event.conversationId. Pass `exclude` to skip a specific user (typing).
+ *
+ * `idempotencyKey` is required so Centrifugo can dedupe retries. For events
+ * wrapped in a DB transaction, prefer `withRealtime` so publishes fire only
+ * after commit.
+ */
+async function broadcastToConversation(
+  conversationId: string,
+  data: unknown,
+  idempotencyKey: string,
+  opts: { exclude?: string } = {},
+) {
+  const userIds = await getConversationMemberIds(conversationId);
+  const filtered = opts.exclude
+    ? userIds.filter((id) => id !== opts.exclude)
+    : userIds;
+  if (filtered.length === 0) return;
+  const channels = filtered.map((id) => centrifugo.userChannel(id));
+  await centrifugo.broadcast(channels, data, { idempotencyKey });
+}
+
+// ─── Init (single call on app startup) ───────────────────────
+
+router.get("/init", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+
+  const [conversations, token] = await Promise.all([
+    getConversationsWithUnread(user.id),
+    Promise.resolve(
+      centrifugo.generateConnectionToken(user.id, {
+        name: user.name,
+        email: user.email,
+      }),
+    ),
+  ]);
+
+  res.json({ conversations, centrifugoToken: token });
+});
+
+// ─── Create conversation ──────────────────────────────────────
+
+router.post("/conversations", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const { type, name, memberIds } = req.body as {
+    type: "direct" | "group";
+    name?: string;
+    memberIds: string[];
+  };
+
+  if (!type || !memberIds?.length) {
+    res.status(400).json({ error: "type and memberIds are required" });
+    return;
+  }
+
+  if (type === "direct") {
+    if (memberIds.length !== 1) {
+      res.status(400).json({ error: "Direct chats require exactly one other member" });
+      return;
+    }
+
+    // Check for existing direct conversation
+    const existing = await prisma.conversation.findFirst({
+      where: {
+        type: "direct",
+        AND: [
+          { members: { some: { userId: user.id } } },
+          { members: { some: { userId: memberIds[0] } } },
+        ],
+      },
+      include: { members: { include: { user: true } } },
+    });
+
+    if (existing) {
+      res.json(existing);
+      return;
+    }
+  }
+
+  
+  const allMemberIds = [user.id, ...memberIds.filter((id) => id !== user.id)];
+
+  
+  const conversation = await withRealtime(async (rt) => {
+    const conv = await rt.tx.conversation.create({
+      data: {
+        type,
+        name: type === "group" ? name : null,
+        createdBy: user.id,
+        members: {
+          create: allMemberIds.map((userId) => ({
+            userId,
+            role: userId === user.id ? "owner" : "member",
+          })),
+        },
+      },
+      include: { members: { include: { user: true } } },
+    });
+
+    if (type === "group") {
+      const otherCount = allMemberIds.filter((id) => id !== user.id).length;
+      await rt.createSystemMessage(
+        conv.id,
+        user.id,
+        `${user.name} created the group${name ? ` "${name}"` : ""} with ${otherCount} member${otherCount !== 1 ? "s" : ""}`,
+      );
+    }
+
+    // Tell every member about the new conversation so their sidebar adds it.
+    const eventPayload = await rt.tx.conversation.findUniqueOrThrow({
+      where: { id: conv.id },
+      select: CONVERSATION_EVENT_SELECT,
+    });
+    await rt.enqueueToConversation(
+      conv.id,
+      { type: "conversation_updated", conversation: eventPayload },
+      `conv_created_${conv.id}`,
+    );
+
+    return conv;
+  });
+
+  // Cache warms lazily on next read, but invalidate pre-emptively in case a
+  // prior (e.g. ghost) entry lingered.
+  invalidateConversation(conversation.id);
+
+  res.status(201).json(conversation);
+});
+
+// ─── List conversations ───────────────────────────────────────
+
+router.get("/conversations", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const conversations = await getConversationsWithUnread(user.id);
+  res.json(conversations);
+});
+
+// ─── Get conversation ─────────────────────────────────────────
+
+router.get("/conversations/:id", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+
+  const conversation = await prisma.conversation.findFirst({
+    where: {
+      id,
+      members: { some: { userId: user.id } },
+    },
+    include: {
+      members: {
+        include: {
+          user: { select: { id: true, name: true, email: true, image: true, lastActiveAt: true } },
+        },
+      },
+    },
+  });
+
+  if (!conversation) {
+    res.status(404).json({ error: "Conversation not found" });
+    return;
+  }
+
+  res.json(conversation);
+});
+
+// ─── Update conversation (rename group) ───────────────────────
+
+router.put("/conversations/:id", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const { name } = req.body as { name: string };
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+    include: { conversation: true },
+  });
+
+  if (!member) {
+    res.status(404).json({ error: "Conversation not found" });
+    return;
+  }
+
+  if (member.conversation.type !== "group") {
+    res.status(400).json({ error: "Cannot rename a direct conversation" });
+    return;
+  }
+
+  if (member.role !== "owner" && member.role !== "admin") {
+    res.status(403).json({ error: "Only owners and admins can rename groups" });
+    return;
+  }
+
+  const oldName = member.conversation.name;
+
+  const conversation = await withRealtime(async (rt) => {
+    const updated = await rt.tx.conversation.update({
+      where: { id },
+      data: { name, version: { increment: 1 } },
+      select: CONVERSATION_EVENT_SELECT,
+    });
+
+    await rt.createSystemMessage(
+      id,
+      user.id,
+      `${user.name} renamed the group from "${oldName}" to "${name}"`,
+    );
+
+    await rt.enqueueToConversation(
+      id,
+      { type: "conversation_updated", conversation: updated },
+      `conv_updated_${id}_${updated.version}`,
+    );
+
+    return updated;
+  });
+
+  res.json(conversation);
+});
+
+// ─── Add members (promotes a direct chat to a group when expanding) ──
+
+router.post("/conversations/:id/members", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const { userIds, name } = req.body as { userIds: string[]; name?: string };
+
+  if (!userIds?.length) {
+    res.status(400).json({ error: "userIds is required" });
+    return;
+  }
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+    include: { conversation: true },
+  });
+
+  if (!member) {
+    res.status(404).json({ error: "Conversation not found" });
+    return;
+  }
+
+  const wasDirect = member.conversation.type === "direct";
+  // Name only has meaning on promotion; ignored for groups (use PUT to rename).
+  const promotionName = wasDirect && name?.trim() ? name.trim() : null;
+
+  const result = await withRealtime(async (rt) => {
+    // Skip users who are already members to keep the event payload accurate.
+    const existingMemberIds = (
+      await rt.tx.conversationMember.findMany({
+        where: { conversationId: id, userId: { in: userIds } },
+        select: { userId: true },
+      })
+    ).map((m) => m.userId);
+
+    const trulyNewIds = userIds.filter((uid) => !existingMemberIds.includes(uid));
+
+    const newUsers = await rt.tx.user.findMany({
+      where: { id: { in: trulyNewIds } },
+      select: { id: true, name: true },
+    });
+
+    if (newUsers.length === 0) {
+      return { added: 0, promoted: false };
+    }
+
+    if (wasDirect) {
+      // Promote the *other* original direct member from "member" → "admin"
+      // so both original participants can rename / add more people.
+      // The creator already has role "owner" so they're unaffected.
+      // MUST run before createMany below, otherwise the newly-added users
+      // (also role "member") would get swept into the promotion.
+      await rt.tx.conversationMember.updateMany({
+        where: { conversationId: id, role: "member" },
+        data: { role: "admin" },
+      });
+    }
+
+    await rt.tx.conversationMember.createMany({
+      data: newUsers.map((u) => ({
+        conversationId: id,
+        userId: u.id,
+        role: "member" as const,
+      })),
+    });
+
+    // A direct chat becomes a group the moment it gains a 3rd member.
+    await rt.tx.conversation.update({
+      where: { id },
+      data: {
+        ...(wasDirect
+          ? {
+              type: "group" as const,
+              ...(promotionName ? { name: promotionName } : {}),
+            }
+          : {}),
+        version: { increment: 1 },
+      },
+    });
+
+    const names = newUsers.map((u) => u.name).join(", ");
+    const systemText = wasDirect
+      ? promotionName
+        ? `${user.name} added ${names} and created the group "${promotionName}"`
+        : `${user.name} added ${names} and turned this into a group`
+      : `${user.name} added ${names}`;
+    await rt.createSystemMessage(id, user.id, systemText);
+
+    // Re-read with up-to-date members list + version for the event.
+    const updated = await rt.tx.conversation.findUniqueOrThrow({
+      where: { id },
+      select: CONVERSATION_EVENT_SELECT,
+    });
+
+    // All current members (including newly added) get the shared update.
+    await rt.enqueueToConversation(
+      id,
+      { type: "conversation_updated", conversation: updated },
+      `conv_updated_${id}_${updated.version}`,
+    );
+
+    return { added: newUsers.length, promoted: wasDirect };
+  });
+
+  invalidateConversation(id);
+
+  res.json(result);
+});
+
+// ─── Remove member / leave group ──────────────────────────────
+
+router.delete("/conversations/:id/members/:userId", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const targetUserId = param(req.params.userId);
+  const isSelf = user.id === targetUserId;
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+    include: { conversation: true },
+  });
+
+  if (!member || member.conversation.type !== "group") {
+    res.status(404).json({ error: "Group not found" });
+    return;
+  }
+
+  if (!isSelf && member.role !== "owner" && member.role !== "admin") {
+    res.status(403).json({ error: "Only owners and admins can remove members" });
+    return;
+  }
+
+  await withRealtime(async (rt) => {
+    // Verify the target is currently a member and capture name for the system message.
+    const target = await rt.tx.conversationMember.findUnique({
+      where: {
+        conversationId_userId: { conversationId: id, userId: targetUserId },
+      },
+      include: { user: { select: { name: true } } },
+    });
+    if (!target) return;
+
+    await rt.tx.conversationMember.delete({ where: { id: target.id } });
+
+    await rt.tx.conversation.update({
+      where: { id },
+      data: { version: { increment: 1 } },
+    });
+
+    if (isSelf) {
+      await rt.createSystemMessage(id, user.id, `${user.name} left the group`);
+    } else {
+      await rt.createSystemMessage(
+        id,
+        user.id,
+        `${user.name} removed ${target.user.name}`,
+      );
+    }
+
+    // Tell the removed user they're gone so their sidebar drops the entry
+    // and their realtime listener stops caring about this conversation.
+    rt.enqueue({
+      channels: [centrifugo.userChannel(targetUserId)],
+      data: { type: "conversation_left", conversationId: id },
+      idempotencyKey: `conv_left_${targetUserId}_${id}`,
+    });
+
+    // And tell remaining members about the new member list / version.
+    const updated = await rt.tx.conversation.findUniqueOrThrow({
+      where: { id },
+      select: CONVERSATION_EVENT_SELECT,
+    });
+    await rt.enqueueToConversation(
+      id,
+      { type: "conversation_updated", conversation: updated },
+      `conv_updated_${id}_${updated.version}`,
+    );
+  });
+
+  invalidateConversation(id);
+
+  res.json({ ok: true });
+});
+
+// ─── Send message ─────────────────────────────────────────────
+
+const MESSAGE_INCLUDE = {
+  replyTo: {
+    select: {
+      id: true,
+      content: true,
+      plainContent: true,
+      senderId: true,
+      sender: { select: { id: true, name: true } },
+    },
+  },
+  attachments: {
+    select: {
+      id: true,
+      url: true,
+      contentType: true,
+      filename: true,
+      size: true,
+      width: true,
+      height: true,
+    },
+  },
+} as const;
+
+router.post("/conversations/:id/messages", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const { content, replyToId, clientMessageId, attachmentIds } = req.body as {
+    content?: unknown;
+    replyToId?: string;
+    clientMessageId?: string;
+    attachmentIds?: string[];
+  };
+
+  const attachmentIdList = Array.isArray(attachmentIds) ? attachmentIds : [];
+
+  // Canonicalize incoming Tiptap JSON. Rejects anything that isn't structural
+  // JSON. Round-trip through the extension schema strips unknown nodes,
+  // forbidden marks and stray attrs — defense in depth for the display path.
+  let canonJson: MessageContentJson | null = null;
+  let plainText = "";
+  if (content !== undefined && content !== null) {
+    try {
+      canonJson = canonicalizeFromJson(content);
+      plainText = extractPlainText(canonJson);
+    } catch {
+      res.status(400).json({ error: "content must be a Tiptap JSON document" });
+      return;
+    }
+  }
+
+  if (plainText.length > MAX_MESSAGE_PLAIN_CHARS) {
+    res.status(413).json({
+      error: `content exceeds ${MAX_MESSAGE_PLAIN_CHARS} characters`,
+    });
+    return;
+  }
+
+  const hasBody = canonJson !== null && !isEmptyContent(canonJson);
+  if (!hasBody && attachmentIdList.length === 0) {
+    res.status(400).json({ error: "content or attachments required" });
+    return;
+  }
+
+  // If the body is empty-after-canonicalize but attachments exist, fall back
+  // to a minimal empty doc so the column stays non-null.
+  const storedContent: MessageContentJson = hasBody
+    ? (canonJson as MessageContentJson)
+    : { type: "doc", content: [] };
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  });
+
+  if (!member) {
+    res.status(403).json({ error: "Not a member of this conversation" });
+    return;
+  }
+
+  // Retry-safe dedup: if the client already sent this message and we stored
+  // it, return the stored row. The unique index on (conversationId, clientMessageId)
+  // also protects against two concurrent inserts with the same key.
+  if (clientMessageId) {
+    const existing = await prisma.message.findUnique({
+      where: {
+        conversationId_clientMessageId: {
+          conversationId: id,
+          clientMessageId,
+        },
+      },
+      include: MESSAGE_INCLUDE,
+    });
+    if (existing) {
+      res.status(200).json(existing);
+      return;
+    }
+  }
+
+  if (replyToId) {
+    const replyTarget = await prisma.message.findFirst({
+      where: { id: replyToId, conversationId: id, deletedAt: null },
+    });
+    if (!replyTarget) {
+      res.status(404).json({ error: "Reply target message not found" });
+      return;
+    }
+  }
+
+  // Validate attachment ownership + unlinked status *before* the tx to give
+  // a clean 400 and keep the tx small.
+  if (attachmentIdList.length > 0) {
+    const rows = await prisma.attachment.findMany({
+      where: { id: { in: attachmentIdList } },
+      select: { id: true, uploaderId: true, messageId: true },
+    });
+    const bad = attachmentIdList.find((aid) => {
+      const row = rows.find((r) => r.id === aid);
+      return !row || row.uploaderId !== user.id || row.messageId !== null;
+    });
+    if (bad) {
+      res.status(400).json({ error: `invalid attachment: ${bad}` });
+      return;
+    }
+  }
+
+  const message = await withRealtime(async (rt) => {
+    // Atomic per-conversation sequence: UPDATE ... SET current_seq = current_seq + 1
+    // runs as a single row-locked op, so concurrent inserts always get distinct seqs.
+    const { currentSeq: seq } = await rt.tx.conversation.update({
+      where: { id },
+      data: { currentSeq: { increment: 1 }, updatedAt: new Date() },
+      select: { currentSeq: true },
+    });
+
+    const msg = await rt.tx.message.create({
+      data: {
+        conversationId: id,
+        senderId: user.id,
+        content: storedContent,
+        plainContent: plainText,
+        type: "text",
+        replyToId: replyToId || null,
+        seq,
+        clientMessageId: clientMessageId ?? null,
+      },
+    });
+
+    if (attachmentIdList.length > 0) {
+      await rt.tx.attachment.updateMany({
+        where: {
+          id: { in: attachmentIdList },
+          uploaderId: user.id,
+          messageId: null,
+        },
+        data: { messageId: msg.id },
+      });
+    }
+
+    await rt.tx.user.update({
+      where: { id: user.id },
+      data: { lastActiveAt: new Date() },
+    });
+
+    // Denormalized unread counter: bump for every other member.
+    await rt.tx.conversationMember.updateMany({
+      where: { conversationId: id, userId: { not: user.id } },
+      data: { unreadCount: { increment: 1 } },
+    });
+
+    // Re-read with relations now that attachments are linked.
+    const full = await rt.tx.message.findUniqueOrThrow({
+      where: { id: msg.id },
+      include: MESSAGE_INCLUDE,
+    });
+
+    // Mentioned user ids, narrowed to actual conversation members so spoofed
+    // or stale data-id values don't cause spurious notifications.
+    const mentionedRaw = extractMentions(
+      full.content as MessageContentJson,
+    );
+    const memberIds =
+      mentionedRaw.length === 0
+        ? []
+        : (
+            await rt.tx.conversationMember.findMany({
+              where: { conversationId: id, userId: { in: mentionedRaw } },
+              select: { userId: true },
+            })
+          ).map((r) => r.userId);
+    const mentions = mentionedRaw.filter((uid) => memberIds.includes(uid));
+
+    await rt.enqueueToConversation(
+      id,
+      {
+        type: "message_added",
+        conversationId: id,
+        message: {
+          id: full.id,
+          seq: full.seq,
+          senderId: user.id,
+          senderName: user.name,
+          content: full.content,
+          plainContent: full.plainContent,
+          msgType: full.type,
+          replyTo: full.replyTo || null,
+          createdAt: full.createdAt,
+          clientMessageId: full.clientMessageId,
+          attachments: full.attachments,
+          mentions,
+        },
+      },
+      `message_${full.id}`,
+    );
+
+    return full;
+  });
+
+  // Fan out Web Push alongside the Centrifugo broadcast. Recipients:
+  // every non-sender, non-muted member plus anyone mentioned (who bypasses
+  // mute). The service worker suppresses the notification if any tab of
+  // theirs is visible, so active users don't get double-pinged.
+  const mentionsInMessage = extractMentions(
+    message.content as MessageContentJson,
+  );
+  const recipients = await prisma.conversationMember.findMany({
+    where: {
+      conversationId: id,
+      userId: { not: user.id },
+      OR: [{ muted: false }, { userId: { in: mentionsInMessage } }],
+    },
+    select: { userId: true },
+  });
+  if (recipients.length > 0) {
+    const preview = message.plainContent.slice(0, 140) || "📎 Attachment";
+    pushToUsers(
+      recipients.map((r) => r.userId),
+      {
+        title: user.name,
+        body: preview,
+        tag: `conv:${id}`,
+        url: "/",
+      },
+    ).catch((err) => console.error("[push] dispatch failed:", err));
+  }
+
+  res.status(201).json(message);
+});
+
+// ─── Search messages (scoped + global) ────────────────────────
+//
+// Both endpoints use the GIN trgm index on messages.content. Ranking blends
+// trigram similarity (fuzzy — catches typos) with ILIKE (catches substring
+// matches of short queries where similarity is low). Recency breaks ties.
+
+interface SearchRow {
+  id: string;
+  // `content` is jsonb — returned as a JS object by pg. Kept in the response
+  // so a future richer result renderer can format matches with marks intact.
+  content: unknown;
+  plain_content: string;
+  createdAt: Date;
+  senderId: string;
+  conversationId: string;
+  conversation_type: "direct" | "group";
+  conversation_name: string | null;
+  sender_name: string;
+  sender_image: string | null;
+}
+
+function shapeSearchResults(rows: SearchRow[]) {
+  return rows.map((r) => ({
+    id: r.id,
+    content: r.content,
+    plainContent: r.plain_content,
+    createdAt: r.createdAt,
+    senderId: r.senderId,
+    conversationId: r.conversationId,
+    conversation: {
+      id: r.conversationId,
+      type: r.conversation_type,
+      name: r.conversation_name,
+    },
+    sender: {
+      id: r.senderId,
+      name: r.sender_name,
+      image: r.sender_image,
+    },
+  }));
+}
+
+router.get("/conversations/:id/search", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const q = ((req.query.q as string) || "").trim();
+
+  if (q.length < 2) {
+    res.status(400).json({ error: "q must be at least 2 characters" });
+    return;
+  }
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+    select: { id: true },
+  });
+  if (!member) {
+    res.status(403).json({ error: "Not a member of this conversation" });
+    return;
+  }
+
+  const likePattern = `%${q}%`;
+  const rows = await prisma.$queryRaw<SearchRow[]>`
+    SELECT m.id,
+           m.content,
+           m.plain_content,
+           m.created_at AS "createdAt",
+           m.sender_id AS "senderId",
+           m.conversation_id AS "conversationId",
+           c.type AS conversation_type,
+           c.name AS conversation_name,
+           u.name AS sender_name,
+           u.image AS sender_image
+    FROM messages m
+    JOIN "user" u ON u.id = m.sender_id
+    JOIN conversations c ON c.id = m.conversation_id
+    WHERE m.conversation_id = ${id}
+      AND m.deleted_at IS NULL
+      AND (m.plain_content ILIKE ${likePattern} OR m.plain_content % ${q})
+    ORDER BY GREATEST(similarity(m.plain_content, ${q}), 0) DESC,
+             m.created_at DESC
+    LIMIT 50
+  `;
+
+  res.json({ results: shapeSearchResults(rows) });
+});
+
+// Global search — all conversations the user is a member of.
+// Intended as the foundation for a global Cmd+K modal later.
+router.get("/search", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const q = ((req.query.q as string) || "").trim();
+
+  if (q.length < 2) {
+    res.status(400).json({ error: "q must be at least 2 characters" });
+    return;
+  }
+
+  const likePattern = `%${q}%`;
+  const rows = await prisma.$queryRaw<SearchRow[]>`
+    SELECT m.id,
+           m.content,
+           m.plain_content,
+           m.created_at AS "createdAt",
+           m.sender_id AS "senderId",
+           m.conversation_id AS "conversationId",
+           c.type AS conversation_type,
+           c.name AS conversation_name,
+           u.name AS sender_name,
+           u.image AS sender_image
+    FROM messages m
+    JOIN "user" u ON u.id = m.sender_id
+    JOIN conversations c ON c.id = m.conversation_id
+    WHERE m.deleted_at IS NULL
+      AND EXISTS (
+        SELECT 1 FROM conversation_members cm
+        WHERE cm.conversation_id = m.conversation_id
+          AND cm.user_id = ${user.id}
+      )
+      AND (m.plain_content ILIKE ${likePattern} OR m.plain_content % ${q})
+    ORDER BY GREATEST(similarity(m.plain_content, ${q}), 0) DESC,
+             m.created_at DESC
+    LIMIT 50
+  `;
+
+  res.json({ results: shapeSearchResults(rows) });
+});
+
+// ─── Get messages (paginated, cursor-based by ID) ─────────────
+
+router.get("/conversations/:id/messages", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const before = req.query.before as string | undefined;
+  const anchor = req.query.anchor as string | undefined;
+  const limit = req.query.limit as string | undefined;
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  });
+
+  if (!member) {
+    res.status(403).json({ error: "Not a member of this conversation" });
+    return;
+  }
+
+  const take = Math.min(parseInt(limit || "50", 10) || 50, 100);
+
+  // Anchor mode: fetch a window centered on a specific message id. Used by
+  // the "jump to message" flow from search results. Takes precedence over
+  // `before`.
+  let seqMin: number | null = null;
+  let seqMax: number | null = null;
+  if (anchor) {
+    const anchorMsg = await prisma.message.findFirst({
+      where: { id: anchor, conversationId: id },
+      select: { seq: true },
+    });
+    if (anchorMsg) {
+      const half = Math.floor(take / 2);
+      seqMin = Math.max(0, anchorMsg.seq - half);
+      seqMax = anchorMsg.seq + half;
+    }
+  }
+
+  let cursorDate: Date | undefined;
+  if (!anchor && before) {
+    const cursorMsg = await prisma.message.findUnique({
+      where: { id: before },
+      select: { createdAt: true },
+    });
+    cursorDate = cursorMsg?.createdAt;
+  }
+
+  const messages = await prisma.message.findMany({
+    where: {
+      conversationId: id,
+      ...(seqMin !== null && seqMax !== null
+        ? { seq: { gte: seqMin, lte: seqMax } }
+        : cursorDate
+          ? { createdAt: { lt: cursorDate } }
+          : {}),
+    },
+    orderBy: { createdAt: "desc" },
+    take,
+    include: {
+      sender: { select: { id: true, name: true, image: true } },
+      replyTo: {
+        select: {
+          id: true,
+          content: true,
+          plainContent: true,
+          senderId: true,
+          deletedAt: true,
+          sender: { select: { id: true, name: true } },
+        },
+      },
+      reactions: {
+        select: {
+          id: true,
+          emoji: true,
+          userId: true,
+          user: { select: { id: true, name: true } },
+        },
+      },
+      attachments: {
+        select: {
+          id: true,
+          url: true,
+          contentType: true,
+          filename: true,
+          size: true,
+          width: true,
+          height: true,
+        },
+      },
+    },
+  });
+
+  // Get read-by info: which members have read up to which message
+  const members = await prisma.conversationMember.findMany({
+    where: { conversationId: id, lastReadMessageId: { not: null } },
+    select: {
+      userId: true,
+      lastReadMessageId: true,
+      user: { select: { id: true, name: true, image: true } },
+    },
+  });
+
+  res.json({
+    messages,
+    readPositions: members.map((m) => ({
+      userId: m.userId,
+      name: m.user.name,
+      image: m.user.image,
+      lastReadMessageId: m.lastReadMessageId,
+    })),
+    nextCursor: messages.length === take ? messages[messages.length - 1].id : null,
+  });
+});
+
+// ─── Edit message ─────────────────────────────────────────────
+
+router.put("/conversations/:id/messages/:messageId", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const messageId = param(req.params.messageId);
+  const { content } = req.body as { content?: unknown };
+
+  let canonJson: MessageContentJson;
+  let plainText: string;
+  try {
+    canonJson = canonicalizeFromJson(content);
+    plainText = extractPlainText(canonJson);
+  } catch {
+    res.status(400).json({ error: "content must be a Tiptap JSON document" });
+    return;
+  }
+
+  if (plainText.length > MAX_MESSAGE_PLAIN_CHARS) {
+    res
+      .status(413)
+      .json({ error: `content exceeds ${MAX_MESSAGE_PLAIN_CHARS} characters` });
+    return;
+  }
+
+  if (isEmptyContent(canonJson)) {
+    res.status(400).json({ error: "content is required" });
+    return;
+  }
+
+  const message = await prisma.message.findFirst({
+    where: {
+      id: messageId,
+      conversationId: id,
+      senderId: user.id,
+      type: "text",
+      deletedAt: null,
+    },
+  });
+
+  if (!message) {
+    res.status(404).json({ error: "Message not found or not yours" });
+    return;
+  }
+
+  const updated = await withRealtime(async (rt) => {
+    const u = await rt.tx.message.update({
+      where: { id: messageId },
+      data: {
+        content: canonJson,
+        plainContent: plainText,
+        editedAt: new Date(),
+      },
+    });
+    await rt.enqueueToConversation(
+      id,
+      {
+        type: "message_edited",
+        conversationId: id,
+        messageId,
+        content: u.content,
+        editedAt: u.editedAt,
+      },
+      `message_edited_${messageId}_${u.editedAt!.getTime()}`,
+    );
+    return u;
+  });
+
+  res.json(updated);
+});
+
+// ─── Delete message (soft) ────────────────────────────────────
+
+router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const messageId = param(req.params.messageId);
+
+  const message = await prisma.message.findFirst({
+    where: {
+      id: messageId,
+      conversationId: id,
+      senderId: user.id,
+      deletedAt: null,
+    },
+  });
+
+  if (!message) {
+    res.status(404).json({ error: "Message not found or not yours" });
+    return;
+  }
+
+  await withRealtime(async (rt) => {
+    await rt.tx.message.update({
+      where: { id: messageId },
+      data: {
+        deletedAt: new Date(),
+        // Reset content to an empty Tiptap doc so a renderer can't leak
+        // the old text if it ignores deletedAt by mistake.
+        content: { type: "doc", content: [] },
+        plainContent: "",
+      },
+    });
+    await rt.enqueueToConversation(
+      id,
+      {
+        type: "message_deleted",
+        conversationId: id,
+        messageId,
+      },
+      `message_deleted_${messageId}`,
+    );
+  });
+
+  res.json({ ok: true });
+});
+
+// ─── Mark conversation as read ────────────────────────────────
+
+router.post("/conversations/:id/read", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const { messageId } = req.body as { messageId: string };
+
+  if (!messageId) {
+    res.status(400).json({ error: "messageId is required" });
+    return;
+  }
+
+  // Verify message exists in this conversation
+  const message = await prisma.message.findFirst({
+    where: { id: messageId, conversationId: id },
+  });
+
+  if (!message) {
+    res.status(404).json({ error: "Message not found" });
+    return;
+  }
+
+  await withRealtime(async (rt) => {
+    await rt.tx.conversationMember.update({
+      where: { conversationId_userId: { conversationId: id, userId: user.id } },
+      data: {
+        lastReadMessageId: messageId,
+        lastReadAt: new Date(),
+        unreadCount: 0,
+      },
+    });
+    await rt.tx.user.update({
+      where: { id: user.id },
+      data: { lastActiveAt: new Date() },
+    });
+    await rt.enqueueToConversation(
+      id,
+      {
+        type: "read_receipt",
+        conversationId: id,
+        userId: user.id,
+        userName: user.name,
+        messageId,
+      },
+      `read_${user.id}_${id}_${messageId}`,
+      { exclude: user.id },
+    );
+  });
+
+  res.json({ ok: true });
+});
+
+// ─── Mute / unmute conversation ───────────────────────────────
+
+router.post("/conversations/:id/mute", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const { muted } = req.body as { muted: boolean };
+
+  if (typeof muted !== "boolean") {
+    res.status(400).json({ error: "muted (boolean) is required" });
+    return;
+  }
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  });
+
+  if (!member) {
+    res.status(404).json({ error: "Conversation not found" });
+    return;
+  }
+
+  await withRealtime(async (rt) => {
+    await rt.tx.conversationMember.update({
+      where: { id: member.id },
+      data: { muted },
+    });
+    // Sync mute state across this user's other sessions (phone + laptop etc).
+    rt.enqueue({
+      channels: [centrifugo.userChannel(user.id)],
+      data: {
+        type: "conversation_mute_changed",
+        conversationId: id,
+        muted,
+      },
+      idempotencyKey: `mute_${user.id}_${id}_${muted ? 1 : 0}_${Date.now()}`,
+    });
+  });
+
+  res.json({ muted });
+});
+
+// ─── Add reaction ─────────────────────────────────────────────
+
+router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const messageId = param(req.params.messageId);
+  const { emoji } = req.body as { emoji: string };
+
+  if (!emoji?.trim()) {
+    res.status(400).json({ error: "emoji is required" });
+    return;
+  }
+
+  // Verify membership and message exists
+  const message = await prisma.message.findFirst({
+    where: {
+      id: messageId,
+      conversationId: id,
+      deletedAt: null,
+      conversation: { members: { some: { userId: user.id } } },
+    },
+  });
+
+  if (!message) {
+    res.status(404).json({ error: "Message not found" });
+    return;
+  }
+
+  const reaction = await withRealtime(async (rt) => {
+    const r = await rt.tx.reaction.upsert({
+      where: {
+        messageId_userId_emoji: { messageId, userId: user.id, emoji: emoji.trim() },
+      },
+      create: { messageId, userId: user.id, emoji: emoji.trim() },
+      update: {},
+    });
+    await rt.enqueueToConversation(
+      id,
+      {
+        type: "reaction_added",
+        conversationId: id,
+        messageId,
+        reaction: {
+          id: r.id,
+          emoji: r.emoji,
+          userId: user.id,
+          userName: user.name,
+        },
+      },
+      `reaction_add_${r.id}`,
+    );
+    return r;
+  });
+
+  res.status(201).json(reaction);
+});
+
+// ─── Remove reaction ──────────────────────────────────────────
+
+router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+  const messageId = param(req.params.messageId);
+  const emoji = decodeURIComponent(param(req.params.emoji));
+
+  const deleted = await prisma.reaction.deleteMany({
+    where: { messageId, userId: user.id, emoji },
+  });
+
+  if (deleted.count === 0) {
+    res.status(404).json({ error: "Reaction not found" });
+    return;
+  }
+
+  await withRealtime(async (rt) => {
+    await rt.enqueueToConversation(
+      id,
+      {
+        type: "reaction_removed",
+        conversationId: id,
+        messageId,
+        emoji,
+        userId: user.id,
+      },
+      `reaction_remove_${messageId}_${user.id}_${emoji}_${Date.now()}`,
+    );
+  });
+
+  res.json({ ok: true });
+});
+
+// ─── Typing indicator ─────────────────────────────────────────
+
+router.post("/conversations/:id/typing", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  const id = param(req.params.id);
+
+  const member = await prisma.conversationMember.findUnique({
+    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  });
+
+  if (!member) {
+    res.status(403).json({ error: "Not a member of this conversation" });
+    return;
+  }
+
+  // Typing is ephemeral; dupe keys collide by design so retries within the
+  // same second don't amplify into a second flash of the indicator.
+  await broadcastToConversation(
+    id,
+    {
+      type: "typing_started",
+      conversationId: id,
+      userId: user.id,
+      userName: user.name,
+    },
+    `typing_${user.id}_${id}_${Math.floor(Date.now() / 2000)}`,
+    { exclude: user.id },
+  );
+
+  res.json({ ok: true });
+});
+
+// ─── Update last active ───────────────────────────────────────
+
+router.post("/me/active", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { lastActiveAt: new Date() },
+  });
+  res.json({ ok: true });
+});
+
+// ─── Broadcast my profile change to peers ─────────────────────
+// Called by the client after `authClient.updateUser`. Fans out a
+// `user_updated` event to every user who shares a conversation with me so
+// their sidebar / header / message avatars refresh in real time.
+
+router.post("/me/broadcast-profile", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+
+  const fresh = await prisma.user.findUnique({
+    where: { id: user.id },
+    select: { id: true, name: true, image: true },
+  });
+  if (!fresh) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  // Distinct peer user ids — everyone who shares at least one conversation
+  // with me, plus me (for multi-tab sync on my own device).
+  const rows = await prisma.conversationMember.findMany({
+    where: {
+      conversation: { members: { some: { userId: fresh.id } } },
+    },
+    select: { userId: true },
+    distinct: ["userId"],
+  });
+
+  const channels = rows.map((r) => centrifugo.userChannel(r.userId));
+  if (channels.length > 0) {
+    await centrifugo.broadcast(
+      channels,
+      { type: "user_updated", user: fresh },
+      { idempotencyKey: `user_updated_${fresh.id}_${Date.now()}` },
+    );
+  }
+
+  res.json({ ok: true });
+});
+
+// ─── Helpers ──────────────────────────────────────────────────
+
+async function getConversationsWithUnread(userId: string) {
+  const memberships = await prisma.conversationMember.findMany({
+    where: { userId },
+    include: {
+      conversation: {
+        include: {
+          members: {
+            include: {
+              user: { select: { id: true, name: true, email: true, image: true, lastActiveAt: true } },
+            },
+          },
+          messages: {
+            where: { deletedAt: null },
+            orderBy: { createdAt: "desc" },
+            take: 1,
+            include: {
+              sender: { select: { id: true, name: true } },
+            },
+          },
+        },
+      },
+    },
+  });
+
+  // unreadCount is now a denormalized column on conversation_members,
+  // maintained by the message-send transaction and zeroed on read. The
+  // previous N+1 COUNT(*) per conversation is gone.
+  const results = memberships.map((m) => ({
+    ...m.conversation,
+    unreadCount: m.unreadCount,
+    muted: m.muted,
+    lastMessage: m.conversation.messages[0] || null,
+  }));
+
+  // Sort by most recent activity
+  results.sort((a, b) => {
+    const aTime = a.lastMessage?.createdAt ?? a.createdAt;
+    const bTime = b.lastMessage?.createdAt ?? b.createdAt;
+    return new Date(bTime).getTime() - new Date(aTime).getTime();
+  });
+
+  return results;
+}
+
+export default router;

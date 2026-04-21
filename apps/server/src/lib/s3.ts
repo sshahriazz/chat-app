@@ -1,0 +1,134 @@
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { env } from "../env";
+
+/**
+ * Generic S3-compatible client. Works for AWS S3 (leave `endpoint` unset),
+ * Cloudflare R2, MinIO, Backblaze B2, Wasabi, etc.
+ *
+ * The server never touches bytes. It only:
+ *   1. Mints a presigned PUT URL (valid ~5 min).
+ *   2. Records metadata in the `attachments` table.
+ *
+ * Clients upload directly to object storage, then POST the message
+ * with the `attachmentId`(s) we gave them. Bandwidth cost + latency
+ * stay with object storage, not our app tier.
+ */
+
+function missingVar(name: string): never {
+  throw new Error(
+    `S3 not configured: set ${name} in apps/server/.env to enable attachments.`,
+  );
+}
+
+function requireS3Config() {
+  const region = env.S3_REGION ?? missingVar("S3_REGION");
+  const bucket = env.S3_BUCKET ?? missingVar("S3_BUCKET");
+  const accessKeyId = env.S3_ACCESS_KEY_ID ?? missingVar("S3_ACCESS_KEY_ID");
+  const secretAccessKey =
+    env.S3_SECRET_ACCESS_KEY ?? missingVar("S3_SECRET_ACCESS_KEY");
+  const publicUrlBase =
+    env.S3_PUBLIC_URL_BASE ?? missingVar("S3_PUBLIC_URL_BASE");
+  return {
+    region,
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+    endpoint: env.S3_ENDPOINT,
+    publicUrlBase: publicUrlBase.replace(/\/$/, ""),
+  };
+}
+
+let cachedClient: S3Client | null = null;
+
+function getClient() {
+  if (cachedClient) return cachedClient;
+  const cfg = requireS3Config();
+  cachedClient = new S3Client({
+    region: cfg.region,
+    endpoint: cfg.endpoint,
+    // R2 / MinIO prefer virtual-hosted-style off; AWS is happier with on.
+    // The SDK default (undefined → auto) is usually right; override only
+    // when explicitly needed via endpoint style hints.
+    credentials: {
+      accessKeyId: cfg.accessKeyId,
+      secretAccessKey: cfg.secretAccessKey,
+    },
+    // Custom endpoints (R2/MinIO) need path-style addressing for safety.
+    forcePathStyle: !!cfg.endpoint,
+  });
+  return cachedClient;
+}
+
+export interface UploadUrlResult {
+  uploadUrl: string;
+  publicUrl: string;
+  key: string;
+  expiresIn: number;
+}
+
+export async function createUploadUrl(params: {
+  userId: string;
+  key: string;
+  contentType: string;
+  contentLength: number;
+  expiresIn?: number;
+}): Promise<UploadUrlResult> {
+  const cfg = requireS3Config();
+  const client = getClient();
+  const expiresIn = params.expiresIn ?? 5 * 60; // 5 min
+
+  const cmd = new PutObjectCommand({
+    Bucket: cfg.bucket,
+    Key: params.key,
+    ContentType: params.contentType,
+    ContentLength: params.contentLength,
+  });
+
+  const uploadUrl = await getSignedUrl(client, cmd, { expiresIn });
+  const publicUrl = `${cfg.publicUrlBase}/${params.key}`;
+  return { uploadUrl, publicUrl, key: params.key, expiresIn };
+}
+
+/**
+ * Signed GET URL that forces the browser to download rather than render.
+ * The `ResponseContentDisposition` override is applied per-request, so the
+ * same object can still serve inline for <img>/<video> on the public URL.
+ */
+export async function createDownloadUrl(params: {
+  key: string;
+  filename: string;
+  expiresIn?: number;
+}): Promise<{ url: string; expiresIn: number }> {
+  const cfg = requireS3Config();
+  const client = getClient();
+  const expiresIn = params.expiresIn ?? 60; // 1 min
+
+  // RFC 5987 encoding so non-ASCII filenames survive.
+  const encoded = encodeURIComponent(params.filename);
+  const disposition = `attachment; filename*=UTF-8''${encoded}`;
+
+  const cmd = new GetObjectCommand({
+    Bucket: cfg.bucket,
+    Key: params.key,
+    ResponseContentDisposition: disposition,
+  });
+
+  const url = await getSignedUrl(client, cmd, { expiresIn });
+  return { url, expiresIn };
+}
+
+/**
+ * Recovers the bucket key from the public URL we stored at upload time.
+ * Relies on S3_PUBLIC_URL_BASE pointing at the bucket origin.
+ */
+export function keyFromPublicUrl(publicUrl: string): string | null {
+  const base = env.S3_PUBLIC_URL_BASE?.replace(/\/$/, "");
+  if (!base) return null;
+  if (!publicUrl.startsWith(base + "/")) return null;
+  return publicUrl.slice(base.length + 1);
+}

@@ -1,0 +1,33 @@
+{
+  "client": {
+    "token": {
+      "hmac_secret_key": "dev-secret-change-in-production"
+    },
+    "allowed_origins": ["http://localhost:3000", "http://192.168.0.101:3000"]
+  },
+  "http_api": {
+    "key": "dev-api-key"
+  },
+  "admin": {
+    "enabled": true,
+    "password": "admin",
+    "secret": "dev-admin-secret"
+  },
+  "channel": {
+    "namespaces": [
+      {
+        "name": "user",
+        "history_size": 300,
+        "history_ttl": "600s",
+        "force_recovery": true
+      },
+      {
+        "name": "presence",
+        "presence": true,
+        "join_leave": true,
+        "force_push_join_leave": true,
+        "allow_presence_for_subscriber": true
+      }
+    ]
+  }
+}
