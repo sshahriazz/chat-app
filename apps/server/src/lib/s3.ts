@@ -46,40 +46,31 @@ function requireS3Config() {
 }
 
 /**
- * Two S3 clients with different endpoints:
+ * Single S3 client pointed at the INTERNAL endpoint (e.g. `http://minio:9000`).
+ * Both presigning and server-side operations (HEAD/DELETE) use it.
  *
- *   getOpsClient()     → internal endpoint (`http://minio:9000`). Used
- *                        for HEAD/DELETE/anything the server runs itself.
- *                        Cheap intra-cluster calls, no public round-trip.
+ * Why sign against the internal hostname?
  *
- *   getSigningClient() → public endpoint (derived from S3_PUBLIC_URL_BASE).
- *                        Used ONLY to mint presigned PUT/GET URLs. The
- *                        Host in the signed URL must match what the
- *                        browser will send when uploading — otherwise
- *                        SigV4 validation fails on MinIO's side.
+ * Next.js's built-in rewrite proxy uses http-proxy with `changeOrigin:
+ * true` (hardcoded — no way to configure via next.config.ts). That means
+ * when a browser PUTs to `https://chat.example.com/<bucket>/<key>?sig=…`,
+ * the web container rewrites the Host header to `minio:9000` before
+ * forwarding to MinIO. SigV4 validates using the Host header MinIO
+ * *receives*, not the URL the browser typed — so to pass validation the
+ * signature must have been computed with Host=minio:9000.
  *
- * When only one URL is set (S3_PUBLIC_URL_BASE points directly at an
- * internet-reachable MinIO), both clients share the same endpoint and
- * the split is a no-op.
+ * The presigned URL returned to the browser is then rewritten (below) so
+ * its origin matches the public host. That only changes the URL string —
+ * the signature payload stays the same, and MinIO still sees what it
+ * expects after the Host rewrite.
  */
 
-function getSigningEndpoint(publicUrlBase: string, bucket: string): string {
-  // Strip the `/<bucket>` suffix so the SDK appends its own path-style
-  // `/<bucket>/<key>`. Works for `http://host:port/bucket` and for
-  // `https://host/subpath/bucket`.
-  const u = new URL(publicUrlBase);
-  const trimmed = u.pathname.replace(new RegExp(`/${bucket}/?$`), "");
-  u.pathname = trimmed;
-  return u.toString().replace(/\/$/, "");
-}
+let s3Client: S3Client | null = null;
 
-let opsClient: S3Client | null = null;
-let signingClient: S3Client | null = null;
-
-function getOpsClient() {
-  if (opsClient) return opsClient;
+function getS3Client() {
+  if (s3Client) return s3Client;
   const cfg = requireS3Config();
-  opsClient = new S3Client({
+  s3Client = new S3Client({
     region: cfg.region,
     endpoint: cfg.endpoint,
     credentials: {
@@ -89,23 +80,25 @@ function getOpsClient() {
     // Custom endpoints (R2/MinIO) need path-style addressing.
     forcePathStyle: !!cfg.endpoint,
   });
-  return opsClient;
+  return s3Client;
 }
 
-function getSigningClient() {
-  if (signingClient) return signingClient;
-  const cfg = requireS3Config();
-  const signingEndpoint = getSigningEndpoint(cfg.publicUrlBase, cfg.bucket);
-  signingClient = new S3Client({
-    region: cfg.region,
-    endpoint: signingEndpoint,
-    credentials: {
-      accessKeyId: cfg.accessKeyId,
-      secretAccessKey: cfg.secretAccessKey,
-    },
-    forcePathStyle: true,
-  });
-  return signingClient;
+/**
+ * Rewrite the origin of a presigned URL to the public host while leaving
+ * the path and query string (including the signature) untouched.
+ *
+ *   http://minio:9000/chatapp/<key>?X-Amz-Signature=…
+ *          ↓
+ *   https://chat.example.com/chatapp/<key>?X-Amz-Signature=…
+ *
+ * The browser uses the rewritten URL; the Next.js rewrite proxy sends the
+ * request on to MinIO with the internal Host header, so SigV4 still
+ * validates against the Host the server signed with.
+ */
+function rewriteToPublicOrigin(signedUrl: string, publicUrlBase: string): string {
+  const signed = new URL(signedUrl);
+  const publicOrigin = new URL(publicUrlBase).origin;
+  return `${publicOrigin}${signed.pathname}${signed.search}`;
 }
 
 export interface UploadUrlResult {
@@ -123,7 +116,7 @@ export async function createUploadUrl(params: {
   expiresIn?: number;
 }): Promise<UploadUrlResult> {
   const cfg = requireS3Config();
-  const client = getSigningClient();
+  const client = getS3Client();
   const expiresIn = params.expiresIn ?? 5 * 60; // 5 min
 
   const cmd = new PutObjectCommand({
@@ -133,7 +126,8 @@ export async function createUploadUrl(params: {
     ContentLength: params.contentLength,
   });
 
-  const uploadUrl = await getSignedUrl(client, cmd, { expiresIn });
+  const internalUrl = await getSignedUrl(client, cmd, { expiresIn });
+  const uploadUrl = rewriteToPublicOrigin(internalUrl, cfg.publicUrlBase);
   const publicUrl = `${cfg.publicUrlBase}/${params.key}`;
   return { uploadUrl, publicUrl, key: params.key, expiresIn };
 }
@@ -149,7 +143,7 @@ export async function createDownloadUrl(params: {
   expiresIn?: number;
 }): Promise<{ url: string; expiresIn: number }> {
   const cfg = requireS3Config();
-  const client = getSigningClient();
+  const client = getS3Client();
   const expiresIn = params.expiresIn ?? 60; // 1 min
 
   // RFC 5987 encoding so non-ASCII filenames survive.
@@ -162,7 +156,8 @@ export async function createDownloadUrl(params: {
     ResponseContentDisposition: disposition,
   });
 
-  const url = await getSignedUrl(client, cmd, { expiresIn });
+  const internalUrl = await getSignedUrl(client, cmd, { expiresIn });
+  const url = rewriteToPublicOrigin(internalUrl, cfg.publicUrlBase);
   return { url, expiresIn };
 }
 
@@ -172,7 +167,7 @@ export async function createDownloadUrl(params: {
  */
 export async function deleteObject(key: string): Promise<void> {
   const cfg = requireS3Config();
-  const client = getOpsClient();
+  const client = getS3Client();
   await client.send(new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }));
 }
 
@@ -183,7 +178,7 @@ export async function deleteObject(key: string): Promise<void> {
  */
 export async function headObjectSize(key: string): Promise<number | null> {
   const cfg = requireS3Config();
-  const client = getOpsClient();
+  const client = getS3Client();
   try {
     const res = await client.send(
       new HeadObjectCommand({ Bucket: cfg.bucket, Key: key }),
