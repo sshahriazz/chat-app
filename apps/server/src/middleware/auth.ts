@@ -38,12 +38,37 @@ setInterval(() => {
   }
 }, 60_000).unref();
 
+/**
+ * Extract better-auth's session-token cookie value from the Cookie header.
+ * Keying the cache on this narrower value — rather than the whole header —
+ * means unrelated cookie changes (e.g. a CSRF header being added by a
+ * proxy) don't thrash the cache, and two users whose browsers happen to
+ * emit the same ancillary cookies can't collide on the key.
+ *
+ * Supports both the plain and `__Secure-` prefixed cookie names that
+ * better-auth uses depending on whether the request is HTTPS.
+ */
+function extractSessionCookie(cookieHeader: string): string | null {
+  const names = [
+    "better-auth.session_token",
+    "__Secure-better-auth.session_token",
+  ];
+  for (const name of names) {
+    const re = new RegExp(
+      `(?:^|;\\s*)${name.replace(/\./g, "\\.")}=([^;]+)`,
+    );
+    const match = cookieHeader.match(re);
+    if (match) return `${name}=${match[1]}`;
+  }
+  return null;
+}
+
 export async function requireAuth(
   req: Request,
   res: Response,
   next: NextFunction,
 ) {
-  const cookieKey = req.headers.cookie ?? "";
+  const cookieKey = extractSessionCookie(req.headers.cookie ?? "");
 
   if (cookieKey) {
     const hit = sessionCache.get(cookieKey);

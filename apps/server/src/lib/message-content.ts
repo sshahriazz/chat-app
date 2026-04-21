@@ -106,5 +106,32 @@ export function isEmptyContent(json: MessageContentJson): boolean {
   return extractPlainText(json).length === 0;
 }
 
+/**
+ * Rewrite every mention node's `attrs.label` to the canonical name
+ * looked up by `attrs.id`. Prevents a client from displaying "@alice"
+ * text while pointing at Bob's user id. IDs outside the lookup map are
+ * left alone — the caller has already validated which ids are
+ * legitimate mentions (current conversation members).
+ */
+export function canonicalizeMentionLabels(
+  json: MessageContentJson,
+  namesByUserId: Map<string, string>,
+): void {
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const n = node as {
+      type?: string;
+      attrs?: { id?: string; label?: string };
+      content?: unknown[];
+    };
+    if (n.type === "mention" && n.attrs && typeof n.attrs.id === "string") {
+      const canonical = namesByUserId.get(n.attrs.id);
+      if (canonical) n.attrs.label = canonical;
+    }
+    if (Array.isArray(n.content)) n.content.forEach(walk);
+  };
+  walk(json);
+}
+
 /** Hard cap on plain-text length. Prevents paste-bombs independent of the JSON shape. */
 export const MAX_MESSAGE_PLAIN_CHARS = 50_000;

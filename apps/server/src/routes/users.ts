@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/auth";
+import { generalLimiter, searchLimiter } from "../middleware/rate-limit";
 import { prisma } from "../db";
 
 const router: Router = Router();
@@ -14,12 +15,12 @@ function isOnline(lastActiveAt: Date | null | undefined): boolean {
 
 // ─── Search users by name or email ────────────────────────────
 
-router.get("/search", requireAuth, async (req, res) => {
+router.get("/search", requireAuth, searchLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const q = ((req.query.q as string) || "").trim();
 
-  if (q.length < 2) {
-    res.status(400).json({ error: "Query must be at least 2 characters" });
+  if (q.length < 2 || q.length > 64) {
+    res.status(400).json({ error: "Query must be 2-64 characters" });
     return;
   }
 
@@ -55,16 +56,23 @@ router.get("/search", requireAuth, async (req, res) => {
 
 // ─── Get online status for a list of user IDs ─────────────────
 
-router.post("/online", requireAuth, async (req, res) => {
-  const { userIds } = req.body as { userIds: string[] };
+router.post("/online", requireAuth, generalLimiter, async (req, res) => {
+  const { userIds } = req.body as { userIds?: unknown };
 
-  if (!userIds?.length) {
-    res.status(400).json({ error: "userIds is required" });
+  if (
+    !Array.isArray(userIds) ||
+    userIds.length === 0 ||
+    userIds.length > 200 ||
+    !userIds.every((v) => typeof v === "string" && v.length <= 128)
+  ) {
+    res.status(400).json({
+      error: "userIds must be an array of 1-200 string ids (≤128 chars each)",
+    });
     return;
   }
 
   const users = await prisma.user.findMany({
-    where: { id: { in: userIds } },
+    where: { id: { in: userIds as string[] } },
     select: { id: true, lastActiveAt: true },
   });
 

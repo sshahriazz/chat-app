@@ -3,6 +3,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
+  HeadObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { env } from "../env";
@@ -131,6 +132,28 @@ export async function deleteObject(key: string): Promise<void> {
   const cfg = requireS3Config();
   const client = getClient();
   await client.send(new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }));
+}
+
+/**
+ * HEAD an object and return its actual byte size, or `null` if it doesn't
+ * exist. Used by the post-upload verification flow to confirm the
+ * bytes the client actually PUT match the size we signed the presign for.
+ */
+export async function headObjectSize(key: string): Promise<number | null> {
+  const cfg = requireS3Config();
+  const client = getClient();
+  try {
+    const res = await client.send(
+      new HeadObjectCommand({ Bucket: cfg.bucket, Key: key }),
+    );
+    return typeof res.ContentLength === "number" ? res.ContentLength : null;
+  } catch (err: unknown) {
+    const status =
+      (err as { $metadata?: { httpStatusCode?: number } })?.$metadata
+        ?.httpStatusCode ?? 0;
+    if (status === 404) return null;
+    throw err;
+  }
 }
 
 /**

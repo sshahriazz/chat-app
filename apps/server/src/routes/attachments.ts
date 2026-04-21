@@ -14,6 +14,10 @@ const router: Router = Router();
 
 // ~50 MB is a reasonable ceiling for a chat attachment; adjust per plan.
 const MAX_SIZE = 50 * 1024 * 1024;
+// Per-user aggregate storage cap. Prevents a single account from filling
+// the bucket via repeated uploads under the per-file 50MB ceiling.
+// Bump in production if you need per-plan quotas; make it an env var.
+const PER_USER_QUOTA_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
 
 // POST /api/attachments/upload-url
 // Client sends file metadata; server mints a signed PUT URL, creates the
@@ -35,6 +39,46 @@ router.post("/upload-url", requireAuth, uploadUrlLimiter, async (req, res) => {
     return;
   }
 
+  // Filename sanity: arbitrary-length user input stored in the DB and
+  // passed as an S3 key extension seed. Windows/POSIX path separators
+  // can't actually produce traversal (the key is a UUID + `path.extname`),
+  // but a huge filename is pure abuse.
+  if (filename.length > 255) {
+    res.status(400).json({ error: "filename too long" });
+    return;
+  }
+
+  // Content-type allowlist. Explicitly rejects image/svg+xml, HTML, and
+  // executables — anything that could serve a script when fetched from
+  // the bucket and opened in a browser tab. Arbitrary octet-stream
+  // downloads are also rejected; we'd want explicit buy-in for generic
+  // binary uploads.
+  const ALLOWED_CONTENT_TYPES = new Set<string>([
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "image/heic",
+    "image/heif",
+    "application/pdf",
+    "text/plain",
+    "text/csv",
+    "application/zip",
+    "application/x-zip-compressed",
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+  ]);
+  if (!ALLOWED_CONTENT_TYPES.has(contentType)) {
+    res.status(415).json({ error: `unsupported content type: ${contentType}` });
+    return;
+  }
+
   // Clamp dimension values: only accept finite positive integers below a
   // sanity ceiling (>16k × 16k is almost certainly a hostile client).
   const validDim = (n: unknown): number | null => {
@@ -47,6 +91,23 @@ router.post("/upload-url", requireAuth, uploadUrlLimiter, async (req, res) => {
   const attHeight = validDim(height);
   if (size <= 0 || size > MAX_SIZE) {
     res.status(400).json({ error: `size must be between 1 and ${MAX_SIZE}` });
+    return;
+  }
+
+  // Per-user quota. Sums the uploader's existing attachments; rejects if
+  // this upload would push them over the cap. Racy under extreme
+  // concurrency (two parallel presigns can both pass), but the window is
+  // small and the worst case is a user ending up slightly over quota —
+  // acceptable while we don't need strict accounting.
+  const used = await prisma.attachment.aggregate({
+    where: { uploaderId: user.id },
+    _sum: { size: true },
+  });
+  const usedBytes = used._sum.size ?? 0;
+  if (usedBytes + size > PER_USER_QUOTA_BYTES) {
+    res.status(413).json({
+      error: `storage quota exceeded (used ${usedBytes} / ${PER_USER_QUOTA_BYTES} bytes)`,
+    });
     return;
   }
 

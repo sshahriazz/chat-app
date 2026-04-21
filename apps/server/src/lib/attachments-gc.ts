@@ -1,5 +1,6 @@
 import { prisma } from "../db";
 import { deleteObject, keyFromPublicUrl } from "./s3";
+import { logger } from "./logger";
 
 /**
  * Orphan attachment GC.
@@ -43,7 +44,10 @@ export async function gcOrphanAttachments(
       await deleteObject(key);
     } catch (err) {
       s3Errors += 1;
-      console.warn("[gc-attachments] S3 delete failed:", key, (err as Error).message);
+      logger.warn("attachments-gc: S3 delete failed", {
+        key,
+        err: err as Error,
+      });
     }
   }
 

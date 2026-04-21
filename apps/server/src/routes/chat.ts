@@ -8,8 +8,11 @@ import {
   invalidateConversation,
 } from "../lib/member-cache";
 import { pushToUsers } from "../lib/push";
+import { logger } from "../lib/logger";
+import { headObjectSize, deleteObject, keyFromPublicUrl } from "../lib/s3";
 import {
   canonicalizeFromJson,
+  canonicalizeMentionLabels,
   extractMentions,
   extractPlainText,
   isEmptyContent,
@@ -20,6 +23,7 @@ import {
   sendMessageLimiter,
   typingLimiter,
   searchLimiter,
+  generalLimiter,
 } from "../middleware/rate-limit";
 
 const router: Router = Router();
@@ -536,12 +540,6 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
     return;
   }
 
-  // If the body is empty-after-canonicalize but attachments exist, fall back
-  // to a minimal empty doc so the column stays non-null.
-  const storedContent: MessageContentJson = hasBody
-    ? (canonJson as MessageContentJson)
-    : { type: "doc", content: [] };
-
   const member = await prisma.conversationMember.findUnique({
     where: { conversationId_userId: { conversationId: id, userId: user.id } },
   });
@@ -554,6 +552,12 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
   // Retry-safe dedup: if the client already sent this message and we stored
   // it, return the stored row. The unique index on (conversationId, clientMessageId)
   // also protects against two concurrent inserts with the same key.
+  if (clientMessageId !== undefined) {
+    if (typeof clientMessageId !== "string" || clientMessageId.length > 256) {
+      res.status(400).json({ error: "clientMessageId must be ≤256 chars" });
+      return;
+    }
+  }
   if (clientMessageId) {
     const existing = await prisma.message.findUnique({
       where: {
@@ -606,12 +610,37 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
       select: { currentSeq: true },
     });
 
+    // Rewrite every mention node's label to the canonical DB name before
+    // storing. Client-supplied labels can't be trusted ("@alice" pointing
+    // at Bob's uid would otherwise persist). IDs that don't resolve to a
+    // real member of this conversation get filtered out of `mentions`
+    // below so they never trigger notifications or mute-bypass.
+    let validatedMentions: string[] = [];
+    if (canonJson) {
+      const rawIds = extractMentions(canonJson);
+      if (rawIds.length > 0) {
+        const rows = await rt.tx.conversationMember.findMany({
+          where: { conversationId: id, userId: { in: rawIds } },
+          include: { user: { select: { id: true, name: true } } },
+        });
+        const lookup = new Map(rows.map((r) => [r.user.id, r.user.name]));
+        canonicalizeMentionLabels(canonJson, lookup);
+        validatedMentions = rows.map((r) => r.user.id);
+      }
+    }
+    // Recompute plaintext after label rewrites — "@alice" might now read
+    // "@Alice Smith" and the search column should reflect it.
+    const finalPlainContent = canonJson ? extractPlainText(canonJson) : "";
+    const finalStoredContent = canonJson && !isEmptyContent(canonJson)
+      ? canonJson
+      : ({ type: "doc", content: [] } as MessageContentJson);
+
     const msg = await rt.tx.message.create({
       data: {
         conversationId: id,
         senderId: user.id,
-        content: storedContent,
-        plainContent: plainText,
+        content: finalStoredContent,
+        plainContent: finalPlainContent,
         type: "text",
         replyToId: replyToId || null,
         seq,
@@ -647,21 +676,9 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
       include: MESSAGE_INCLUDE,
     });
 
-    // Mentioned user ids, narrowed to actual conversation members so spoofed
-    // or stale data-id values don't cause spurious notifications.
-    const mentionedRaw = extractMentions(
-      full.content as MessageContentJson,
-    );
-    const memberIds =
-      mentionedRaw.length === 0
-        ? []
-        : (
-            await rt.tx.conversationMember.findMany({
-              where: { conversationId: id, userId: { in: mentionedRaw } },
-              select: { userId: true },
-            })
-          ).map((r) => r.userId);
-    const mentions = mentionedRaw.filter((uid) => memberIds.includes(uid));
+    // `validatedMentions` was built above while canonicalizing labels —
+    // already narrowed to actual conversation members.
+    const mentions = validatedMentions;
 
     await rt.enqueueToConversation(
       id,
@@ -714,7 +731,56 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, asyn
         tag: `conv:${id}`,
         url: "/",
       },
-    ).catch((err) => console.error("[push] dispatch failed:", err));
+    ).catch((err) =>
+      logger.error("push dispatch failed", {
+        conversationId: id,
+        err: err as Error,
+      }),
+    );
+  }
+
+  // Post-commit attachment size verification. Fire-and-forget — doesn't
+  // block the response. S3 signs ContentLength in the presigned PUT so
+  // compliant backends reject mismatched uploads, but we verify anyway
+  // as defense-in-depth against non-strict backends (older MinIO, etc).
+  // If a mismatch is detected we delete both the S3 object and the DB
+  // row so a cheating client can't retain a too-large file.
+  if (message.attachments && message.attachments.length > 0) {
+    const linked = message.attachments.map((a) => ({
+      id: a.id,
+      url: a.url,
+      expectedSize: a.size,
+    }));
+    (async () => {
+      for (const a of linked) {
+        const key = keyFromPublicUrl(a.url);
+        if (!key) continue;
+        try {
+          const actual = await headObjectSize(key);
+          if (actual === null) {
+            logger.warn("attachment missing from S3 after link", {
+              attachmentId: a.id,
+            });
+            await prisma.attachment.delete({ where: { id: a.id } }).catch(() => {});
+            continue;
+          }
+          if (actual !== a.expectedSize) {
+            logger.warn("attachment size mismatch after upload", {
+              attachmentId: a.id,
+              expectedSize: a.expectedSize,
+              actualSize: actual,
+            });
+            await deleteObject(key).catch(() => {});
+            await prisma.attachment.delete({ where: { id: a.id } }).catch(() => {});
+          }
+        } catch (err) {
+          logger.warn("attachment verification failed", {
+            attachmentId: a.id,
+            err: err as Error,
+          });
+        }
+      }
+    })();
   }
 
   res.status(201).json(message);
@@ -767,8 +833,8 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, async (req, 
   const id = param(req.params.id);
   const q = ((req.query.q as string) || "").trim();
 
-  if (q.length < 2) {
-    res.status(400).json({ error: "q must be at least 2 characters" });
+  if (q.length < 2 || q.length > 128) {
+    res.status(400).json({ error: "q must be 2-128 characters" });
     return;
   }
 
@@ -813,8 +879,8 @@ router.get("/search", requireAuth, searchLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const q = ((req.query.q as string) || "").trim();
 
-  if (q.length < 2) {
-    res.status(400).json({ error: "q must be at least 2 characters" });
+  if (q.length < 2 || q.length > 128) {
+    res.status(400).json({ error: "q must be 2-128 characters" });
     return;
   }
 
@@ -850,7 +916,7 @@ router.get("/search", requireAuth, searchLimiter, async (req, res) => {
 
 // ─── Get messages (paginated, cursor-based by ID) ─────────────
 
-router.get("/conversations/:id/messages", requireAuth, async (req, res) => {
+router.get("/conversations/:id/messages", requireAuth, generalLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const before = req.query.before as string | undefined;
@@ -1007,11 +1073,25 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, async (req, re
   }
 
   const updated = await withRealtime(async (rt) => {
+    // Same canonicalization as the send path: rewrite mention labels to
+    // the DB canonical name. Bob can't get "@alice" reflected on the
+    // edited message.
+    const rawIds = extractMentions(canonJson);
+    if (rawIds.length > 0) {
+      const rows = await rt.tx.conversationMember.findMany({
+        where: { conversationId: id, userId: { in: rawIds } },
+        include: { user: { select: { id: true, name: true } } },
+      });
+      const lookup = new Map(rows.map((r) => [r.user.id, r.user.name]));
+      canonicalizeMentionLabels(canonJson, lookup);
+    }
+    const finalPlain = extractPlainText(canonJson);
+
     const u = await rt.tx.message.update({
       where: { id: messageId },
       data: {
         content: canonJson,
-        plainContent: plainText,
+        plainContent: finalPlain,
         editedAt: new Date(),
       },
     });
@@ -1177,10 +1257,18 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, asy
   const { user } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
-  const { emoji } = req.body as { emoji: string };
+  const { emoji } = req.body as { emoji?: string };
+  const trimmedEmoji = emoji?.trim() ?? "";
 
-  if (!emoji?.trim()) {
+  if (!trimmedEmoji) {
     res.status(400).json({ error: "emoji is required" });
+    return;
+  }
+  // A grapheme cluster is rarely more than 16 UTF-16 code units (flag
+  // emojis, skin tones, ZWJ sequences). Reject anything longer —
+  // attacker could otherwise stuff the unique-index with huge strings.
+  if (trimmedEmoji.length > 16) {
+    res.status(400).json({ error: "emoji must be ≤16 chars" });
     return;
   }
 
@@ -1202,9 +1290,13 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, asy
   const reaction = await withRealtime(async (rt) => {
     const r = await rt.tx.reaction.upsert({
       where: {
-        messageId_userId_emoji: { messageId, userId: user.id, emoji: emoji.trim() },
+        messageId_userId_emoji: {
+          messageId,
+          userId: user.id,
+          emoji: trimmedEmoji,
+        },
       },
-      create: { messageId, userId: user.id, emoji: emoji.trim() },
+      create: { messageId, userId: user.id, emoji: trimmedEmoji },
       update: {},
     });
     await rt.enqueueToConversation(
@@ -1235,6 +1327,11 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
   const emoji = decodeURIComponent(param(req.params.emoji));
+
+  if (emoji.length > 16 || emoji.length === 0) {
+    res.status(400).json({ error: "emoji must be 1-16 chars" });
+    return;
+  }
 
   const deleted = await prisma.reaction.deleteMany({
     where: { messageId, userId: user.id, emoji },
@@ -1296,7 +1393,7 @@ router.post("/conversations/:id/typing", requireAuth, typingLimiter, async (req,
 
 // ─── Update last active ───────────────────────────────────────
 
-router.post("/me/active", requireAuth, async (req, res) => {
+router.post("/me/active", requireAuth, generalLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   await prisma.user.update({
     where: { id: user.id },
@@ -1310,7 +1407,7 @@ router.post("/me/active", requireAuth, async (req, res) => {
 // `user_updated` event to every user who shares a conversation with me so
 // their sidebar / header / message avatars refresh in real time.
 
-router.post("/me/broadcast-profile", requireAuth, async (req, res) => {
+router.post("/me/broadcast-profile", requireAuth, generalLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
 
   const fresh = await prisma.user.findUnique({

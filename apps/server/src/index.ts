@@ -9,17 +9,33 @@ import chatRoutes from "./routes/chat";
 import userRoutes from "./routes/users";
 import attachmentRoutes from "./routes/attachments";
 import pushRoutes from "./routes/push";
+import { authLimiter } from "./middleware/rate-limit";
+import { logger } from "./lib/logger";
 
 const app = express();
 
+const allowedOrigins: string[] = (
+  env.CORS_ALLOWED_ORIGINS ?? "http://localhost:3000,http://192.168.0.103:3000"
+)
+  .split(",")
+  .map((s: string) => s.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: ["http://localhost:3000", "http://192.168.0.101:3000"],
+    origin: allowedOrigins,
     credentials: true,
   }),
 );
 
 // better-auth handler MUST come before express.json()
+// Brute-force gating on the unauthenticated auth endpoints. Registered
+// BEFORE the catch-all so `next()` in the limiter falls through to
+// `toNodeHandler(auth)` — same-path middleware is processed in order.
+// Better-auth has its own internal limiter too, but it's per-process and
+// lenient; ours caps at 10/min/IP for sign-in and sign-up.
+app.use(["/api/auth/sign-in", "/api/auth/sign-up"], authLimiter);
+
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
 app.use(express.json());
@@ -36,7 +52,7 @@ app.use("/api/push", pushRoutes);
 app.use("/api", chatRoutes);
 
 app.listen(env.PORT, () => {
-  console.log(`Server running on http://localhost:${env.PORT}`);
+  logger.info("server listening", { port: env.PORT });
 });
 
 // Background jobs — only register when this process owns them. Under a
@@ -49,12 +65,13 @@ import("node-cron").then(({ default: cron }) => {
       try {
         const result = await gcOrphanAttachments();
         if (result.deleted > 0 || result.s3Errors > 0) {
-          console.log(
-            `[cron] orphan-attachments: deleted=${result.deleted} s3Errors=${result.s3Errors}`,
-          );
+          logger.info("cron attachments-gc", {
+            deleted: result.deleted,
+            s3Errors: result.s3Errors,
+          });
         }
       } catch (err) {
-        console.error("[cron] orphan-attachments failed:", err);
+        logger.error("cron attachments-gc failed", { err: err as Error });
       }
     });
   });

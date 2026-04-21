@@ -34,4 +34,8 @@ export const env = {
   VAPID_PUBLIC_KEY: optional("VAPID_PUBLIC_KEY"),
   VAPID_PRIVATE_KEY: optional("VAPID_PRIVATE_KEY"),
   VAPID_SUBJECT: optional("VAPID_SUBJECT"), // e.g. mailto:admin@example.com
+
+  // Comma-separated list of origins allowed by CORS + better-auth. Keeps
+  // dev defaults if unset. Production must set this explicitly.
+  CORS_ALLOWED_ORIGINS: optional("CORS_ALLOWED_ORIGINS"),
 };

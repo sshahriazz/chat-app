@@ -1,6 +1,7 @@
 import webpush, { type PushSubscription as WPSubscription } from "web-push";
 import { env } from "../env";
 import { prisma } from "../db";
+import { logger } from "./logger";
 
 /**
  * Web Push dispatch. Kept lazy so the server can boot without VAPID
@@ -73,7 +74,11 @@ export async function pushToUsers(
             .delete({ where: { id: s.id } })
             .catch(() => {});
         } else {
-          console.error("[push] send failed:", err);
+          logger.error("push send failed", {
+            subscriptionId: s.id,
+            statusCode: status,
+            err: err as Error,
+          });
         }
       }
     }),

@@ -41,9 +41,24 @@ self.addEventListener("push", (event) => {
   );
 });
 
+// Same-origin check for openWindow. Push payloads come from our server
+// today, but defense-in-depth: a compromised server or buggy future
+// feature could send a `javascript:` or external URL. Coerce to same-
+// origin relative URL and fall back to "/" on anything suspicious.
+function safeSameOriginUrl(raw) {
+  try {
+    const scopeOrigin = new URL(self.registration.scope).origin;
+    const target = new URL(raw || "/", self.registration.scope);
+    if (target.origin !== scopeOrigin) return "/";
+    return target.toString();
+  } catch {
+    return "/";
+  }
+}
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
-  const targetUrl = event.notification.data?.url || "/";
+  const targetUrl = safeSameOriginUrl(event.notification.data?.url);
   event.waitUntil(
     (async () => {
       const clients = await self.clients.matchAll({
