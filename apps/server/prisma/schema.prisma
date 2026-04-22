@@ -69,7 +69,7 @@ model User {
   // Tenant-scoped composite identity. `externalId` is the tenant's own
   // user id (never mutated), `id` stays server-internal (UUID) so our
   // FKs / Centrifugo channels don't need to change.
-  tenantId     String    @default("default") @map("tenant_id")
+  tenantId     String    @map("tenant_id")
   externalId   String    @map("external_id")
   name         String
   email        String?
@@ -111,7 +111,7 @@ enum MessageType {
 
 model Conversation {
   id         String           @id @default(uuid())
-  tenantId   String           @default("default") @map("tenant_id")
+  tenantId   String           @map("tenant_id")
   type       ConversationType
   name       String?
   createdBy  String           @map("created_by")
@@ -133,7 +133,7 @@ model Conversation {
 
 model ConversationMember {
   id                String     @id @default(uuid())
-  tenantId          String     @default("default") @map("tenant_id")
+  tenantId          String     @map("tenant_id")
   conversationId    String     @map("conversation_id")
   userId            String     @map("user_id")
   role              MemberRole @default(member)
@@ -178,7 +178,7 @@ model Outbox {
 
 model PushSubscription {
   id        String   @id @default(uuid())
-  tenantId  String   @default("default") @map("tenant_id")
+  tenantId  String   @map("tenant_id")
   userId    String   @map("user_id")
   // Unique per browser: the endpoint is the browser's Push service URL plus
   // a client-specific path. Upserting on it avoids duplicates when the same
@@ -198,7 +198,7 @@ model PushSubscription {
 
 model Attachment {
   id          String   @id @default(uuid())
-  tenantId    String   @default("default") @map("tenant_id")
+  tenantId    String   @map("tenant_id")
   // Nullable so the upload flow can mint the row before the user hits "send".
   // Orphan attachments (messageId remains null past some TTL) can be GC'd.
   messageId   String?  @map("message_id")
@@ -223,7 +223,7 @@ model Attachment {
 
 model Message {
   id              String      @id @default(uuid())
-  tenantId        String      @default("default") @map("tenant_id")
+  tenantId        String      @map("tenant_id")
   conversationId  String      @map("conversation_id")
   senderId        String      @map("sender_id")
   // Tiptap AST — stored as jsonb so we never ship HTML over the wire or
@@ -263,7 +263,7 @@ model Message {
 
 model Reaction {
   id        String   @id @default(uuid())
-  tenantId  String   @default("default") @map("tenant_id")
+  tenantId  String   @map("tenant_id")
   messageId String   @map("message_id")
   userId    String   @map("user_id")
   emoji     String

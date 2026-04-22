@@ -39,7 +39,7 @@ router.post(
         "Push not configured. Set VAPID_* in apps/server/.env.",
       );
     }
-    const { user } = req as AuthenticatedRequest;
+    const { user, tenantId } = req as AuthenticatedRequest;
     const body = req.body as {
       endpoint: string;
       keys: { p256dh: string; auth: string };
@@ -48,12 +48,14 @@ router.post(
     await prisma.pushSubscription.upsert({
       where: { endpoint: body.endpoint },
       create: {
+        tenantId,
         userId: user.id,
         endpoint: body.endpoint,
         p256dh: body.keys.p256dh,
         auth: body.keys.auth,
       },
       update: {
+        tenantId,
         userId: user.id,
         p256dh: body.keys.p256dh,
         auth: body.keys.auth,
@@ -70,9 +72,10 @@ router.post(
   requireAuth,
   validate({ body: PushUnsubscribeBodySchema }),
   async (req, res) => {
+    const { tenantId } = req as AuthenticatedRequest;
     const { endpoint } = req.body as { endpoint: string };
     await prisma.pushSubscription
-      .deleteMany({ where: { endpoint } })
+      .deleteMany({ where: { tenantId, endpoint } })
       .catch(() => {});
     res.json({ ok: true });
   },

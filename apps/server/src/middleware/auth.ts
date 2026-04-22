@@ -13,4 +13,8 @@ export { requireUserJwt as requireAuth } from "./require-user-jwt";
 export interface AuthenticatedRequest extends Request {
   user: { id: string; name: string; email: string; image: string | null };
   session: { id: string; token: string; userId: string; expiresAt: Date };
+  // Tenant the JWT was issued under. Route handlers MUST use this in
+  // every Prisma `where` touching a tenant-scoped table so a leaked
+  // or guessed id from another tenant can't be read or mutated.
+  tenantId: string;
 }

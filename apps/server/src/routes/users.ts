@@ -29,11 +29,12 @@ router.get(
   searchLimiter,
   validate({ query: UserSearchQuerySchema }),
   async (req, res) => {
-    const { user } = req as AuthenticatedRequest;
+    const { user, tenantId } = req as AuthenticatedRequest;
     const { q } = req.query as { q: string };
 
     const users = await prisma.user.findMany({
       where: {
+        tenantId,
         id: { not: user.id },
         OR: [
           { name: { contains: q, mode: "insensitive" } },
@@ -71,10 +72,11 @@ router.post(
   generalLimiter,
   validate({ body: OnlineUsersBodySchema }),
   async (req, res) => {
+    const { tenantId } = req as AuthenticatedRequest;
     const { userIds } = req.body as { userIds: string[] };
 
     const users = await prisma.user.findMany({
-      where: { id: { in: userIds } },
+      where: { tenantId, id: { in: userIds } },
       select: { id: true, lastActiveAt: true },
     });
 
@@ -101,12 +103,13 @@ router.post(
 // deletion without needing DB forensics.
 
 router.delete("/me", requireAuth, generalLimiter, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
 
   // 1. Enumerate S3 keys for attachments owned by this user before the
-  //    cascade wipes the rows.
+  //    cascade wipes the rows. `tenantId` is redundant given uploaderId
+  //    is already tenant-scoped, but explicit beats implicit.
   const attachments = await prisma.attachment.findMany({
-    where: { uploaderId: user.id },
+    where: { tenantId, uploaderId: user.id },
     select: { url: true },
   });
   const s3Keys: string[] = [];
@@ -116,8 +119,11 @@ router.delete("/me", requireAuth, generalLimiter, async (req, res) => {
   }
 
   // 2. Delete the user row. Cascade handles every other table per the
-  //    schema; if this throws, nothing has been mutated yet.
-  await prisma.user.delete({ where: { id: user.id } });
+  //    schema; if this throws, nothing has been mutated yet. `deleteMany`
+  //    + tenantId lets us defend against a hypothetical userId collision
+  //    across tenants (UUIDs make that astronomically unlikely, but the
+  //    check costs nothing).
+  await prisma.user.deleteMany({ where: { id: user.id, tenantId } });
 
   // 3. Invalidate caches: profile, session (the in-flight request
   //    already has a valid session but it's about to be gone).

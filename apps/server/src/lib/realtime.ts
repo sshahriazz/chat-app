@@ -84,11 +84,16 @@ export async function withRealtime<T>(
         });
       },
       createSystemMessage: async (conversationId, senderId, content) => {
-        const { currentSeq: seq } = await tx.conversation.update({
+        // Bump seq + grab the conversation's tenantId in one round-trip
+        // so the system message lands in the same tenant as everything
+        // else in this conversation. Doing this here (vs. asking callers
+        // to pass tenantId) keeps the helper tamper-proof.
+        const conv = await tx.conversation.update({
           where: { id: conversationId },
           data: { currentSeq: { increment: 1 } },
-          select: { currentSeq: true },
+          select: { currentSeq: true, tenantId: true },
         });
+        const seq = conv.currentSeq;
         // System messages are plain-text produced server-side — wrap them in
         // a minimal Tiptap paragraph so renderers handle them the same way as
         // user messages. `plainContent` mirrors for search.
@@ -100,6 +105,7 @@ export async function withRealtime<T>(
         };
         const msg = await tx.message.create({
           data: {
+            tenantId: conv.tenantId,
             conversationId,
             senderId,
             content: systemDoc,

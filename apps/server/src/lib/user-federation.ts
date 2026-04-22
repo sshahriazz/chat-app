@@ -52,45 +52,36 @@ export async function upsertFederatedUser(
   tenantId: string,
   claims: FederatedUserInput,
 ): Promise<MaterializedUser> {
-  // `User.id` is the server-internal UUID. On fresh upsert we mint a new
-  // one; on subsequent hits we keep the existing id. That's the identity
-  // we use for Centrifugo channels, FK references, rate limits, etc.
+  // Hot path: the row already exists and nothing changed. Skip the write
+  // so a browser session hammering the API at N req/s doesn't translate
+  // into N UPDATEs on the user row.
   const existing = await prisma.user.findUnique({
     where: { tenantId_externalId: { tenantId, externalId: claims.externalId } },
-    select: { id: true, name: true, image: true, email: true },
+    select: {
+      id: true, tenantId: true, externalId: true,
+      name: true, image: true, email: true,
+    },
   });
 
-  if (!existing) {
-    const id = crypto.randomUUID();
-    const created = await prisma.user.create({
-      data: {
-        id,
-        tenantId,
-        externalId: claims.externalId,
-        name: claims.name,
-        image: claims.image ?? null,
-        email: claims.email ?? null,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      },
-      select: {
-        id: true, tenantId: true, externalId: true,
-        name: true, image: true, email: true,
-      },
-    });
-    return created;
-  }
+  if (existing) {
+    const nameChanged = existing.name !== claims.name;
+    const imageChanged = (existing.image ?? null) !== (claims.image ?? null);
+    const emailChanged =
+      claims.email !== undefined && (claims.email ?? null) !== (existing.email ?? null);
 
-  // Diff only the fields the tenant controls. Avoids a write on every
-  // authenticated request when nothing has changed.
-  const nameChanged = existing.name !== claims.name;
-  const imageChanged = (existing.image ?? null) !== (claims.image ?? null);
-  const emailChanged =
-    claims.email !== undefined && (claims.email ?? null) !== (existing.email ?? null);
+    if (!nameChanged && !imageChanged && !emailChanged) {
+      return {
+        id: existing.id,
+        tenantId: existing.tenantId,
+        externalId: existing.externalId,
+        name: existing.name,
+        image: existing.image ?? null,
+        email: existing.email ?? null,
+      };
+    }
 
-  if (nameChanged || imageChanged || emailChanged) {
     const updated = await prisma.user.update({
-      where: { id: existing.id },
+      where: { tenantId_externalId: { tenantId, externalId: claims.externalId } },
       data: {
         name: claims.name,
         image: claims.image ?? null,
@@ -106,14 +97,35 @@ export async function upsertFederatedUser(
     return updated;
   }
 
-  return {
-    id: existing.id,
-    tenantId,
-    externalId: claims.externalId,
-    name: existing.name,
-    image: existing.image ?? null,
-    email: existing.email ?? null,
-  };
+  // First-time materialization. `upsert` compiles to Postgres
+  // `INSERT ... ON CONFLICT (...) DO UPDATE` so two requests from the
+  // same tenant+externalId racing on first login both succeed — one
+  // INSERTs, the other is a no-op UPDATE that still returns the row.
+  // Prior code used `findUnique`-then-`create`, which raced with a 500.
+  const id = crypto.randomUUID();
+  const row = await prisma.user.upsert({
+    where: { tenantId_externalId: { tenantId, externalId: claims.externalId } },
+    create: {
+      id,
+      tenantId,
+      externalId: claims.externalId,
+      name: claims.name,
+      image: claims.image ?? null,
+      email: claims.email ?? null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    },
+    update: {
+      // Loser-of-the-race path: the row exists already. Touching
+      // updatedAt is enough; the winner already wrote the claims.
+      updatedAt: new Date(),
+    },
+    select: {
+      id: true, tenantId: true, externalId: true,
+      name: true, image: true, email: true,
+    },
+  });
+  return row;
 }
 
 /**

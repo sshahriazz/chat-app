@@ -54,15 +54,13 @@ export async function requireUserJwt(
       email: claims.email ?? null,
     });
 
-    const r = req as AuthenticatedRequest & { tenantId?: string };
+    const r = req as AuthenticatedRequest;
     r.user = {
       id: user.id,
       name: user.name,
       email: user.email ?? "",
       image: user.image,
     };
-    // Fabricated session shape so downstream code that expects it
-    // keeps working. Real session cookie goes away in PR 3.
     r.session = {
       id: `jwt_${user.id}`,
       token: "",

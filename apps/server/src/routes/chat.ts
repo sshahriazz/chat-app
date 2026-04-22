@@ -111,11 +111,11 @@ async function broadcastToConversation(
 // ─── Init (single call on app startup) ───────────────────────
 
 router.get("/init", requireAuth, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const limit = Number(req.query.limit) || 50;
 
   const [page, token] = await Promise.all([
-    getConversationsWithUnread(user.id, { limit }),
+    getConversationsWithUnread(user.id, tenantId, { limit }),
     Promise.resolve(
       centrifugo.generateConnectionToken(user.id, {
         name: user.name,
@@ -138,7 +138,7 @@ router.post(
   requireAuth,
   validate({ body: CreateConversationBodySchema }),
   async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const { type, name, memberIds } = req.body as {
     type: "direct" | "group";
     name?: string;
@@ -149,6 +149,18 @@ router.post(
     throw new BadRequestError("type and memberIds are required");
   }
 
+  // Every `memberIds` entry must resolve to a User in this tenant —
+  // otherwise a tenant could add another tenant's userId as a member
+  // and leak the conversation into that tenant's sidebar. Resolved
+  // once here, used for both the direct-dupe lookup and the create.
+  const resolvedMembers = await prisma.user.findMany({
+    where: { tenantId, id: { in: memberIds } },
+    select: { id: true },
+  });
+  if (resolvedMembers.length !== memberIds.length) {
+    throw new BadRequestError("One or more memberIds are invalid");
+  }
+
   if (type === "direct") {
     if (memberIds.length !== 1) {
       throw new BadRequestError("Direct chats require exactly one other member");
@@ -157,6 +169,7 @@ router.post(
     // Check for existing direct conversation
     const existing = await prisma.conversation.findFirst({
       where: {
+        tenantId,
         type: "direct",
         AND: [
           { members: { some: { userId: user.id } } },
@@ -172,18 +185,20 @@ router.post(
     }
   }
 
-  
+
   const allMemberIds = [user.id, ...memberIds.filter((id) => id !== user.id)];
 
-  
+
   const conversation = await withRealtime(async (rt) => {
     const conv = await rt.tx.conversation.create({
       data: {
+        tenantId,
         type,
         name: type === "group" ? name : null,
         createdBy: user.id,
         members: {
           create: allMemberIds.map((userId) => ({
+            tenantId,
             userId,
             role: userId === user.id ? "owner" : "member",
           })),
@@ -228,23 +243,24 @@ router.post(
 // ─── List conversations ───────────────────────────────────────
 
 router.get("/conversations", requireAuth, validate({ query: ListConversationsQuerySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const limit = Number(req.query.limit) || 50;
   const before =
     typeof req.query.before === "string" ? req.query.before : undefined;
-  const page = await getConversationsWithUnread(user.id, { limit, before });
+  const page = await getConversationsWithUnread(user.id, tenantId, { limit, before });
   res.json(page);
 });
 
 // ─── Get conversation ─────────────────────────────────────────
 
 router.get("/conversations/:id", requireAuth, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
 
   const conversation = await prisma.conversation.findFirst({
     where: {
       id,
+      tenantId,
       members: { some: { userId: user.id } },
     },
     include: {
@@ -266,12 +282,19 @@ router.get("/conversations/:id", requireAuth, async (req, res) => {
 // ─── Update conversation (rename group) ───────────────────────
 
 router.put("/conversations/:id", requireAuth, validate({ body: RenameConversationBodySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { name } = req.body as { name: string };
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  // `findFirst` with the tenantId filter guarantees we can't hop
+  // tenants via a guessed conversation id even if a ConversationMember
+  // row somehow exists across boundaries.
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
     include: { conversation: true },
   });
 
@@ -317,7 +340,7 @@ router.put("/conversations/:id", requireAuth, validate({ body: RenameConversatio
 // ─── Add members (promotes a direct chat to a group when expanding) ──
 
 router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembersBodySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { userIds, name } = req.body as { userIds: string[]; name?: string };
 
@@ -325,8 +348,12 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
     throw new BadRequestError("userIds is required");
   }
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
     include: { conversation: true },
   });
 
@@ -349,13 +376,21 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
 
     const trulyNewIds = userIds.filter((uid) => !existingMemberIds.includes(uid));
 
+    // CRITICAL: filter target users by tenantId. Without this, tenant A
+    // could pass a userId from tenant B and inject them into a tenant A
+    // conversation — tenant B's user would then see the conversation
+    // appear in their sidebar (cross-tenant leak).
     const newUsers = await rt.tx.user.findMany({
-      where: { id: { in: trulyNewIds } },
+      where: { tenantId, id: { in: trulyNewIds } },
       select: { id: true, name: true },
     });
 
     if (newUsers.length === 0) {
       return { added: 0, promoted: false };
+    }
+
+    if (newUsers.length !== trulyNewIds.length) {
+      throw new BadRequestError("One or more userIds are invalid");
     }
 
     if (wasDirect) {
@@ -372,6 +407,7 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
 
     await rt.tx.conversationMember.createMany({
       data: newUsers.map((u) => ({
+        tenantId,
         conversationId: id,
         userId: u.id,
         role: "member" as const,
@@ -427,13 +463,17 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
 // ─── Remove member / leave group ──────────────────────────────
 
 router.delete("/conversations/:id/members/:userId", requireAuth, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const targetUserId = param(req.params.userId);
   const isSelf = user.id === targetUserId;
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
     include: { conversation: true },
   });
 
@@ -526,7 +566,7 @@ const MESSAGE_INCLUDE = {
 } as const;
 
 router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, validate({ body: SendMessageBodySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { content, replyToId, clientMessageId, attachmentIds } = req.body as {
     content?: unknown;
@@ -562,8 +602,12 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
     throw new BadRequestError("content or attachments required");
   }
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
   });
 
   if (!member) {
@@ -596,7 +640,7 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
 
   if (replyToId) {
     const replyTarget = await prisma.message.findFirst({
-      where: { id: replyToId, conversationId: id, deletedAt: null },
+      where: { id: replyToId, conversationId: id, tenantId, deletedAt: null },
     });
     if (!replyTarget) {
       throw new NotFoundError("Reply target message not found");
@@ -604,10 +648,12 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
   }
 
   // Validate attachment ownership + unlinked status *before* the tx to give
-  // a clean 400 and keep the tx small.
+  // a clean 400 and keep the tx small. `tenantId` filter is redundant
+  // given `uploaderId` is tenant-scoped already, but stays as
+  // defense-in-depth.
   if (attachmentIdList.length > 0) {
     const rows = await prisma.attachment.findMany({
-      where: { id: { in: attachmentIdList } },
+      where: { tenantId, id: { in: attachmentIdList } },
       select: { id: true, uploaderId: true, messageId: true },
     });
     const bad = attachmentIdList.find((aid) => {
@@ -655,6 +701,7 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
 
     const msg = await rt.tx.message.create({
       data: {
+        tenantId,
         conversationId: id,
         senderId: user.id,
         content: finalStoredContent,
@@ -669,6 +716,7 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
     if (attachmentIdList.length > 0) {
       await rt.tx.attachment.updateMany({
         where: {
+          tenantId,
           id: { in: attachmentIdList },
           uploaderId: user.id,
           messageId: null,
@@ -847,7 +895,7 @@ function shapeSearchResults(rows: SearchRow[]) {
 }
 
 router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ query: SearchQuerySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const q = ((req.query.q as string) || "").trim();
 
@@ -855,8 +903,12 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
     throw new BadRequestError("q must be 2-128 characters");
   }
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
     select: { id: true },
   });
   if (!member) {
@@ -879,6 +931,7 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
     JOIN "user" u ON u.id = m.sender_id
     JOIN conversations c ON c.id = m.conversation_id
     WHERE m.conversation_id = ${id}
+      AND m.tenant_id = ${tenantId}
       AND m.deleted_at IS NULL
       AND (m.plain_content ILIKE ${likePattern} OR m.plain_content % ${q})
     ORDER BY GREATEST(similarity(m.plain_content, ${q}), 0) DESC,
@@ -892,7 +945,7 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
 // Global search — all conversations the user is a member of.
 // Intended as the foundation for a global Cmd+K modal later.
 router.get("/search", requireAuth, searchLimiter, validate({ query: SearchQuerySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const q = ((req.query.q as string) || "").trim();
 
   if (q.length < 2 || q.length > 128) {
@@ -914,7 +967,8 @@ router.get("/search", requireAuth, searchLimiter, validate({ query: SearchQueryS
     FROM messages m
     JOIN "user" u ON u.id = m.sender_id
     JOIN conversations c ON c.id = m.conversation_id
-    WHERE m.deleted_at IS NULL
+    WHERE m.tenant_id = ${tenantId}
+      AND m.deleted_at IS NULL
       AND EXISTS (
         SELECT 1 FROM conversation_members cm
         WHERE cm.conversation_id = m.conversation_id
@@ -932,14 +986,18 @@ router.get("/search", requireAuth, searchLimiter, validate({ query: SearchQueryS
 // ─── Get messages (paginated, cursor-based by ID) ─────────────
 
 router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate({ query: ListMessagesQuerySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const before = req.query.before as string | undefined;
   const anchor = req.query.anchor as string | undefined;
   const limit = req.query.limit as string | undefined;
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
   });
 
   if (!member) {
@@ -955,7 +1013,7 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
   let seqMax: number | null = null;
   if (anchor) {
     const anchorMsg = await prisma.message.findFirst({
-      where: { id: anchor, conversationId: id },
+      where: { id: anchor, conversationId: id, tenantId },
       select: { seq: true },
     });
     if (anchorMsg) {
@@ -967,8 +1025,8 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
 
   let cursorDate: Date | undefined;
   if (!anchor && before) {
-    const cursorMsg = await prisma.message.findUnique({
-      where: { id: before },
+    const cursorMsg = await prisma.message.findFirst({
+      where: { id: before, conversationId: id, tenantId },
       select: { createdAt: true },
     });
     cursorDate = cursorMsg?.createdAt;
@@ -977,6 +1035,7 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
   const messages = await prisma.message.findMany({
     where: {
       conversationId: id,
+      tenantId,
       ...(seqMin !== null && seqMax !== null
         ? { seq: { gte: seqMin, lte: seqMax } }
         : cursorDate
@@ -1044,7 +1103,7 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
 // ─── Edit message ─────────────────────────────────────────────
 
 router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ body: EditMessageBodySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
   const { content } = req.body as { content?: unknown };
@@ -1073,6 +1132,7 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ bod
     where: {
       id: messageId,
       conversationId: id,
+      tenantId,
       senderId: user.id,
       type: "text",
       deletedAt: null,
@@ -1126,7 +1186,7 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ bod
 // ─── Delete message (soft) ────────────────────────────────────
 
 router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
 
@@ -1134,6 +1194,7 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
     where: {
       id: messageId,
       conversationId: id,
+      tenantId,
       senderId: user.id,
       deletedAt: null,
     },
@@ -1171,7 +1232,7 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
 // ─── Mark conversation as read ────────────────────────────────
 
 router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBodySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { messageId } = req.body as { messageId: string };
 
@@ -1179,9 +1240,9 @@ router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBod
     throw new BadRequestError("messageId is required");
   }
 
-  // Verify message exists in this conversation
+  // Verify message exists in this conversation (tenant-scoped)
   const message = await prisma.message.findFirst({
-    where: { id: messageId, conversationId: id },
+    where: { id: messageId, conversationId: id, tenantId },
   });
 
   if (!message) {
@@ -1221,7 +1282,7 @@ router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBod
 // ─── Mute / unmute conversation ───────────────────────────────
 
 router.post("/conversations/:id/mute", requireAuth, validate({ body: MuteBodySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { muted } = req.body as { muted: boolean };
 
@@ -1229,8 +1290,12 @@ router.post("/conversations/:id/mute", requireAuth, validate({ body: MuteBodySch
     throw new BadRequestError("muted (boolean) is required");
   }
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
   });
 
   if (!member) {
@@ -1260,7 +1325,7 @@ router.post("/conversations/:id/mute", requireAuth, validate({ body: MuteBodySch
 // ─── Add reaction ─────────────────────────────────────────────
 
 router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, validate({ body: ReactionBodySchema }), async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
   const { emoji } = req.body as { emoji?: string };
@@ -1281,6 +1346,7 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, val
     where: {
       id: messageId,
       conversationId: id,
+      tenantId,
       deletedAt: null,
       conversation: { members: { some: { userId: user.id } } },
     },
@@ -1299,7 +1365,7 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, val
           emoji: trimmedEmoji,
         },
       },
-      create: { messageId, userId: user.id, emoji: trimmedEmoji },
+      create: { tenantId, messageId, userId: user.id, emoji: trimmedEmoji },
       update: {},
     });
     await rt.enqueueToConversation(
@@ -1363,11 +1429,15 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
 // ─── Typing indicator ─────────────────────────────────────────
 
 router.post("/conversations/:id/typing", requireAuth, typingLimiter, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
 
-  const member = await prisma.conversationMember.findUnique({
-    where: { conversationId_userId: { conversationId: id, userId: user.id } },
+  const member = await prisma.conversationMember.findFirst({
+    where: {
+      conversationId: id,
+      userId: user.id,
+      conversation: { tenantId },
+    },
   });
 
   if (!member) {
@@ -1471,6 +1541,7 @@ interface ConversationPageParams {
 
 async function getConversationsWithUnread(
   userId: string,
+  tenantId: string,
   { limit = 50, before }: ConversationPageParams = {},
 ) {
   // Cap the page so a malicious client can't ask for 1M rows.
@@ -1482,9 +1553,10 @@ async function getConversationsWithUnread(
   const memberships = await prisma.conversationMember.findMany({
     where: {
       userId,
-      ...(useBefore
-        ? { conversation: { updatedAt: { lt: beforeDate } } }
-        : {}),
+      conversation: {
+        tenantId,
+        ...(useBefore ? { updatedAt: { lt: beforeDate } } : {}),
+      },
     },
     orderBy: { conversation: { updatedAt: "desc" } },
     take: take + 1, // over-fetch by one to detect "has more"

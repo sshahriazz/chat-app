@@ -33,7 +33,7 @@ router.post(
   uploadUrlLimiter,
   validate({ body: UploadUrlBodySchema }),
   async (req, res) => {
-    const { user } = req as AuthenticatedRequest;
+    const { user, tenantId } = req as AuthenticatedRequest;
     const { filename, contentType, size, width, height } = req.body as {
       filename: string;
       contentType: string;
@@ -53,7 +53,7 @@ router.post(
     // small and the worst case is a user ending up slightly over quota —
     // acceptable while we don't need strict accounting.
     const used = await prisma.attachment.aggregate({
-      where: { uploaderId: user.id },
+      where: { tenantId, uploaderId: user.id },
       _sum: { size: true },
     });
     const usedBytes = used._sum.size ?? 0;
@@ -82,6 +82,7 @@ router.post(
 
     const attachment = await prisma.attachment.create({
       data: {
+        tenantId,
         uploaderId: user.id,
         url: signed.publicUrl,
         contentType,
@@ -106,11 +107,11 @@ router.post(
 // Works for any content-type so images, PDFs and arbitrary binaries all
 // prompt a download instead of rendering inline.
 router.get("/:id/download", requireAuth, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
 
-  const attachment = await prisma.attachment.findUnique({
-    where: { id },
+  const attachment = await prisma.attachment.findFirst({
+    where: { id, tenantId },
     include: {
       message: { select: { conversationId: true } },
     },
@@ -121,12 +122,11 @@ router.get("/:id/download", requireAuth, async (req, res) => {
   // Authorization: linked attachments require conversation membership;
   // orphan uploads (messageId null) are only accessible to the uploader.
   if (attachment.messageId && attachment.message) {
-    const member = await prisma.conversationMember.findUnique({
+    const member = await prisma.conversationMember.findFirst({
       where: {
-        conversationId_userId: {
-          conversationId: attachment.message.conversationId,
-          userId: user.id,
-        },
+        conversationId: attachment.message.conversationId,
+        userId: user.id,
+        conversation: { tenantId },
       },
       select: { id: true },
     });
