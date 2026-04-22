@@ -38,6 +38,20 @@ const EnvSchema = z.object({
   // rotation endpoints. In production this MUST be set; the optional()
   // below is only for dev / tests where admin endpoints aren't mounted.
   MASTER_API_KEY: z.string().min(32).optional(),
+  // Auth dispatch mode. `both` accepts either the legacy cookie
+  // session or a tenant-issued Bearer JWT (preferred during the
+  // dual-auth cutover window). `jwt` rejects cookie requests outright
+  // — set this once PR 3 lands and you're ready for the cutover.
+  // `session` is a rollback path that forces legacy-only.
+  AUTH_MODE: z.enum(["both", "session", "jwt"]).default("both"),
+  // Dev-only: opt-in switch that mounts `POST /api/dev/mint-token`
+  // outside non-production. Stays false in prod unless explicitly
+  // enabled (e.g. staging envs where you want to e2e-test end-to-end).
+  DEV_MINT_ENABLED: z.coerce.boolean().default(false),
+  // When dev mint is enabled in production, ONLY these tenant ids can
+  // be minted for. Comma-separated. Prevents a leaked flag from
+  // becoming a tenant-impersonation backdoor.
+  ALLOW_DEV_MINT_TENANTS: z.string().optional(),
   // Seconds of clock skew tolerated when verifying tenant-signed user
   // JWTs. Defaults to a conservative 30s; raise if tenants run on
   // systems with unsynced clocks.

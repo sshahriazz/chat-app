@@ -19,6 +19,7 @@ import attachmentRoutes from "./routes/attachments";
 import pushRoutes from "./routes/push";
 import webhookRoutes from "./routes/webhooks";
 import adminRoutes from "./routes/admin";
+import devRoutes from "./routes/dev";
 import { apiReference } from "@scalar/express-api-reference";
 import { getOpenApiDocument } from "./http/openapi";
 import { httpMetrics } from "./middleware/metrics";
@@ -190,6 +191,9 @@ app.use("/api/push", express.json({ limit: "4kb" }), pushRoutes);
 // reach them yet.
 app.use("/api/webhooks", express.json({ limit: "8kb" }), webhookRoutes);
 app.use("/api/admin", express.json({ limit: "4kb" }), adminRoutes);
+// Dev-only mint-token endpoint. Middleware inside returns 404 in prod
+// unless DEV_MINT_ENABLED=true + ALLOW_DEV_MINT_TENANTS is set.
+app.use("/api/dev", express.json({ limit: "4kb" }), devRoutes);
 // Chat catch-all registered last so more specific prefixes above match
 // first. 512 KB covers the worst-case serialized Tiptap doc (50K plain
 // chars × ~3× markup overhead) plus request-shape overhead.

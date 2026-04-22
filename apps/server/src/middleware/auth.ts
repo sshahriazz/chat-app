@@ -1,8 +1,10 @@
 import type { Request, Response, NextFunction } from "express";
 import { fromNodeHeaders } from "better-auth/node";
 import { auth } from "../auth";
+import { env } from "../env";
 import { CACHE_NS, cacheGet, cacheSet, cacheDel } from "../lib/cache";
 import { UnauthorizedError } from "../http/errors";
+import { requireUserJwt } from "./require-user-jwt";
 
 export interface AuthenticatedRequest extends Request {
   user: { id: string; name: string; email: string; image: string | null };
@@ -10,36 +12,27 @@ export interface AuthenticatedRequest extends Request {
 }
 
 /**
- * Redis-backed session cache. better-auth's `getSession` hits Postgres
- * on every call; for hot endpoints (sending messages, typing) that's a
- * SELECT per request. Caching the validated session for a short window
- * cuts DB reads by roughly the rps-per-user factor while keeping the
- * revocation delay bounded to `CACHE_NS.session.ttlSec`.
+ * Unified auth middleware — dispatches to either the legacy cookie-based
+ * better-auth path or the new tenant-federated JWT path based on:
  *
- * Scaling notes:
- *  - Shared across replicas: a revocation happening on one instance
- *    expires for everyone once Redis TTL elapses; no per-instance drift.
- *  - Key is the raw cookie value, so the same user logging in from two
- *    browsers keeps two separate cache entries (as expected).
- *  - For stricter revocation, `cacheDel(CACHE_NS.session, cookieKey)`
- *    from /api/auth/sign-out as a follow-up.
+ *   1. Request shape: a `Authorization: Bearer …` header means JWT; a
+ *      `Cookie: better-auth.session_token=…` header means session.
+ *   2. Operator-set `AUTH_MODE` env:
+ *        - `both` (default)  — accept either; prefer JWT when both present
+ *        - `session`         — cookie-only, 401 on Bearer
+ *        - `jwt`             — JWT-only, 401 on cookie (used for cutover)
+ *
+ * The downstream `req.user` / `req.session` shape is identical across
+ * both paths so every route handler stays agnostic. PR 3 collapses this
+ * to just the JWT path; PR 4 removes the cookie branch entirely.
  */
+
 
 interface CachedSession {
   user: AuthenticatedRequest["user"];
   session: AuthenticatedRequest["session"];
 }
 
-/**
- * Extract better-auth's session-token cookie value from the Cookie header.
- * Keying the cache on this narrower value — rather than the whole header —
- * means unrelated cookie changes (e.g. a CSRF header being added by a
- * proxy) don't thrash the cache, and two users whose browsers happen to
- * emit the same ancillary cookies can't collide on the key.
- *
- * Supports both the plain and `__Secure-` prefixed cookie names that
- * better-auth uses depending on whether the request is HTTPS.
- */
 function extractSessionCookie(cookieHeader: string): string | null {
   const names = [
     "better-auth.session_token",
@@ -55,7 +48,12 @@ function extractSessionCookie(cookieHeader: string): string | null {
   return null;
 }
 
-export async function requireAuth(
+function hasBearer(req: Request): boolean {
+  const h = req.headers.authorization;
+  return typeof h === "string" && /^Bearer\s+.+/.test(h);
+}
+
+async function requireCookieSession(
   req: Request,
   _res: Response,
   next: NextFunction,
@@ -86,7 +84,10 @@ export async function requireAuth(
     const sessionInfo = session.session as AuthenticatedRequest["session"];
 
     if (cookieKey) {
-      await cacheSet(CACHE_NS.session, cookieKey, { user, session: sessionInfo });
+      await cacheSet(CACHE_NS.session, cookieKey, {
+        user,
+        session: sessionInfo,
+      });
     }
 
     (req as AuthenticatedRequest).user = user;
@@ -94,5 +95,40 @@ export async function requireAuth(
     next();
   } catch (err) {
     next(err);
+  }
+}
+
+export function requireAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const mode = env.AUTH_MODE;
+  const bearer = hasBearer(req);
+
+  if (mode === "jwt") {
+    // Cutover mode: reject cookie-only requests outright.
+    if (!bearer) {
+      next(new UnauthorizedError("Bearer token required (AUTH_MODE=jwt)"));
+      return;
+    }
+    void requireUserJwt(req, res, next);
+    return;
+  }
+
+  if (mode === "session") {
+    if (bearer) {
+      next(new UnauthorizedError("Cookie session required (AUTH_MODE=session)"));
+      return;
+    }
+    void requireCookieSession(req, res, next);
+    return;
+  }
+
+  // `both` — JWT wins when present, cookie otherwise.
+  if (bearer) {
+    void requireUserJwt(req, res, next);
+  } else {
+    void requireCookieSession(req, res, next);
   }
 }

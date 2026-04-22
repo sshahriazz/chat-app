@@ -175,6 +175,13 @@ services:
       # Rotate in Dokploy env when bootstrapping real tenants.
       MASTER_API_KEY: ${MASTER_API_KEY:-}
       TENANT_JWT_CLOCK_SKEW_SEC: ${TENANT_JWT_CLOCK_SKEW_SEC:-30}
+      AUTH_MODE: ${AUTH_MODE:-both}
+      # Local dev + the reference web app need the dev-mint endpoint
+      # mounted so the demo sign-in flow works. Real production
+      # deployments set DEV_MINT_ENABLED=false and leave the allowlist
+      # empty, which returns 404.
+      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-true}
+      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-default}
       # S3 split clients (see apps/server/src/lib/s3.ts):
       #   S3_ENDPOINT        — internal, used for HEAD/DELETE/etc.
       #   S3_PUBLIC_URL_BASE — public, used to mint presigned PUT/GET
