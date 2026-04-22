@@ -60,13 +60,6 @@ export async function upsertFederatedUser(
     select: { id: true, name: true, image: true, email: true },
   });
 
-  // TEMPORARY during PR 1: `email` + `emailVerified` are still NOT NULL
-  // on the schema (because better-auth is still live). Synthesize
-  // defaults when the claims don't carry one. PR 3 drops these
-  // columns and this branch becomes just `email: claims.email ?? null`.
-  const syntheticEmail =
-    claims.email ?? `${tenantId}+${claims.externalId}@tenants.invalid`;
-
   if (!existing) {
     const id = crypto.randomUUID();
     const created = await prisma.user.create({
@@ -76,8 +69,7 @@ export async function upsertFederatedUser(
         externalId: claims.externalId,
         name: claims.name,
         image: claims.image ?? null,
-        email: syntheticEmail,
-        emailVerified: false,
+        email: claims.email ?? null,
         createdAt: new Date(),
         updatedAt: new Date(),
       },
@@ -94,7 +86,7 @@ export async function upsertFederatedUser(
   const nameChanged = existing.name !== claims.name;
   const imageChanged = (existing.image ?? null) !== (claims.image ?? null);
   const emailChanged =
-    claims.email !== undefined && existing.email !== syntheticEmail;
+    claims.email !== undefined && (claims.email ?? null) !== (existing.email ?? null);
 
   if (nameChanged || imageChanged || emailChanged) {
     const updated = await prisma.user.update({
@@ -102,7 +94,7 @@ export async function upsertFederatedUser(
       data: {
         name: claims.name,
         image: claims.image ?? null,
-        ...(emailChanged ? { email: syntheticEmail } : {}),
+        ...(emailChanged ? { email: claims.email ?? null } : {}),
         updatedAt: new Date(),
       },
       select: {

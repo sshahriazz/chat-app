@@ -57,26 +57,28 @@ model Tenant {
   @@map("tenant")
 }
 
-// ─── Better Auth tables ───────────────────────────────────────
+// ─── User (tenant-federated) ───────────────────────────────────
+//
+// Post-cutover: the better-auth tables (Session, Account, Verification)
+// are gone; identity is carried by tenant-signed JWTs and materialized
+// here lazily on first authenticated request. `email` is display-only
+// now — no longer unique, nullable.
 
 model User {
-  id            String    @id
+  id           String    @id
   // Tenant-scoped composite identity. `externalId` is the tenant's own
   // user id (never mutated), `id` stays server-internal (UUID) so our
   // FKs / Centrifugo channels don't need to change.
-  tenantId      String    @default("default") @map("tenant_id")
-  externalId    String    @map("external_id")
-  name          String
-  email         String    @unique
-  emailVerified Boolean   @map("email_verified")
-  image         String?
-  lastActiveAt  DateTime? @map("last_active_at")
-  createdAt     DateTime  @map("created_at")
-  updatedAt     DateTime  @map("updated_at")
+  tenantId     String    @default("default") @map("tenant_id")
+  externalId   String    @map("external_id")
+  name         String
+  email        String?
+  image        String?
+  lastActiveAt DateTime? @map("last_active_at")
+  createdAt    DateTime  @map("created_at")
+  updatedAt    DateTime  @map("updated_at")
 
   tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  sessions            Session[]
-  accounts            Account[]
   conversationMembers ConversationMember[]
   messages            Message[]
   reactions           Reaction[]
@@ -86,52 +88,6 @@ model User {
   @@unique([tenantId, externalId])
   @@index([tenantId])
   @@map("user")
-}
-
-model Session {
-  id        String   @id
-  expiresAt DateTime @map("expires_at")
-  token     String   @unique
-  createdAt DateTime @map("created_at")
-  updatedAt DateTime @map("updated_at")
-  ipAddress String?  @map("ip_address")
-  userAgent String?  @map("user_agent")
-  userId    String   @map("user_id")
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@map("session")
-}
-
-model Account {
-  id                    String    @id
-  accountId             String    @map("account_id")
-  providerId            String    @map("provider_id")
-  userId                String    @map("user_id")
-  accessToken           String?   @map("access_token")
-  refreshToken          String?   @map("refresh_token")
-  idToken               String?   @map("id_token")
-  accessTokenExpiresAt  DateTime? @map("access_token_expires_at")
-  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at")
-  scope                 String?
-  password              String?
-  createdAt             DateTime  @map("created_at")
-  updatedAt             DateTime  @map("updated_at")
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@map("account")
-}
-
-model Verification {
-  id         String    @id
-  identifier String
-  value      String
-  expiresAt  DateTime  @map("expires_at")
-  createdAt  DateTime? @map("created_at")
-  updatedAt  DateTime? @map("updated_at")
-
-  @@map("verification")
 }
 
 // ─── Chat tables ──────────────────────────────────────────────

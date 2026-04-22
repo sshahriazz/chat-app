@@ -123,11 +123,9 @@ router.delete("/me", requireAuth, generalLimiter, async (req, res) => {
   //    already has a valid session but it's about to be gone).
   await invalidateUserProfile(user.id);
 
-  // 4. Clear the session cookie so the browser can't keep the stale
-  //    token around. Better-auth writes both `better-auth.session_token`
-  //    and (in prod) the `__Secure-` variant; strip both for safety.
-  res.clearCookie("better-auth.session_token", { path: "/" });
-  res.clearCookie("__Secure-better-auth.session_token", { path: "/" });
+  // 4. Post-cutover: no more session cookies to clear. Tenant must
+  //    stop issuing JWTs for this externalId (our JWT middleware
+  //    would 404 anyway once the User row is gone).
 
   // 5. Fire-and-forget S3 cleanup. Doesn't block the response; any
   //    failures here are picked up by the orphan GC cron.

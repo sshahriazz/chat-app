@@ -43,7 +43,12 @@ const EnvSchema = z.object({
   // dual-auth cutover window). `jwt` rejects cookie requests outright
   // — set this once PR 3 lands and you're ready for the cutover.
   // `session` is a rollback path that forces legacy-only.
-  AUTH_MODE: z.enum(["both", "session", "jwt"]).default("both"),
+  // PR 3 onwards the server only accepts JWT — `session`/`both` are
+  // kept in the enum as explicit rollback escape hatches (set the env
+  // var to re-enable the cookie path temporarily). The dispatcher in
+  // middleware/auth.ts is now just the JWT path; if you flip this,
+  // you'll also need to revert the middleware.
+  AUTH_MODE: z.enum(["both", "session", "jwt"]).default("jwt"),
   // Dev-only: opt-in switch that mounts `POST /api/dev/mint-token`
   // outside non-production. Stays false in prod unless explicitly
   // enabled (e.g. staging envs where you want to e2e-test end-to-end).

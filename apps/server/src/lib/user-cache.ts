@@ -22,7 +22,7 @@ import {
 export interface CachedUserProfile {
   id: string;
   name: string;
-  email: string;
+  email: string | null;
   image: string | null;
 }
 

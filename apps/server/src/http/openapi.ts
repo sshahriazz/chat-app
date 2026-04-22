@@ -238,11 +238,14 @@ const onlineUsersBodySchema = z
 
 // ─── Path helpers ────────────────────────────────────────────
 
+// PR 3 cutover: every authenticated endpoint now takes a Bearer JWT
+// in Authorization. The helper below documents that header instead of
+// a session cookie.
 const sessionCookie = {
-  cookie: z.object({
-    "better-auth.session_token": z.string().meta({
+  header: z.object({
+    authorization: z.string().meta({
       description:
-        "Better-auth session cookie. The browser sends it automatically when logged in; document here so 'Try it' in the docs UI knows the name.",
+        "`Bearer <tenant-signed user JWT>`. Tenants mint these with their `jwtSecret` (HS256). See /api/webhooks for the server-to-server counterpart.",
     }),
   }),
 };
@@ -277,7 +280,8 @@ export function buildOpenApiDocument() {
     ],
     tags: [
       { name: "Health", description: "Liveness + readiness probes" },
-      { name: "Auth", description: "Better-auth session endpoints" },
+      { name: "Webhooks", description: "Server-to-server tenant webhook endpoints" },
+      { name: "Admin", description: "Operator endpoints (MASTER_API_KEY gated)" },
       { name: "Users", description: "User directory + presence" },
       { name: "Conversations", description: "Conversation + membership CRUD" },
       { name: "Messages", description: "Messages, reactions, typing, reads" },
@@ -327,34 +331,52 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/auth/{path}": {
-        description:
-          "Catch-all for better-auth endpoints (sign-in, sign-up, sign-out, session, update-user, …). See https://www.better-auth.com/docs for the full contract.",
-        parameters: [
-          {
-            name: "path",
-            in: "path",
-            required: true,
-            schema: { type: "string" },
-            description: "Better-auth route suffix",
-          },
-        ],
-        get: {
-          tags: ["Auth"],
-          summary: "Better-auth GET handler",
+      "/api/webhooks/users.updated": {
+        post: {
+          tags: ["Webhooks"],
+          summary: "Tenant pushes a user-profile update",
+          description:
+            "Idempotent: tenant sends the full desired state (name, optional image + email). Server upserts the User row and broadcasts a `user_updated` realtime event to every peer sharing a conversation. Authenticated with the tenant's API key.",
           responses: {
-            "200": { description: "See better-auth docs" },
+            "202": { description: "Accepted, broadcast enqueued" },
+            "401": commonResponses.Unauthorized,
+            "429": commonResponses.TooManyRequests,
+          },
+        },
+      },
+
+      "/api/webhooks/users.deleted": {
+        post: {
+          tags: ["Webhooks"],
+          summary: "Tenant notifies of a deleted user",
+          description:
+            "Cascade-deletes the User row + every linked Conversation/Message/Attachment/etc. S3 objects are reaped asynchronously by the orphan-attachment GC.",
+          responses: {
+            "202": { description: "Deleted" },
+            "404": commonResponses.NotFound,
             "401": commonResponses.Unauthorized,
           },
         },
+      },
+
+      "/api/admin/tenants": {
         post: {
-          tags: ["Auth"],
-          summary: "Better-auth POST handler",
+          tags: ["Admin"],
+          summary: "Create a new tenant (MASTER_API_KEY)",
+          description:
+            "Returns the tenant id + a fresh API key and JWT-signing secret. Both secrets are surfaced exactly once; lost values require rotation.",
           responses: {
-            "200": { description: "See better-auth docs" },
-            "400": commonResponses.BadRequest,
+            "201": { description: "Tenant created" },
             "401": commonResponses.Unauthorized,
-            "429": commonResponses.TooManyRequests,
+            "403": commonResponses.Forbidden,
+          },
+        },
+        get: {
+          tags: ["Admin"],
+          summary: "List tenants (MASTER_API_KEY)",
+          responses: {
+            "200": { description: "Tenant list (no secrets)" },
+            "403": commonResponses.Forbidden,
           },
         },
       },

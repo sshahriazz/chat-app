@@ -112,18 +112,13 @@ export const generalLimiter = rateLimit({
 /**
  * Brute-force protection for the unauthenticated auth endpoints. Keyed by
  * IP (no user yet) via `ipKeyGenerator` so IPv6 callers can't rotate
- * addresses to bypass. 10 attempts per minute per IP is generous for a
- * real user but slow enough to make credential-stuffing expensive.
+ * addresses to bypass.
+ *
+ * PR 3: removed. Tenants handle password auth in their own backend;
+ * the chat server never sees credentials. If abuse on the webhook
+ * endpoints becomes a concern, add a dedicated tenant-keyed limiter
+ * there — the webhook routes already have that (webhooks.ts).
  */
-export const authLimiter = rateLimit({
-  windowMs: 60_000,
-  limit: 10,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
-  keyGenerator: (req) => ipKeyGenerator(req.ip ?? ""),
-  store: makeStore("auth"),
-  handler: (_req, res, _next, options) => json413(res, options.windowMs),
-});
 
 /** Re-export so routes can apply it only when a user is authenticated. */
 export type Limiter = (req: Request, res: Response, next: NextFunction) => void;

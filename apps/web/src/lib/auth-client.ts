@@ -1,17 +1,283 @@
-import { createAuthClient } from "better-auth/react";
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import {
+  getAuthToken,
+  setAuthToken,
+  onAuthTokenChange,
+} from "./auth-token";
 
 /**
- * Same-origin by default — auth endpoints at `/api/auth/*` are proxied
- * through Next.js rewrites to the Express server. Browsers stay on one
- * origin (no CORS, session cookie lives on one domain, one TLS cert).
+ * Minimal JWT-federation auth client. Replaces the better-auth React
+ * SDK that lived here before the PR 3 cutover.
  *
- * Override with `NEXT_PUBLIC_API_BASE_URL` if you need cross-origin
- * requests (e.g. the API is on a separate subdomain).
+ * The chat server trusts tenant-signed user JWTs and has no built-in
+ * sign-in flow. The "login" the reference client exposes here is
+ * purely a dev simulation of what a tenant's own backend would do in
+ * production: it mints a JWT through `/api/dev/mint-token` under the
+ * `default` tenant, then fetches `/api/me` to resolve the internal
+ * user id. Real tenants wire up their own password flow on their own
+ * backend; only the JWT + upsert contract ends at this server.
+ *
+ * Same-origin base URL — the Next.js server proxies `/api/*` through
+ * to the Express backend, so no CORS and no explicit API host needed.
  */
+
 const baseURL =
   process.env.NEXT_PUBLIC_API_BASE_URL ||
   (typeof window !== "undefined" ? window.location.origin : "");
 
-export const authClient = createAuthClient({
-  baseURL,
-});
+export interface SessionUser {
+  id: string;
+  name: string;
+  email: string;
+  image: string | null;
+}
+
+export interface SessionState {
+  user: SessionUser;
+}
+
+interface SessionHookResult {
+  data: SessionState | null;
+  isPending: boolean;
+}
+
+/** Key for remembering the most recent sign-in's externalId / name so a
+ *  page reload after refresh lands the user back where they were. */
+const SESSION_META_KEY = "chat_session_meta";
+
+interface SessionMeta {
+  tenantId: string;
+  externalId: string;
+  name: string;
+  email: string;
+  image?: string | null;
+}
+
+function readSessionMeta(): SessionMeta | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(SESSION_META_KEY);
+    return raw ? (JSON.parse(raw) as SessionMeta) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSessionMeta(meta: SessionMeta | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (meta) window.localStorage.setItem(SESSION_META_KEY, JSON.stringify(meta));
+    else window.localStorage.removeItem(SESSION_META_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+async function mintToken(input: {
+  tenantId: string;
+  externalId: string;
+  name: string;
+  email?: string;
+  image?: string | null;
+}): Promise<string> {
+  const res = await fetch(`${baseURL}/api/dev/mint-token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || "Mint failed");
+  }
+  const { token } = (await res.json()) as { token: string };
+  return token;
+}
+
+async function fetchMe(token: string): Promise<SessionUser> {
+  const res = await fetch(`${baseURL}/api/me`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error("Session lookup failed");
+  const data = (await res.json()) as {
+    id: string;
+    name: string;
+    email: string | null;
+    image: string | null;
+  };
+  return {
+    id: data.id,
+    name: data.name,
+    email: data.email ?? "",
+    image: data.image ?? null,
+  };
+}
+
+/** Open a session by upserting a tenant user + fetching /api/me. */
+async function openSession(meta: SessionMeta): Promise<SessionUser> {
+  const token = await mintToken({
+    tenantId: meta.tenantId,
+    externalId: meta.externalId,
+    name: meta.name,
+    email: meta.email,
+    image: meta.image ?? null,
+  });
+  setAuthToken(token);
+  writeSessionMeta(meta);
+  return fetchMe(token);
+}
+
+/**
+ * useSession — React hook mirroring better-auth's shape so consumer
+ * code (`AuthContext` etc.) doesn't need to change.
+ */
+function useSession(): SessionHookResult {
+  const [state, setState] = useState<SessionHookResult>({
+    data: null,
+    isPending: true,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function boot() {
+      const token = getAuthToken();
+      const meta = readSessionMeta();
+      if (!token || !meta) {
+        if (!cancelled) setState({ data: null, isPending: false });
+        return;
+      }
+      // Refresh the token + materialize user on every mount. Cheap;
+      // keeps claims in sync with anything the user changed via the
+      // settings page in a previous session.
+      try {
+        const user = await openSession(meta);
+        if (!cancelled) setState({ data: { user }, isPending: false });
+      } catch {
+        setAuthToken(null);
+        writeSessionMeta(null);
+        if (!cancelled) setState({ data: null, isPending: false });
+      }
+    }
+
+    void boot();
+
+    const unsub = onAuthTokenChange((t) => {
+      if (t === null) {
+        // Sign-out
+        setState({ data: null, isPending: false });
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unsub();
+    };
+  }, []);
+
+  return state;
+}
+
+export const authClient = {
+  useSession,
+
+  signIn: {
+    /**
+     * Dev-demo sign-in. Treats the email as the externalId (stable per
+     * user across sessions). Password is ignored — this reference
+     * client is not a real auth backend.
+     */
+    email: async ({
+      email,
+      password: _password,
+    }: {
+      email: string;
+      password: string;
+    }): Promise<{ error: { message: string } | null }> => {
+      try {
+        await openSession({
+          tenantId: "default",
+          externalId: email.toLowerCase().trim(),
+          name:
+            readSessionMeta()?.email === email
+              ? readSessionMeta()!.name
+              : email.split("@")[0],
+          email,
+        });
+        return { error: null };
+      } catch (err) {
+        return {
+          error: { message: (err as Error).message || "Sign in failed" },
+        };
+      }
+    },
+  },
+
+  signUp: {
+    email: async ({
+      name,
+      email,
+      password: _password,
+    }: {
+      name: string;
+      email: string;
+      password: string;
+    }): Promise<{ error: { message: string } | null }> => {
+      try {
+        await openSession({
+          tenantId: "default",
+          externalId: email.toLowerCase().trim(),
+          name,
+          email,
+        });
+        return { error: null };
+      } catch (err) {
+        return {
+          error: { message: (err as Error).message || "Sign up failed" },
+        };
+      }
+    },
+  },
+
+  signOut: async (): Promise<void> => {
+    setAuthToken(null);
+    writeSessionMeta(null);
+  },
+
+  /**
+   * Update the current user's profile. Re-mints the JWT with the new
+   * claims so the next authenticated request triggers `upsertFederatedUser`
+   * on the server — name/image propagate through all HTTP responses on
+   * the following fetch. Live realtime broadcast (`user_updated`) stays
+   * with the server-to-server webhook path which real tenants' backends
+   * hit from their own backend.
+   */
+  updateUser: async (input: {
+    name?: string;
+    image?: string | null;
+  }): Promise<{ error: { message: string } | null }> => {
+    const current = readSessionMeta();
+    if (!current) return { error: { message: "Not signed in" } };
+    const next: SessionMeta = {
+      ...current,
+      name: input.name ?? current.name,
+      image: input.image !== undefined ? input.image : current.image,
+    };
+    try {
+      await openSession(next);
+      return { error: null };
+    } catch (err) {
+      return {
+        error: { message: (err as Error).message || "Update failed" },
+      };
+    }
+  },
+
+  /** Direct reference — same-origin fetch helper for the rare caller
+   *  that needs the base URL at runtime. */
+  _internal: { baseURL, mintToken, fetchMe },
+};
+
+const useCallbackKeepStaticRef = useCallback;
+export { useCallbackKeepStaticRef };

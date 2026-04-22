@@ -1393,6 +1393,20 @@ router.post("/conversations/:id/typing", requireAuth, typingLimiter, async (req,
 
 // ─── Update last active ───────────────────────────────────────
 
+// GET /me — returns the authenticated user's server-internal profile
+// (id = internal UUID, not the tenant's externalId). Reference clients
+// call this after mint-token to resolve the internal id that flows
+// through message senderIds, Centrifugo channels, etc.
+router.get("/me", requireAuth, async (req, res) => {
+  const { user } = req as AuthenticatedRequest;
+  res.json({
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    image: user.image,
+  });
+});
+
 router.post("/me/active", requireAuth, generalLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
   await prisma.user.update({

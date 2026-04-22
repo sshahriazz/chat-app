@@ -3,14 +3,11 @@ import express, { type NextFunction, type Request, type Response } from "express
 import cors from "cors";
 import helmet from "helmet";
 import pinoHttp from "pino-http";
-import { toNodeHandler } from "better-auth/node";
-import { auth } from "./auth";
 import { env } from "./env";
 import { logger } from "./infra/logger";
 import { prisma } from "./infra/prisma";
 import { redis } from "./infra/redis";
 import { requestId } from "./middleware/request-id";
-import { authLimiter } from "./middleware/rate-limit";
 import healthRoutes from "./routes/health";
 import centrifugoRoutes from "./routes/centrifugo";
 import chatRoutes from "./routes/chat";
@@ -169,10 +166,10 @@ app.use(
   }),
 );
 
-// better-auth catch-all reads the raw request stream, so must come BEFORE
-// express.json(). Brute-force limiter in front of sign-in + sign-up.
-app.use(["/api/auth/sign-in", "/api/auth/sign-up"], authLimiter);
-app.all("/api/auth/*splat", toNodeHandler(auth));
+// PR 3: the legacy better-auth `/api/auth/*` catch-all is gone.
+// Tenants authenticate via user JWTs (`Authorization: Bearer`), which
+// the dual-auth dispatcher in middleware/auth.ts resolves to a
+// materialized User via `requireUserJwt`.
 
 // --- Route tree -------------------------------------------------------------
 //
