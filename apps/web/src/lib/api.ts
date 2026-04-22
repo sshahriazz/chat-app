@@ -11,6 +11,8 @@
  * where web and server live on separate domains). Value is baked into
  * the client bundle at build time.
  */
+import { getAuthToken } from "./auth-token";
+
 const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
 export const API_BASE_URL = BASE_URL;
@@ -25,9 +27,18 @@ async function request<T>(
   body?: unknown,
   opts: RequestOpts = {},
 ): Promise<T> {
+  const token = getAuthToken();
+  const headers: Record<string, string> = {};
+  if (body) headers["Content-Type"] = "application/json";
+  // Bearer header is the JWT path; server middleware dispatches to
+  // requireUserJwt when present. credentials:include keeps the legacy
+  // cookie-session path working in parallel during the dual-auth
+  // window (AUTH_MODE=both, default) — dropped in PR 3.
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: Object.keys(headers).length ? headers : undefined,
     body: body ? JSON.stringify(body) : undefined,
     credentials: "include",
     signal: opts.signal,
