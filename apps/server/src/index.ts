@@ -123,8 +123,11 @@ app.use(
 );
 
 // Health probes before auth + body parsing — they must be dependency-cheap
-// and bypass every middleware that could 401 or fail.
+// and bypass every middleware that could 401 or fail. Also mounted under
+// `/api` so deploys that expose the server under a path prefix (e.g.
+// Traefik rewriting `/chat-api/*` → `/api/*`) can reach the probes too.
 app.use(healthRoutes);
+app.use("/api", healthRoutes);
 
 // Prometheus scrape target. Unauthenticated on purpose (standard
 // convention); protect by binding to an internal network, firewall, or
