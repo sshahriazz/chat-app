@@ -144,30 +144,33 @@ app.get("/metrics", async (_req, res) => {
 // the docs are reachable without a session. Kept unauthenticated on purpose:
 // the server's HTTP surface is not a secret and having the docs 401 breaks
 // the ergonomic case of cURLing a route by clicking "Try it".
-app.get("/openapi.json", (_req, res) => {
+const openapiHandler = (_req: express.Request, res: express.Response) => {
   res.json(getOpenApiDocument());
-});
+};
+app.get("/openapi.json", openapiHandler);
+app.get("/api/openapi.json", openapiHandler);
+
 // Scalar's shell pulls its bundle from jsdelivr, uses eval internally,
 // fetches source maps, and (by default) talks to api.scalar.com for a
 // curated registry. The app-wide strict CSP blocks all of that. Disable
 // CSP on `/docs` alone — every real API route keeps the hardened default,
 // and the docs page is a third-party renderer whose attack surface is
 // already a function of trusting Scalar's CDN.
-app.use(
-  "/docs",
-  (_req, res, next) => {
-    // The global helmet() above already stamped CSP; per-route helmet
-    // can't un-set a header an upstream middleware added. Strip it here
-    // so Scalar's CDN bundle + inline bootstrap + eval-based runtime
-    // + api.scalar.com fetches all work.
-    res.removeHeader("Content-Security-Policy");
-    next();
-  },
-  apiReference({
-    url: "/openapi.json",
-    theme: "default",
-  }),
-);
+const stripCsp: express.RequestHandler = (_req, res, next) => {
+  // The global helmet() above already stamped CSP; per-route helmet
+  // can't un-set a header an upstream middleware added. Strip it here
+  // so Scalar's CDN bundle + inline bootstrap + eval-based runtime
+  // + api.scalar.com fetches all work.
+  res.removeHeader("Content-Security-Policy");
+  next();
+};
+// Relative `./openapi.json` resolves from whichever mount the browser
+// landed on (`/docs` → `/openapi.json`, `/api/docs` → `/api/openapi.json`),
+// so path-prefix deploys like Traefik's `/chat-api/*` → `/api/*` rewrite
+// keep working without baking the external prefix into the server.
+const docsHandler = apiReference({ url: "./openapi.json", theme: "default" });
+app.use("/docs", stripCsp, docsHandler);
+app.use("/api/docs", stripCsp, docsHandler);
 
 // Authentication: Tenants present a user JWT as `Authorization: Bearer`;
 // `requireAuth` in middleware/auth.ts verifies it + upserts the local
