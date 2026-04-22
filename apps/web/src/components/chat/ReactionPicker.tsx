@@ -9,11 +9,19 @@ const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
 interface ReactionPickerProps {
   messageId: string;
   conversationId: string;
+  /** Controlled open state. The parent tracks this so the containing
+   *  hover-actions row stays mounted while the dropdown is open — otherwise
+   *  moving the mouse to the portal'd dropdown unmounts the trigger and
+   *  kills the menu mid-interaction. */
+  opened: boolean;
+  onOpenChange: (opened: boolean) => void;
 }
 
 export function ReactionPicker({
   messageId,
   conversationId,
+  opened,
+  onOpenChange,
 }: ReactionPickerProps) {
   const addReaction = (emoji: string) => {
     api
@@ -22,10 +30,11 @@ export function ReactionPicker({
         { emoji },
       )
       .catch(() => {});
+    onOpenChange(false);
   };
 
   return (
-    <Menu shadow="md" position="top">
+    <Menu shadow="md" position="top" opened={opened} onChange={onOpenChange}>
       <Menu.Target>
         <ActionIcon variant="light" size="xs" radius="xl">
           <IconMoodSmile size={12} />

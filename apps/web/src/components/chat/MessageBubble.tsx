@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import {
   Box,
   Text,
@@ -13,7 +13,6 @@ import {
 } from "@mantine/core";
 import { MessageEditor } from "./MessageEditor";
 import {
-  IconMoodSmile,
   IconDotsVertical,
   IconEdit,
   IconTrash,
@@ -194,6 +193,37 @@ function MessageBubbleImpl({
   const { editMessage, deleteMessage, retrySendMessage } = useChatActions();
   const [hovered, setHovered] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [reactionOpen, setReactionOpen] = useState(false);
+  const [actionMenuOpen, setActionMenuOpen] = useState(false);
+
+  // Hover-state with a short grace period. Without this:
+  //   (a) the action buttons render at `top: -12` — above the Box the
+  //       mouse handlers live on — so moving up to click one crosses a
+  //       gap where `onMouseLeave` fires and the buttons disappear.
+  //   (b) once a Menu dropdown opens in its portal, moving the mouse
+  //       to it leaves the bubble → setHovered(false) → the
+  //       conditionally-rendered Menu unmounts → dropdown dies.
+  // A 150 ms grace + same handlers on the action Group itself keep the
+  // buttons mounted through both transitions. Menu open state is also
+  // tracked (controlled props below) so the buttons stay visible as
+  // long as any dropdown is active — even if the mouse wanders off.
+  const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPendingLeave = () => {
+    if (leaveTimerRef.current) {
+      clearTimeout(leaveTimerRef.current);
+      leaveTimerRef.current = null;
+    }
+  };
+  const handleEnter = () => {
+    cancelPendingLeave();
+    setHovered(true);
+  };
+  const handleLeave = () => {
+    cancelPendingLeave();
+    leaveTimerRef.current = setTimeout(() => setHovered(false), 150);
+  };
+
+  const showActions = hovered || reactionOpen || actionMenuOpen;
 
   // IMPORTANT: all hooks must be called BEFORE any conditional returns.
   // `renderedHtml` used to live further down — when a message transitioned
@@ -284,8 +314,8 @@ function MessageBubbleImpl({
         display: "flex",
         justifyContent: isOwn ? "flex-end" : "flex-start",
       }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
+      onMouseEnter={handleEnter}
+      onMouseLeave={handleLeave}
     >
       <Group
         gap="xs"
@@ -408,13 +438,22 @@ function MessageBubbleImpl({
           )}
         </Box>
 
-        {/* Action buttons on hover */}
-        {hovered && !editing && (
+        {/* Action buttons on hover. Mounted while the bubble is hovered
+            OR any of its dropdowns are open — the latter keeps the
+            dropdown's portal alive even when the mouse wanders off the
+            trigger. A 16 px invisible padding-top on the Group extends
+            its hit-box upward to cover the visual gap above the bubble,
+            so moving the mouse toward the buttons doesn't trip the
+            outer Box's mouseleave. */}
+        {showActions && !editing && (
           <Group
             gap={2}
+            onMouseEnter={handleEnter}
+            onMouseLeave={handleLeave}
             style={{
               position: "absolute",
-              top: -12,
+              top: -28,
+              paddingTop: 16,
               right: isOwn ? 0 : undefined,
               left: !isOwn ? 0 : undefined,
             }}
@@ -422,6 +461,8 @@ function MessageBubbleImpl({
             <ReactionPicker
               messageId={message.id}
               conversationId={message.conversationId}
+              opened={reactionOpen}
+              onOpenChange={setReactionOpen}
             />
             <ActionIcon
               variant="light"
@@ -432,7 +473,12 @@ function MessageBubbleImpl({
               <IconArrowBackUp size={12} />
             </ActionIcon>
             {(canEdit || canDelete) && (
-              <Menu shadow="sm" position="top">
+              <Menu
+                shadow="sm"
+                position="top"
+                opened={actionMenuOpen}
+                onChange={setActionMenuOpen}
+              >
                 <Menu.Target>
                   <ActionIcon variant="light" size="xs" radius="xl">
                     <IconDotsVertical size={12} />

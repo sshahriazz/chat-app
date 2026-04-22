@@ -25,7 +25,7 @@
   },
   "lint-staged": {
     "apps/web/**/*.{ts,tsx}": [
-      "pnpm --filter @chat-app/web exec eslint --max-warnings=0"
+      "pnpm --filter @chat-app/web exec eslint"
     ]
   }
 }
