@@ -14,7 +14,8 @@ import {
  * every one of those reads.
  *
  * Invalidation: every code path that can change `name` / `image` calls
- * `invalidateUserProfile` — better-auth's `update-user` hook (via
+ * `invalidateUserProfile` — the users.updated webhook + the JWT
+ * middleware (via
  * `auth.ts`) and the `/api/me/broadcast-profile` endpoint. Email is
  * treated as read-only post-signup so it's safe to cache longer.
  */

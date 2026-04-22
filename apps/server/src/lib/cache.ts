@@ -40,7 +40,8 @@ export const CACHE_NS = {
   convMembers: { prefix: "cache:conv:members:", ttlSec: 300 },
 
   /** userId → { id, name, email, image }. Invalidated when the user
-   *  updates their profile (better-auth hook + broadcast-profile). */
+   *  updates their profile — fired from the users.updated webhook and
+   *  from the JWT middleware when claims differ from the cached row. */
   userProfile: { prefix: "cache:user:", ttlSec: 600 },
 
   /** conversationId → { id, type, name, version, createdBy }.

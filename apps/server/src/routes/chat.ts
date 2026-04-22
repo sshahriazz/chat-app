@@ -1425,9 +1425,10 @@ router.post("/me/broadcast-profile", requireAuth, generalLimiter, async (req, re
   const { user } = req as AuthenticatedRequest;
 
   // Bust the cache first so the next read downstream gets fresh data.
-  // The client has already written to the DB through better-auth by the
-  // time it calls this endpoint; we're only responsible for fan-out +
-  // cache coherence.
+  // The tenant's backend has already hit POST /api/webhooks/users.updated
+  // (or the reference client re-minted a JWT with new claims, which
+  // upserts on the next authenticated request). We're only responsible
+  // for fan-out + cache coherence.
   await invalidateUserProfile(user.id);
 
   const fresh = await prisma.user.findUnique({

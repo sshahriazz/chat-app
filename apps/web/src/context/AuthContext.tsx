@@ -1,8 +1,7 @@
 "use client";
 
-import { createContext, useContext, useEffect, type ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
 import { authClient } from "@/lib/auth-client";
-import { setAuthToken } from "@/lib/auth-token";
 import type { User } from "@/lib/types";
 
 interface AuthState {
@@ -16,39 +15,16 @@ interface AuthState {
 const AuthContext = createContext<AuthState | null>(null);
 
 /**
- * After a successful better-auth sign-in the reference client mints a
- * short-lived tenant user JWT via `/api/dev/mint-token` and stashes it
- * in `auth-token.ts` so `api.ts` attaches it as a Bearer header on
- * every subsequent request. The server's dual-auth dispatcher then
- * prefers the JWT path — which is the real API surface a tenant would
- * wire up in production.
+ * Thin wrapper around the JWT-federation auth-client. `signUp` / `signIn`
+ * mint a tenant JWT under the `default` tenant; `useSession` fetches the
+ * server-internal user via `/api/me` so `user.id` is the UUID the rest
+ * of the app uses (senderId, Centrifugo channels, etc).
  *
- * The cookie session still exists alongside and works as a fallback
- * until PR 3 drops it. Minting targets the default tenant because
- * that's where every legacy user was backfilled.
+ * Password is accepted for form-shape compatibility but ignored in the
+ * reference client — tenants own password auth in their own backend.
+ * After a successful auth mutation we trigger a full-page reload so
+ * `useSession`'s mount-time bootstrap sees the fresh token.
  */
-async function mintTenantJwt(user: User): Promise<string | null> {
-  try {
-    const res = await fetch("/api/dev/mint-token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({
-        tenantId: "default",
-        externalId: user.id,
-        name: user.name,
-        email: user.email,
-        image: user.image,
-      }),
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { token: string };
-    return data.token;
-  } catch {
-    return null;
-  }
-}
-
 export function AuthProvider({ children }: { children: ReactNode }) {
   const { data: session, isPending } = authClient.useSession();
 
@@ -61,46 +37,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     : null;
 
-  // Mint / refresh the tenant JWT whenever the better-auth session
-  // settles on a user. Clears the token on sign-out. We intentionally
-  // depend on the individual User fields rather than the object —
-  // `user` gets a fresh identity on every render.
-  const uid = user?.id;
-  const uname = user?.name;
-  const uimage = user?.image;
-  useEffect(() => {
-    let cancelled = false;
-    if (!uid) {
-      setAuthToken(null);
-      return;
-    }
-    void mintTenantJwt({
-      id: uid,
-      name: uname ?? "",
-      email: user?.email ?? "",
-      image: uimage ?? null,
-    }).then((token) => {
-      if (!cancelled) setAuthToken(token);
-    });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [uid, uname, uimage]);
-
   const signUp = async (name: string, email: string, password: string) => {
     const { error } = await authClient.signUp.email({ name, email, password });
     if (error) throw new Error(error.message);
+    if (typeof window !== "undefined") window.location.reload();
   };
 
   const signIn = async (email: string, password: string) => {
     const { error } = await authClient.signIn.email({ email, password });
     if (error) throw new Error(error.message);
+    if (typeof window !== "undefined") window.location.reload();
   };
 
   const signOut = async () => {
     await authClient.signOut();
-    setAuthToken(null);
+    if (typeof window !== "undefined") window.location.reload();
   };
 
   return (

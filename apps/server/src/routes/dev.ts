@@ -90,6 +90,7 @@ router.post(
       externalId: body.externalId,
       expiresIn: body.ttlSeconds ?? 3600,
     });
+    
   },
 );
 

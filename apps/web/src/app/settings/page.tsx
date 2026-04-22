@@ -84,9 +84,10 @@ export default function SettingsPage() {
     if (!dirty) return;
     setSaving(true);
     try {
-      // better-auth persists name/image on the User row and refreshes the
-      // session automatically — `useSession` subscribers (AuthContext,
-      // ConversationItem avatars, ChatHeader) re-render with the new data.
+      // authClient.updateUser re-mints the JWT with new claims. The
+      // server upserts the User row on the next authenticated request;
+      // the page reload below refreshes every useSession subscriber
+      // (AuthContext, ConversationItem avatars, ChatHeader).
       const result = await authClient.updateUser({
         name,
         image: image ?? "",

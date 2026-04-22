@@ -1,11 +1,11 @@
 /**
  * Module-level JWT holder. `api.ts` attaches it as `Authorization:
  * Bearer …` on every request; `AuthContext` keeps it fresh by minting
- * a new one after each successful better-auth sign-in.
+ * a new one after each successful sign-in via `authClient.signIn`.
  *
- * This is the bridge between the cookie-based UI (still here in PR 2)
- * and the JWT-federated API path (new in PR 1). In PR 3 the cookie UI
- * goes away and this holder becomes the only auth source.
+ * Post-cutover this is the ONLY auth source: the server's requireAuth
+ * middleware expects a Bearer token and the cookie session path no
+ * longer exists.
  */
 
 let token: string | null = null;

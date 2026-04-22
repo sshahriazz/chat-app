@@ -166,10 +166,10 @@ app.use(
   }),
 );
 
-// PR 3: the legacy better-auth `/api/auth/*` catch-all is gone.
-// Tenants authenticate via user JWTs (`Authorization: Bearer`), which
-// the dual-auth dispatcher in middleware/auth.ts resolves to a
-// materialized User via `requireUserJwt`.
+// Authentication: Tenants present a user JWT as `Authorization: Bearer`;
+// `requireAuth` in middleware/auth.ts verifies it + upserts the local
+// User row. Server-to-server ops (webhooks, admin) use a tenant API key
+// instead — also Bearer-style.
 
 // --- Route tree -------------------------------------------------------------
 //
