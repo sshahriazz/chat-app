@@ -8,8 +8,8 @@ generator client {
 // `pure` variants (no Prisma-client type helpers) keeps them usable from
 // any consumer — server routes, client bundles, migrations.
 generator zod {
-  provider       = "prisma-zod-generator"
-  output         = "../src/generated/zod"
+  provider         = "prisma-zod-generator"
+  output           = "../src/generated/zod"
   useMultipleFiles = true
   createInputTypes = false
   createModelTypes = true
@@ -19,10 +19,53 @@ datasource db {
   provider = "postgresql"
 }
 
+// ─── Tenancy ──────────────────────────────────────────────────
+//
+// A Tenant is a third-party app that uses this chat server. Every chat
+// entity (User, Conversation, Message, …) is scoped to exactly one
+// tenant, enforced at the query layer so two tenants can't see each
+// other's data even with a bug in route authorization.
+//
+// `apiKeyHash` is Argon2(apiKey) — the raw key is surfaced exactly
+// once at create/rotate time. Tenants authenticate server-to-server
+// endpoints by sending `Authorization: Bearer <apiKey>`.
+//
+// `jwtSecret` is the HMAC secret the tenant uses to sign user JWTs
+// for their end-users. Their backend mints a short-lived token with
+// `sub = externalId` + name/image/email claims; we verify with this
+// secret and upsert a User row keyed by `(tenantId, externalId)`.
+//
+// A single `default` tenant is seeded by the initial tenancy
+// migration and carries every pre-existing row.
+
+model Tenant {
+  id         String   @id @default(uuid())
+  name       String
+  apiKeyHash String   @map("api_key_hash")
+  jwtSecret  String   @map("jwt_secret")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  users               User[]
+  conversations       Conversation[]
+  conversationMembers ConversationMember[]
+  messages            Message[]
+  reactions           Reaction[]
+  attachments         Attachment[]
+  pushSubscriptions   PushSubscription[]
+
+  @@map("tenant")
+}
+
 // ─── Better Auth tables ───────────────────────────────────────
 
 model User {
   id            String    @id
+  // Tenant-scoped composite identity. `externalId` is the tenant's own
+  // user id (never mutated), `id` stays server-internal (UUID) so our
+  // FKs / Centrifugo channels don't need to change.
+  tenantId      String    @default("default") @map("tenant_id")
+  externalId    String    @map("external_id")
   name          String
   email         String    @unique
   emailVerified Boolean   @map("email_verified")
@@ -31,6 +74,7 @@ model User {
   createdAt     DateTime  @map("created_at")
   updatedAt     DateTime  @map("updated_at")
 
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   sessions            Session[]
   accounts            Account[]
   conversationMembers ConversationMember[]
@@ -39,6 +83,8 @@ model User {
   attachments         Attachment[]
   pushSubscriptions   PushSubscription[]
 
+  @@unique([tenantId, externalId])
+  @@index([tenantId])
   @@map("user")
 }
 
@@ -109,6 +155,7 @@ enum MessageType {
 
 model Conversation {
   id         String           @id @default(uuid())
+  tenantId   String           @default("default") @map("tenant_id")
   type       ConversationType
   name       String?
   createdBy  String           @map("created_by")
@@ -120,14 +167,17 @@ model Conversation {
   // is inserted to produce `Message.seq`.
   currentSeq Int              @default(0) @map("current_seq")
 
+  tenant   Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   members  ConversationMember[]
   messages Message[]
 
+  @@index([tenantId])
   @@map("conversations")
 }
 
 model ConversationMember {
   id                String     @id @default(uuid())
+  tenantId          String     @default("default") @map("tenant_id")
   conversationId    String     @map("conversation_id")
   userId            String     @map("user_id")
   role              MemberRole @default(member)
@@ -141,11 +191,13 @@ model ConversationMember {
   // every /init + /conversations request.
   unreadCount       Int        @default(0) @map("unread_count")
 
+  tenant          Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   conversation    Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   lastReadMessage Message?     @relation("LastReadMessage", fields: [lastReadMessageId], references: [id], onDelete: SetNull)
 
   @@unique([conversationId, userId])
+  @@index([tenantId])
   @@map("conversation_members")
 }
 
@@ -170,6 +222,7 @@ model Outbox {
 
 model PushSubscription {
   id        String   @id @default(uuid())
+  tenantId  String   @default("default") @map("tenant_id")
   userId    String   @map("user_id")
   // Unique per browser: the endpoint is the browser's Push service URL plus
   // a client-specific path. Upserting on it avoids duplicates when the same
@@ -179,14 +232,17 @@ model PushSubscription {
   auth      String
   createdAt DateTime @default(now()) @map("created_at")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([tenantId])
   @@map("push_subscriptions")
 }
 
 model Attachment {
   id          String   @id @default(uuid())
+  tenantId    String   @default("default") @map("tenant_id")
   // Nullable so the upload flow can mint the row before the user hits "send".
   // Orphan attachments (messageId remains null past some TTL) can be GC'd.
   messageId   String?  @map("message_id")
@@ -199,16 +255,19 @@ model Attachment {
   height      Int?
   createdAt   DateTime @default(now()) @map("created_at")
 
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   message  Message? @relation(fields: [messageId], references: [id], onDelete: Cascade)
   uploader User     @relation(fields: [uploaderId], references: [id], onDelete: Cascade)
 
   @@index([messageId])
   @@index([uploaderId, createdAt])
+  @@index([tenantId])
   @@map("attachments")
 }
 
 model Message {
   id              String      @id @default(uuid())
+  tenantId        String      @default("default") @map("tenant_id")
   conversationId  String      @map("conversation_id")
   senderId        String      @map("sender_id")
   // Tiptap AST — stored as jsonb so we never ship HTML over the wire or
@@ -230,10 +289,11 @@ model Message {
   // Optional dedup key provided by clients for optimistic UI + retries.
   clientMessageId String?     @map("client_message_id")
 
-  conversation Conversation       @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  sender       User               @relation(fields: [senderId], references: [id], onDelete: Cascade)
-  replyTo      Message?           @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
-  replies      Message[]          @relation("MessageReplies")
+  tenant       Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversation Conversation         @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User                 @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  replyTo      Message?             @relation("MessageReplies", fields: [replyToId], references: [id], onDelete: SetNull)
+  replies      Message[]            @relation("MessageReplies")
   readBy       ConversationMember[] @relation("LastReadMessage")
   reactions    Reaction[]
   attachments  Attachment[]
@@ -241,19 +301,23 @@ model Message {
   @@unique([conversationId, seq])
   @@unique([conversationId, clientMessageId])
   @@index([conversationId, createdAt])
+  @@index([tenantId])
   @@map("messages")
 }
 
 model Reaction {
   id        String   @id @default(uuid())
+  tenantId  String   @default("default") @map("tenant_id")
   messageId String   @map("message_id")
   userId    String   @map("user_id")
   emoji     String
   createdAt DateTime @default(now()) @map("created_at")
 
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
   user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([messageId, userId, emoji])
+  @@index([tenantId])
   @@map("reactions")
 }

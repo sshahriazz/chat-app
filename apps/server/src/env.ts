@@ -31,6 +31,17 @@ const EnvSchema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .optional(),
   TRUST_PROXY: z.coerce.number().int().nonnegative().default(1),
+
+  // Tenancy (PR 1 onward).
+  //
+  // MASTER_API_KEY gates `POST /api/admin/tenants` and the key/secret
+  // rotation endpoints. In production this MUST be set; the optional()
+  // below is only for dev / tests where admin endpoints aren't mounted.
+  MASTER_API_KEY: z.string().min(32).optional(),
+  // Seconds of clock skew tolerated when verifying tenant-signed user
+  // JWTs. Defaults to a conservative 30s; raise if tenants run on
+  // systems with unsynced clocks.
+  TENANT_JWT_CLOCK_SKEW_SEC: z.coerce.number().int().nonnegative().default(30),
   SHUTDOWN_TIMEOUT_MS: z.coerce
     .number()
     .int()

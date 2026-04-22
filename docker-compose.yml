@@ -171,6 +171,10 @@ services:
       # report req.ip as the real client — critical for rate limiting
       # and for better-auth's secure-cookie detection.
       TRUST_PROXY: ${TRUST_PROXY:-2}
+      # Tenancy admin gate. Unset in dev → admin endpoints return 403.
+      # Rotate in Dokploy env when bootstrapping real tenants.
+      MASTER_API_KEY: ${MASTER_API_KEY:-}
+      TENANT_JWT_CLOCK_SKEW_SEC: ${TENANT_JWT_CLOCK_SKEW_SEC:-30}
       # S3 split clients (see apps/server/src/lib/s3.ts):
       #   S3_ENDPOINT        — internal, used for HEAD/DELETE/etc.
       #   S3_PUBLIC_URL_BASE — public, used to mint presigned PUT/GET

@@ -17,6 +17,8 @@ import chatRoutes from "./routes/chat";
 import userRoutes from "./routes/users";
 import attachmentRoutes from "./routes/attachments";
 import pushRoutes from "./routes/push";
+import webhookRoutes from "./routes/webhooks";
+import adminRoutes from "./routes/admin";
 import { apiReference } from "@scalar/express-api-reference";
 import { getOpenApiDocument } from "./http/openapi";
 import { httpMetrics } from "./middleware/metrics";
@@ -183,6 +185,11 @@ app.use("/api/centrifugo", express.json({ limit: "4kb" }), centrifugoRoutes);
 app.use("/api/users", express.json({ limit: "32kb" }), userRoutes);
 app.use("/api/attachments", express.json({ limit: "8kb" }), attachmentRoutes);
 app.use("/api/push", express.json({ limit: "4kb" }), pushRoutes);
+// Tenancy: webhooks (tenant backends → us) + admin (operator → us).
+// Both dormant in PR 1 — mounted but no existing user/session code paths
+// reach them yet.
+app.use("/api/webhooks", express.json({ limit: "8kb" }), webhookRoutes);
+app.use("/api/admin", express.json({ limit: "4kb" }), adminRoutes);
 // Chat catch-all registered last so more specific prefixes above match
 // first. 512 KB covers the worst-case serialized Tiptap doc (50K plain
 // chars × ~3× markup overhead) plus request-shape overhead.
