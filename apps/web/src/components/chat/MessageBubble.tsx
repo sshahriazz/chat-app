@@ -195,6 +195,21 @@ function MessageBubbleImpl({
   const [hovered, setHovered] = useState(false);
   const [editing, setEditing] = useState(false);
 
+  // IMPORTANT: all hooks must be called BEFORE any conditional returns.
+  // `renderedHtml` used to live further down — when a message transitioned
+  // from not-deleted → deleted, the `isDeleted` early return skipped
+  // this useMemo, violating the Rules of Hooks. React threw "Rendered
+  // fewer hooks than expected" and the tree tore down, which showed up
+  // as Chrome's "This page couldn't load" (the renderer gave up with
+  // nothing left to display). For deleted/system messages the memo
+  // result is just unused; running it costs nothing because
+  // `isEmptyContent` short-circuits.
+  const renderedHtml = useMemo(
+    () =>
+      isEmptyContent(message.content) ? "" : renderMessageToHtml(message.content),
+    [message.content],
+  );
+
   const isOwn = message.senderId === user?.id;
   const isDeleted = !!message.deletedAt;
   const isSystem = message.type === "system";
@@ -250,15 +265,6 @@ function MessageBubbleImpl({
   };
 
   const cancelEdit = () => setEditing(false);
-
-  // Memoized JSON → HTML render. Re-runs only when message.content identity
-  // changes (we replace, never mutate in-place), so this is free during
-  // typing / presence / reaction churn in sibling components.
-  const renderedHtml = useMemo(
-    () =>
-      isEmptyContent(message.content) ? "" : renderMessageToHtml(message.content),
-    [message.content],
-  );
 
   // Group reactions by emoji
   const groupedReactions = (message.reactions || []).reduce(
