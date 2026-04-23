@@ -28,6 +28,7 @@ Throughout this guide, the chat server lives at `https://chat.technext.it/chat-a
 18. [Error responses](#18-error-responses)
 19. [Security](#19-security)
 20. [Troubleshooting](#20-troubleshooting)
+21. [Capability lifecycle at a glance](#21-capability-lifecycle-at-a-glance)
 
 ---
 
@@ -71,6 +72,8 @@ Throughout this guide, the chat server lives at `https://chat.technext.it/chat-a
 | `jwtSecret` | your backend only | signing user JWTs | yes — invalidates every live token |
 
 Your **frontend never sees** `apiKey` or `jwtSecret`. It only sees short-lived user JWTs minted by your backend.
+
+> For the full chronological list of everything a tenant can do — onboarding through rotation — see [§21 Capability lifecycle at a glance](#21-capability-lifecycle-at-a-glance).
 
 ---
 
@@ -1264,3 +1267,93 @@ Every error is a JSON envelope with an HTTP status and a stable `code`:
 | Mentions aren't notifying | The mentioned userId didn't resolve to a member of the conversation. Server drops unresolved ids from `mentions[]`. |
 
 Full API reference + interactive playground: **`/chat-api/docs`**.
+
+---
+
+## 21. Capability lifecycle at a glance
+
+Every action a tenant can take with this server, in chronological order — from onboarding, through day-to-day use, to credential rotation. Treat it as both a TOC and a checklist.
+
+### One-time onboarding
+
+1. Receive `tenantId` + `apiKey` + `jwtSecret` from the operator (out of band)
+2. Store all three in the tenant's secret manager
+3. Implement a `/chat-token` endpoint on the tenant backend that signs a user JWT with `jwtSecret`
+4. Implement webhook senders for profile updates + deletes on the tenant backend
+
+### Per-session (each user login)
+
+5. User logs into the tenant's app with the tenant's own auth
+6. Tenant's frontend fetches a fresh chat JWT from the tenant's backend
+7. Call `GET /me` to resolve the user's internal UUID
+8. Call `GET /init` to bootstrap the conversation list + Centrifugo connection token
+9. Open the Centrifugo WebSocket — auto-subscribed to `user:{id}`
+10. Subscribe to `presence:conv_{id}` for the active conversation
+
+### Discovery
+
+11. Search users — `POST /users/search?q=...` (scope-filtered)
+12. Batch-check online status — `POST /users/online`
+
+### Conversation lifecycle
+
+13. Create a direct or group conversation — `POST /conversations`
+14. Add members — `POST /conversations/:id/members`
+15. Rename a group — `PUT /conversations/:id`
+16. Remove a member / leave a group — `DELETE /conversations/:id/members/:userId`
+17. Paginate the conversation list — `GET /conversations?before=`
+
+### Messaging
+
+18. Send a message (text, rich content, or attachments) — `POST /conversations/:id/messages`
+19. Broadcast typing — `POST /conversations/:id/typing`
+20. Edit a message — `PUT /conversations/:id/messages/:messageId`
+21. Soft-delete a message — `DELETE /conversations/:id/messages/:messageId`
+22. Reply to a message (set `replyToId` on send)
+23. Mention users (Tiptap `mention` nodes)
+24. React — `POST /conversations/:id/messages/:messageId/reactions`
+25. Remove a reaction — `DELETE /conversations/:id/messages/:messageId/reactions/:emoji`
+26. Mark conversation as read — `POST /conversations/:id/read`
+27. Mute / unmute conversation — `POST /conversations/:id/mute`
+28. Paginate message history — `GET /conversations/:id/messages?before=`
+29. Jump to a specific message (window mode) — `GET /conversations/:id/messages?anchor=<id>`
+
+### Search
+
+30. Search within one conversation — `GET /conversations/:id/search?q=...`
+31. Search globally across all accessible conversations — `GET /search?q=...`
+
+### Attachments
+
+32. Mint a presigned upload URL — `POST /attachments/upload-url`
+33. PUT file bytes directly to S3 with the presigned URL
+34. Attach uploaded file to a message (`attachmentIds` in send)
+35. Download an attachment — `GET /attachments/:id/download`
+
+### Push notifications
+
+36. Fetch the VAPID public key — `GET /push/vapid-public-key`
+37. Register a Web Push subscription — `POST /push/subscribe`
+38. Unregister — `POST /push/unsubscribe`
+
+### Identity maintenance
+
+39. Ping `lastActive` — `POST /me/active`
+40. Broadcast a profile change live (from the frontend) — `POST /me/broadcast-profile`
+41. Update a user's server-side profile (from the tenant backend) — `POST /api/webhooks/users.updated`
+42. Delete a user (GDPR, from the tenant backend) — `POST /api/webhooks/users.deleted`
+43. Soft-delete self (user-initiated GDPR, from the frontend) — `DELETE /me`
+
+### Continuous operation
+
+44. Refresh the user JWT before expiry (refetch `/chat-token` from the tenant backend)
+45. Refresh the Centrifugo token (refetch `/init`, swap on next reconnect)
+
+### Credential hygiene
+
+46. Rotate `apiKey` (via operator — typical trigger: staff offboarding, suspected leak)
+47. Rotate `jwtSecret` (via operator — invalidates every live user JWT at once)
+
+### B2B2C partitioning
+
+48. Partition users into **scopes** by including a `scope` claim in minted JWTs (project chats, support tickets, deal rooms, per-client CRM)
