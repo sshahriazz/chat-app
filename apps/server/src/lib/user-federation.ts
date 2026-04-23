@@ -4,6 +4,7 @@ import type { TenantUserClaims } from "../http/jwt-tenant";
 import { logger } from "../infra/logger";
 import * as centrifugo from "./centrifugo";
 import { invalidateUserProfile } from "./user-cache";
+import { CACHE_NS, cacheDel, cacheGet, cacheSet } from "./cache";
 
 /**
  * User federation — bridge between a tenant's own user model and this
@@ -51,10 +52,67 @@ export interface MaterializedUser {
  * middleware on every request — must be fast. Writes only when the
  * incoming metadata differs from what's stored.
  */
+/**
+ * Deterministic short hash of the tenant-visible claim tuple. Stored
+ * alongside the cached `MaterializedUser` so the middleware can skip
+ * the DB entirely when the JWT presents the same claims as last time.
+ *
+ * `scope: undefined` means "tenant didn't send one this time; don't
+ * touch the stored scope." We hash `"__undef__"` as a sentinel so two
+ * minted tokens — one with scope set, one without — don't collide.
+ */
+function claimHash(input: FederatedUserInput): string {
+  const parts = [
+    input.externalId,
+    input.name,
+    input.image ?? "",
+    input.email ?? "",
+    input.scope === undefined ? "__undef__" : (input.scope ?? "__null__"),
+  ];
+  return crypto.createHash("sha256").update(parts.join("\x1f")).digest("hex");
+}
+
+interface CachedFederatedUser extends MaterializedUser {
+  /** Hash of the claims that produced this row. Fast-path hit only
+   *  when the incoming JWT's claimHash matches. */
+  hash: string;
+}
+
+function fedKey(tenantId: string, externalId: string): string {
+  return `${tenantId}:${externalId}`;
+}
+
+/** Purge the cached federation entry so the next auth goes back to DB.
+ *  Called from webhook updates + user deletes. */
+export async function invalidateFederatedUser(
+  tenantId: string,
+  externalId: string,
+): Promise<void> {
+  await cacheDel(CACHE_NS.fedUser, fedKey(tenantId, externalId));
+}
+
 export async function upsertFederatedUser(
   tenantId: string,
   claims: FederatedUserInput,
 ): Promise<MaterializedUser> {
+  const hash = claimHash(claims);
+
+  // ── Cache fast path: same claims as last time → zero DB traffic ──
+  //
+  // Hit rate in steady state is >90% for an active session (same user
+  // hammering the API with the same JWT claims). The 60s TTL bounds
+  // the staleness of profile changes that came in via some path we
+  // didn't explicitly invalidate; webhook + broadcast-profile both
+  // purge immediately.
+  const cached = await cacheGet<CachedFederatedUser>(
+    CACHE_NS.fedUser,
+    fedKey(tenantId, claims.externalId),
+  );
+  if (cached && cached.hash === hash) {
+    const { hash: _h, ...user } = cached;
+    return user;
+  }
+
   // Hot path: the row already exists and nothing changed. Skip the write
   // so a browser session hammering the API at N req/s doesn't translate
   // into N UPDATEs on the user row.
@@ -79,8 +137,9 @@ export async function upsertFederatedUser(
     const scopeChanged =
       scopeProvided && (existing.scope ?? null) !== (claims.scope ?? null);
 
+    let result: MaterializedUser;
     if (!nameChanged && !imageChanged && !emailChanged && !scopeChanged) {
-      return {
+      result = {
         id: existing.id,
         tenantId: existing.tenantId,
         externalId: existing.externalId,
@@ -89,32 +148,38 @@ export async function upsertFederatedUser(
         email: existing.email ?? null,
         scope: existing.scope ?? null,
       };
+    } else {
+      const updated = await prisma.user.update({
+        where: { tenantId_externalId: { tenantId, externalId: claims.externalId } },
+        data: {
+          name: claims.name,
+          image: claims.image ?? null,
+          ...(emailChanged ? { email: claims.email ?? null } : {}),
+          ...(scopeChanged ? { scope: claims.scope ?? null } : {}),
+          updatedAt: new Date(),
+        },
+        select: {
+          id: true, tenantId: true, externalId: true,
+          name: true, image: true, email: true, scope: true,
+        },
+      });
+      await invalidateUserProfile(updated.id);
+      result = {
+        id: updated.id,
+        tenantId: updated.tenantId,
+        externalId: updated.externalId,
+        name: updated.name,
+        image: updated.image ?? null,
+        email: updated.email ?? null,
+        scope: updated.scope ?? null,
+      };
     }
-
-    const updated = await prisma.user.update({
-      where: { tenantId_externalId: { tenantId, externalId: claims.externalId } },
-      data: {
-        name: claims.name,
-        image: claims.image ?? null,
-        ...(emailChanged ? { email: claims.email ?? null } : {}),
-        ...(scopeChanged ? { scope: claims.scope ?? null } : {}),
-        updatedAt: new Date(),
-      },
-      select: {
-        id: true, tenantId: true, externalId: true,
-        name: true, image: true, email: true, scope: true,
-      },
-    });
-    await invalidateUserProfile(updated.id);
-    return {
-      id: updated.id,
-      tenantId: updated.tenantId,
-      externalId: updated.externalId,
-      name: updated.name,
-      image: updated.image ?? null,
-      email: updated.email ?? null,
-      scope: updated.scope ?? null,
-    };
+    await cacheSet<CachedFederatedUser>(
+      CACHE_NS.fedUser,
+      fedKey(tenantId, claims.externalId),
+      { ...result, hash },
+    );
+    return result;
   }
 
   // First-time materialization. `upsert` compiles to Postgres
@@ -146,7 +211,7 @@ export async function upsertFederatedUser(
       name: true, image: true, email: true, scope: true,
     },
   });
-  return {
+  const result: MaterializedUser = {
     id: row.id,
     tenantId: row.tenantId,
     externalId: row.externalId,
@@ -155,6 +220,12 @@ export async function upsertFederatedUser(
     email: row.email ?? null,
     scope: row.scope ?? null,
   };
+  await cacheSet<CachedFederatedUser>(
+    CACHE_NS.fedUser,
+    fedKey(tenantId, claims.externalId),
+    { ...result, hash },
+  );
+  return result;
 }
 
 /**
@@ -169,6 +240,11 @@ export async function applyTenantUserUpdate(
   tenantId: string,
   input: FederatedUserInput,
 ): Promise<MaterializedUser> {
+  // Webhooks are an authoritative push from the tenant — bypass any
+  // cached fast-path match so this write always hits DB and the fresh
+  // values overwrite both DB and cache. Cheap; webhooks are low volume.
+  await invalidateFederatedUser(tenantId, input.externalId);
+
   const user = await upsertFederatedUser(tenantId, input);
 
   // Peers to notify: every user who shares at least one conversation
@@ -221,5 +297,6 @@ export async function deleteFederatedUser(
 
   await prisma.user.delete({ where: { id: row.id } });
   await invalidateUserProfile(row.id);
+  await invalidateFederatedUser(tenantId, externalId);
   return { deleted: true };
 }

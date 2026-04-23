@@ -47,6 +47,20 @@ export const CACHE_NS = {
   /** conversationId → { id, type, name, version, createdBy }.
    *  Invalidated on rename / member change / any version bump. */
   convMeta: { prefix: "cache:conv:meta:", ttlSec: 600 },
+
+  /** tenantId → { id, jwtSecret } with jwtSecret already unwrapped.
+   *  Skips the Postgres SELECT + AES-GCM decrypt on every authenticated
+   *  request. Short TTL bounds the rotation window — after a rotate,
+   *  stale entries expire within ttlSec even without an explicit purge.
+   *  Rotation paths also call `invalidateTenant()` for instant effect. */
+  tenant: { prefix: "cache:tenant:", ttlSec: 30 },
+
+  /** `{tenantId}:{externalId}` → the materialized user row + a hash
+   *  of the JWT claims we last saw. On auth, if the incoming JWT's
+   *  claim hash matches the cached one, we skip findUnique entirely
+   *  and return the cached row. Tenant webhook updates +
+   *  upsertFederatedUser both invalidate. */
+  fedUser: { prefix: "cache:fedu:", ttlSec: 60 },
 } as const;
 
 export type CacheNamespace = typeof CACHE_NS[keyof typeof CACHE_NS];
