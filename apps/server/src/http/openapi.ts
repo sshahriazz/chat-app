@@ -31,6 +31,28 @@ import {
   PushSubscriptionModelSchema,
 } from "../generated/zod/schemas/variants/pure";
 import { commonResponses, errorResponseSchema } from "./openapi-shared";
+import {
+  AddMembersBodySchema,
+  CreateConversationBodySchema,
+  CreateTenantBodySchema,
+  EditMessageBodySchema,
+  ListConversationsQuerySchema,
+  ListMessagesQuerySchema,
+  MarkReadBodySchema,
+  MuteBodySchema,
+  OnlineUsersBodySchema,
+  PushSubscribeBodySchema,
+  PushUnsubscribeBodySchema,
+  ReactionBodySchema,
+  RenameConversationBodySchema,
+  SearchQuerySchema,
+  SendMessageBodySchema,
+  SubscriptionTokenBodySchema,
+  UploadUrlBodySchema,
+  UsersDeletedWebhookBodySchema,
+  UsersUpdatedWebhookBodySchema,
+  UserSearchQuerySchema,
+} from "./schemas";
 
 /**
  * Lightweight public user shape — what we return from search, conversation
@@ -160,68 +182,10 @@ const messageWithRelationsSchema = MessageModelSchema.pick({
   })
   .meta({ id: "MessageWithRelations" });
 
-// ─── Request bodies ──────────────────────────────────────────
-
-const tiptapDocSchema = z
-  .object({
-    type: z.literal("doc"),
-    content: z.array(z.unknown()).optional(),
-  })
-  .meta({ id: "TiptapDoc" });
-
-const createConversationBodySchema = z
-  .object({
-    type: z.enum(["direct", "group"]),
-    name: z.string().min(1).max(100).optional(),
-    memberIds: z.array(z.string()).min(1),
-  })
-  .meta({ id: "CreateConversationBody" });
-
-const renameConversationBodySchema = z
-  .object({ name: z.string().min(1).max(100) })
-  .meta({ id: "RenameConversationBody" });
-
-const addMembersBodySchema = z
-  .object({
-    userIds: z.array(z.string()).min(1),
-    name: z.string().min(1).max(100).optional(),
-  })
-  .meta({ id: "AddMembersBody" });
-
-const sendMessageBodySchema = z
-  .object({
-    content: tiptapDocSchema.optional(),
-    replyToId: z.string().optional(),
-    clientMessageId: z.string().max(256).optional(),
-    attachmentIds: z.array(z.string()).optional(),
-  })
-  .meta({ id: "SendMessageBody" });
-
-const editMessageBodySchema = z
-  .object({ content: tiptapDocSchema })
-  .meta({ id: "EditMessageBody" });
-
-const markReadBodySchema = z
-  .object({ messageId: z.string() })
-  .meta({ id: "MarkReadBody" });
-
-const muteBodySchema = z
-  .object({ muted: z.boolean() })
-  .meta({ id: "MuteBody" });
-
-const reactionBodySchema = z
-  .object({ emoji: z.string().min(1).max(16) })
-  .meta({ id: "ReactionBody" });
-
-const uploadUrlBodySchema = z
-  .object({
-    filename: z.string().min(1).max(255),
-    contentType: z.string(),
-    size: z.number().int().positive(),
-    width: z.number().int().positive().optional(),
-    height: z.number().int().positive().optional(),
-  })
-  .meta({ id: "UploadUrlBody" });
+// ─── Response-only schemas ───────────────────────────────────
+// Request bodies + query params are imported from `./schemas` (single
+// source of truth with runtime validation). Below are response shapes
+// that don't participate in request validation.
 
 const uploadUrlResponseSchema = z
   .object({
@@ -236,25 +200,74 @@ const connectionTokenResponseSchema = z
   .object({ token: z.string() })
   .meta({ id: "CentrifugoConnectionToken" });
 
-const subscriptionTokenBodySchema = z
-  .object({ channel: z.string() })
-  .meta({ id: "CentrifugoSubscriptionTokenBody" });
+// ─── Webhook responses ───────────────────────────────────────
 
-const pushSubscribeBodySchema = z
+const webhookAcceptedResponseSchema = z
+  .object({ accepted: z.literal(true) })
+  .meta({ id: "WebhookAcceptedResponse" });
+
+const webhookDeletedResponseSchema = z
+  .object({ deleted: z.boolean() })
+  .meta({ id: "WebhookDeletedResponse" });
+
+// ─── Admin responses ─────────────────────────────────────────
+
+const createTenantResponseSchema = z
   .object({
-    endpoint: z.string().url(),
-    keys: z.object({
-      p256dh: z.string(),
-      auth: z.string(),
+    id: z.string(),
+    name: z.string(),
+    apiKey: z.string().meta({
+      description:
+        "Raw API key. Shown exactly once — persist immediately in the tenant's backend secret store. Recovery requires rotation.",
+    }),
+    jwtSecret: z.string().meta({
+      description:
+        "Raw HS256 signing secret for user JWTs. Shown exactly once.",
     }),
   })
-  .meta({ id: "PushSubscribeBody" });
+  .meta({ id: "CreateTenantResponse" });
 
-const onlineUsersBodySchema = z
+const tenantListResponseSchema = z
   .object({
-    userIds: z.array(z.string()).min(1).max(200),
+    tenants: z.array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        createdAt: z.date(),
+        updatedAt: z.date(),
+      }),
+    ),
   })
-  .meta({ id: "OnlineUsersBody" });
+  .meta({ id: "TenantListResponse" });
+
+const rotateApiKeyResponseSchema = z
+  .object({
+    apiKey: z.string().meta({
+      description:
+        "New raw API key. The previous key stops working the moment this request returns.",
+    }),
+    rotatedAt: z.string().meta({ description: "ISO-8601 timestamp" }),
+  })
+  .meta({ id: "RotateApiKeyResponse" });
+
+const rotateJwtSecretResponseSchema = z
+  .object({
+    jwtSecret: z.string().meta({
+      description:
+        "New HS256 signing secret. Every JWT signed with the old secret is invalidated immediately — coordinate the rollout with the tenant's backend.",
+    }),
+    rotatedAt: z.string(),
+  })
+  .meta({ id: "RotateJwtSecretResponse" });
+
+const meResponseSchema = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    email: z.string().nullable().optional(),
+    image: z.string().nullable().optional(),
+  })
+  .meta({ id: "MeResponse" });
 
 // ─── Path helpers ────────────────────────────────────────────
 
@@ -266,6 +279,30 @@ const sessionCookie = {
     authorization: z.string().meta({
       description:
         "`Bearer <tenant-signed user JWT>`. Tenants mint these with their `jwtSecret` (HS256). See /api/webhooks for the server-to-server counterpart.",
+    }),
+  }),
+};
+
+// Tenant backend → us. API key returned once by `POST /admin/tenants`.
+const webhookAuth = {
+  header: z.object({
+    authorization: z.string().meta({
+      description:
+        "`Bearer <tenantApiKey>` — the raw key returned once by `POST /admin/tenants`. Store in the tenant's backend secret manager; never ship to a browser.",
+    }),
+    "x-chat-signature": z.string().optional().meta({
+      description:
+        "`sha256=<hex>` of `HMAC-SHA256(apiKey, rawRequestBody)`. Required when the deploy sets `WEBHOOK_SIGNATURE_REQUIRED=true`; otherwise recommended but not enforced. When present, the server verifies unconditionally.",
+    }),
+  }),
+};
+
+// Operator → us. Master key from env, not issued by any endpoint.
+const masterKeyAuth = {
+  header: z.object({
+    authorization: z.string().meta({
+      description:
+        "`Bearer <MASTER_API_KEY>` — set in the deploy's env. Admin endpoints 403 if unset server-side. Optionally gated by `ADMIN_IP_ALLOWLIST`.",
     }),
   }),
 };
@@ -309,8 +346,7 @@ export function buildOpenApiDocument() {
       { name: "Conversations", description: "Conversation + membership CRUD" },
       { name: "Messages", description: "Messages, reactions, typing, reads" },
       { name: "Search", description: "Full-text search across messages" },
-      {
-        name: "Attachments",
+      {name: "Attachments",
         description: "S3 presigned upload + authenticated download",
       },
       { name: "Centrifugo", description: "Realtime connection + subscription tokens" },
@@ -359,9 +395,15 @@ export function buildOpenApiDocument() {
           tags: ["Webhooks"],
           summary: "Tenant pushes a user-profile update",
           description:
-            "Idempotent: tenant sends the full desired state (name, optional image + email). Server upserts the User row and broadcasts a `user_updated` realtime event to every peer sharing a conversation. Authenticated with the tenant's API key.",
+            "Idempotent: tenant sends the full desired state (name, optional image + email). Server upserts the User row and broadcasts a `user_updated` realtime event to every peer sharing a conversation. Rate-limited per tenant (100/min) and per (tenant, externalId) (10/min).",
+          requestParams: webhookAuth,
+          requestBody: jsonBody(UsersUpdatedWebhookBodySchema),
           responses: {
-            "202": { description: "Accepted, broadcast enqueued" },
+            "202": jsonResponse(
+              "Accepted, broadcast enqueued",
+              webhookAcceptedResponseSchema,
+            ),
+            "400": commonResponses.BadRequest,
             "401": commonResponses.Unauthorized,
             "429": commonResponses.TooManyRequests,
           },
@@ -373,10 +415,17 @@ export function buildOpenApiDocument() {
           tags: ["Webhooks"],
           summary: "Tenant notifies of a deleted user",
           description:
-            "Cascade-deletes the User row + every linked Conversation/Message/Attachment/etc. S3 objects are reaped asynchronously by the orphan-attachment GC. Idempotent: always 202 whether the user existed or not — retries are safe.",
+            "Cascade-deletes the User row + every linked Conversation/Message/Attachment/etc. S3 objects are reaped asynchronously by the orphan-attachment GC. Idempotent: always 202 whether the user existed or not — the `deleted` boolean in the response distinguishes \"row removed\" from \"already gone\".",
+          requestParams: webhookAuth,
+          requestBody: jsonBody(UsersDeletedWebhookBodySchema),
           responses: {
-            "202": { description: "Accepted (deleted or already gone)" },
+            "202": jsonResponse(
+              "Accepted (deleted or already gone)",
+              webhookDeletedResponseSchema,
+            ),
+            "400": commonResponses.BadRequest,
             "401": commonResponses.Unauthorized,
+            "429": commonResponses.TooManyRequests,
           },
         },
       },
@@ -387,8 +436,11 @@ export function buildOpenApiDocument() {
           summary: "Create a new tenant (MASTER_API_KEY)",
           description:
             "Returns the tenant id + a fresh API key and JWT-signing secret. Both secrets are surfaced exactly once; lost values require rotation.",
+          requestParams: masterKeyAuth,
+          requestBody: jsonBody(CreateTenantBodySchema),
           responses: {
-            "201": { description: "Tenant created" },
+            "201": jsonResponse("Tenant created", createTenantResponseSchema),
+            "400": commonResponses.BadRequest,
             "401": commonResponses.Unauthorized,
             "403": commonResponses.Forbidden,
           },
@@ -396,9 +448,58 @@ export function buildOpenApiDocument() {
         get: {
           tags: ["Admin"],
           summary: "List tenants (MASTER_API_KEY)",
+          description:
+            "Returns tenant ids, names, and timestamps. Secrets (apiKeyHash, jwtSecret) are never surfaced here — use rotation endpoints to get fresh raw values.",
+          requestParams: masterKeyAuth,
           responses: {
-            "200": { description: "Tenant list (no secrets)" },
+            "200": jsonResponse(
+              "Tenant list (no secrets)",
+              tenantListResponseSchema,
+            ),
+            "401": commonResponses.Unauthorized,
             "403": commonResponses.Forbidden,
+          },
+        },
+      },
+      "/admin/tenants/{id}/api-keys": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        post: {
+          tags: ["Admin"],
+          summary: "Rotate a tenant's API key (MASTER_API_KEY)",
+          description:
+            "Generates a new raw API key and replaces the stored hash. The previous key stops authenticating webhook calls the instant this returns — coordinate the swap with the tenant's backend.",
+          requestParams: masterKeyAuth,
+          responses: {
+            "200": jsonResponse(
+              "Rotation complete, new key surfaced once",
+              rotateApiKeyResponseSchema,
+            ),
+            "401": commonResponses.Unauthorized,
+            "403": commonResponses.Forbidden,
+            "404": commonResponses.NotFound,
+          },
+        },
+      },
+      "/admin/tenants/{id}/jwt-secret/rotate": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        post: {
+          tags: ["Admin"],
+          summary: "Rotate a tenant's JWT signing secret (MASTER_API_KEY)",
+          description:
+            "Generates a new HS256 signing secret. Every currently-issued user JWT signed with the old secret is invalidated the moment this returns — users will be 401'd on their next request until the tenant mints new tokens with the new secret.",
+          requestParams: masterKeyAuth,
+          responses: {
+            "200": jsonResponse(
+              "Rotation complete, new secret surfaced once",
+              rotateJwtSecretResponseSchema,
+            ),
+            "401": commonResponses.Unauthorized,
+            "403": commonResponses.Forbidden,
+            "404": commonResponses.NotFound,
           },
         },
       },
@@ -409,13 +510,7 @@ export function buildOpenApiDocument() {
           summary: "Search users by name or email",
           requestParams: {
             ...sessionCookie,
-            query: z.object({
-              q: z
-                .string()
-                .min(2)
-                .max(64)
-                .meta({ description: "Search query (2–64 chars)." }),
-            }),
+            query: UserSearchQuerySchema,
           },
           responses: {
             "200": jsonResponse(
@@ -433,13 +528,26 @@ export function buildOpenApiDocument() {
           tags: ["Users"],
           summary: "Batch presence lookup",
           requestParams: sessionCookie,
-          requestBody: jsonBody(onlineUsersBodySchema),
+          requestBody: jsonBody(OnlineUsersBodySchema),
           responses: {
             "200": jsonResponse(
               "Subset of supplied ids currently online",
               z.object({ online: z.array(z.string()) }),
             ),
             "400": commonResponses.BadRequest,
+            "401": commonResponses.Unauthorized,
+          },
+        },
+      },
+      "/users/me": {
+        delete: {
+          tags: ["Users"],
+          summary: "Delete my account (GDPR right to be forgotten)",
+          description:
+            "Cascade-deletes the authenticated user and every row FK'd to them (conversation memberships, messages sent, reactions, push subscriptions). S3 attachment bytes are reaped asynchronously by the orphan-attachment GC so response time is independent of upload history size. The tenant backend must also stop minting JWTs for this externalId.",
+          requestParams: sessionCookie,
+          responses: {
+            "200": jsonResponse("Account deleted", okSchema),
             "401": commonResponses.Unauthorized,
           },
         },
@@ -482,18 +590,7 @@ export function buildOpenApiDocument() {
           summary: "List conversations (paginated)",
           requestParams: {
             ...sessionCookie,
-            query: z.object({
-              limit: z.coerce
-                .number()
-                .int()
-                .positive()
-                .max(100)
-                .optional(),
-              before: z.string().optional().meta({
-                description:
-                  "ISO timestamp cursor — only conversations older than this.",
-              }),
-            }),
+            query: ListConversationsQuerySchema,
           },
           responses: {
             "200": jsonResponse(
@@ -507,7 +604,7 @@ export function buildOpenApiDocument() {
           tags: ["Conversations"],
           summary: "Create conversation",
           requestParams: sessionCookie,
-          requestBody: jsonBody(createConversationBodySchema),
+          requestBody: jsonBody(CreateConversationBodySchema),
           responses: {
             "201": jsonResponse(
               "Conversation created",
@@ -540,7 +637,7 @@ export function buildOpenApiDocument() {
           tags: ["Conversations"],
           summary: "Rename group",
           requestParams: sessionCookie,
-          requestBody: jsonBody(renameConversationBodySchema),
+          requestBody: jsonBody(RenameConversationBodySchema),
           responses: {
             "200": jsonResponse("Updated conversation", conversationWithMetaSchema),
             "400": commonResponses.BadRequest,
@@ -558,7 +655,7 @@ export function buildOpenApiDocument() {
           tags: ["Conversations"],
           summary: "Add members (promotes a direct chat to a group when expanding)",
           requestParams: sessionCookie,
-          requestBody: jsonBody(addMembersBodySchema),
+          requestBody: jsonBody(AddMembersBodySchema),
           responses: {
             "200": jsonResponse(
               "Add result",
@@ -600,19 +697,7 @@ export function buildOpenApiDocument() {
           summary: "List messages (paginated)",
           requestParams: {
             ...sessionCookie,
-            query: z.object({
-              limit: z.coerce
-                .number()
-                .int()
-                .positive()
-                .max(100)
-                .optional(),
-              before: z.string().optional(),
-              anchor: z.string().optional().meta({
-                description:
-                  "Message id to center the page on (jump-to-message flow).",
-              }),
-            }),
+            query: ListMessagesQuerySchema,
           },
           responses: {
             "200": jsonResponse(
@@ -640,7 +725,7 @@ export function buildOpenApiDocument() {
           description:
             "Accepts a canonicalized Tiptap JSON doc. The server rejects anything that isn't structural JSON and rewrites mention labels to the canonical DB name before persisting.",
           requestParams: sessionCookie,
-          requestBody: jsonBody(sendMessageBodySchema),
+          requestBody: jsonBody(SendMessageBodySchema),
           responses: {
             "201": jsonResponse("Created", messageWithRelationsSchema),
             "200": jsonResponse(
@@ -667,7 +752,7 @@ export function buildOpenApiDocument() {
           tags: ["Messages"],
           summary: "Edit message",
           requestParams: sessionCookie,
-          requestBody: jsonBody(editMessageBodySchema),
+          requestBody: jsonBody(EditMessageBodySchema),
           responses: {
             "200": jsonResponse("Edited message", messageWithRelationsSchema),
             "400": commonResponses.BadRequest,
@@ -699,7 +784,7 @@ export function buildOpenApiDocument() {
           tags: ["Messages"],
           summary: "Add reaction",
           requestParams: sessionCookie,
-          requestBody: jsonBody(reactionBodySchema),
+          requestBody: jsonBody(ReactionBodySchema),
           responses: {
             "201": jsonResponse(
               "Reaction added (idempotent upsert)",
@@ -749,7 +834,7 @@ export function buildOpenApiDocument() {
           tags: ["Messages"],
           summary: "Mark conversation as read",
           requestParams: sessionCookie,
-          requestBody: jsonBody(markReadBodySchema),
+          requestBody: jsonBody(MarkReadBodySchema),
           responses: {
             "200": jsonResponse("Marked", okSchema),
             "400": commonResponses.BadRequest,
@@ -766,7 +851,7 @@ export function buildOpenApiDocument() {
           tags: ["Messages"],
           summary: "Mute / unmute conversation",
           requestParams: sessionCookie,
-          requestBody: jsonBody(muteBodySchema),
+          requestBody: jsonBody(MuteBodySchema),
           responses: {
             "200": jsonResponse(
               "Updated mute state",
@@ -804,7 +889,7 @@ export function buildOpenApiDocument() {
           summary: "Search within a single conversation",
           requestParams: {
             ...sessionCookie,
-            query: z.object({ q: z.string().min(2).max(128) }),
+            query: SearchQuerySchema,
           },
           responses: {
             "200": jsonResponse(
@@ -823,7 +908,7 @@ export function buildOpenApiDocument() {
           summary: "Global search across all user's conversations",
           requestParams: {
             ...sessionCookie,
-            query: z.object({ q: z.string().min(2).max(128) }),
+            query: SearchQuerySchema,
           },
           responses: {
             "200": jsonResponse(
@@ -843,7 +928,7 @@ export function buildOpenApiDocument() {
           description:
             "Client sends file metadata; server allocates an attachment row, presigns a PUT URL, and returns both so the client uploads directly to S3 — the app server never handles attachment bytes.",
           requestParams: sessionCookie,
-          requestBody: jsonBody(uploadUrlBodySchema),
+          requestBody: jsonBody(UploadUrlBodySchema),
           responses: {
             "201": jsonResponse("Presigned URL minted", uploadUrlResponseSchema),
             "400": commonResponses.BadRequest,
@@ -901,7 +986,7 @@ export function buildOpenApiDocument() {
           description:
             "Only `presence:conv_{id}` channels are gated through this endpoint — the user's own `user:{userId}` channel is auto-subscribed via the connection token.",
           requestParams: sessionCookie,
-          requestBody: jsonBody(subscriptionTokenBodySchema),
+          requestBody: jsonBody(SubscriptionTokenBodySchema),
           responses: {
             "200": jsonResponse("JWT", connectionTokenResponseSchema),
             "400": commonResponses.BadRequest,
@@ -934,7 +1019,7 @@ export function buildOpenApiDocument() {
           tags: ["Push"],
           summary: "Register a Push subscription for this browser",
           requestParams: sessionCookie,
-          requestBody: jsonBody(pushSubscribeBodySchema),
+          requestBody: jsonBody(PushSubscribeBodySchema),
           responses: {
             "200": jsonResponse("Subscribed", okSchema),
             "400": commonResponses.BadRequest,
@@ -951,11 +1036,7 @@ export function buildOpenApiDocument() {
           tags: ["Push"],
           summary: "Unregister a Push subscription",
           requestParams: sessionCookie,
-          requestBody: jsonBody(
-            z.object({ endpoint: z.string().url() }).meta({
-              id: "PushUnsubscribeBody",
-            }),
-          ),
+          requestBody: jsonBody(PushUnsubscribeBodySchema),
           responses: {
             "200": jsonResponse("Unsubscribed", okSchema),
             "400": commonResponses.BadRequest,
@@ -964,6 +1045,19 @@ export function buildOpenApiDocument() {
         },
       },
 
+      "/me": {
+        get: {
+          tags: ["Users"],
+          summary: "Get the authenticated user's server-internal profile",
+          description:
+            "Returns the user's internal UUID (not the tenant's `externalId`) plus name, email, and image. Reference clients call this once after mint-token to resolve the internal id that flows through `senderId`, Centrifugo channels, and conversation members.",
+          requestParams: sessionCookie,
+          responses: {
+            "200": jsonResponse("Authenticated user profile", meResponseSchema),
+            "401": commonResponses.Unauthorized,
+          },
+        },
+      },
       "/me/active": {
         post: {
           tags: ["Users"],

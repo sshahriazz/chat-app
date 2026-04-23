@@ -1,7 +1,6 @@
 import { Router } from "express";
-import { z } from "zod";
-import "zod-openapi";
 import { validate } from "../http/validate";
+import { CreateTenantBodySchema } from "../http/schemas";
 import { requireMasterKey } from "../middleware/require-master-key";
 import { createTenant, rotateApiKey, rotateJwtSecret } from "../lib/tenant";
 import { NotFoundError } from "../http/errors";
@@ -18,12 +17,6 @@ import { prisma } from "../db";
 const router: Router = Router();
 
 router.use(requireMasterKey);
-
-const CreateTenantBodySchema = z
-  .object({
-    name: z.string().min(1).max(128),
-  })
-  .meta({ id: "CreateTenantBody" });
 
 // POST /api/admin/tenants
 router.post(

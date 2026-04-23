@@ -1,7 +1,9 @@
 import { Router } from "express";
-import { z } from "zod";
-import "zod-openapi";
 import { validate } from "../http/validate";
+import {
+  UsersDeletedWebhookBodySchema,
+  UsersUpdatedWebhookBodySchema,
+} from "../http/schemas";
 import {
   requireApiKey,
   type ApiKeyAuthenticatedRequest,
@@ -53,23 +55,6 @@ const userBucket = rateLimit({
       (redis.call as any)(...args),
   }),
 });
-
-// ─── Schemas ─────────────────────────────────────────────────
-
-export const UsersUpdatedWebhookBodySchema = z
-  .object({
-    externalId: z.string().min(1).max(256),
-    name: z.string().min(1).max(128),
-    image: z.string().url().max(2048).nullable().optional(),
-    email: z.string().email().max(254).nullable().optional(),
-  })
-  .meta({ id: "UsersUpdatedWebhookBody" });
-
-export const UsersDeletedWebhookBodySchema = z
-  .object({
-    externalId: z.string().min(1).max(256),
-  })
-  .meta({ id: "UsersDeletedWebhookBody" });
 
 // ─── POST /api/webhooks/users.updated ────────────────────────
 //

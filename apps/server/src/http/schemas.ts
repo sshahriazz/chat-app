@@ -199,3 +199,26 @@ export const PushSubscribeBodySchema = z
 export const PushUnsubscribeBodySchema = z
   .object({ endpoint: z.string().url().max(1024) })
   .meta({ id: "PushUnsubscribeBody" });
+
+// ─── Webhooks (tenant → us) ──────────────────────────────────
+
+export const UsersUpdatedWebhookBodySchema = z
+  .object({
+    externalId: z.string().min(1).max(256),
+    name: z.string().min(1).max(128),
+    image: z.string().url().max(2048).nullable().optional(),
+    email: z.string().email().max(254).nullable().optional(),
+  })
+  .meta({ id: "UsersUpdatedWebhookBody" });
+
+export const UsersDeletedWebhookBodySchema = z
+  .object({
+    externalId: z.string().min(1).max(256),
+  })
+  .meta({ id: "UsersDeletedWebhookBody" });
+
+// ─── Admin (operator → us, MASTER_API_KEY) ───────────────────
+
+export const CreateTenantBodySchema = z
+  .object({ name: z.string().min(1).max(128) })
+  .meta({ id: "CreateTenantBody" });
