@@ -93,9 +93,13 @@ async function mintToken(input: {
     tenantId: input.tenantId,
     externalId: input.externalId,
     name: input.name,
-    email: input.email,
-    image: input.image,
   };
+  // Optional fields: the server's Zod schema validates `email` strictly,
+  // so sending "" trips VALIDATION_ERROR. Send only when non-empty;
+  // leave absent otherwise (undefined = omit from payload).
+  if (input.email && input.email.length > 0) payload.email = input.email;
+  if (input.image !== undefined && input.image !== null)
+    payload.image = input.image;
   // Only send `scope` when the caller explicitly supplied it — `undefined`
   // tells the server "leave existing scope alone," while an explicit
   // `null` promotes the user to tenant-wide.
