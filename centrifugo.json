@@ -35,20 +35,5 @@
         "allow_presence_for_subscriber": true
       }
     ]
-  },
-  "consumers": [
-    {
-      "name": "postgresql",
-      "type": "postgresql",
-      "postgresql": {
-        "dsn": "postgres://chatapp:chatapp@postgres:5432/chatapp",
-        "outbox_table_name": "chat_outbox",
-        "num_partitions": 1,
-        "partition_select_limit": 100,
-        "partition_poll_interval": "300ms",
-        "partition_notification_channel": "centrifugo_partition_change"
-      },
-      "enabled": true
-    }
-  ]
+  }
 }

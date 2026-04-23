@@ -82,6 +82,14 @@ services:
       # Falls back to BETTER_AUTH_URL for the same reason as the server's
       # CORS allowlist.
       CENTRIFUGO_CLIENT_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-${BETTER_AUTH_URL:-http://localhost:3000}}
+      # Postgres consumer — picks outbox rows off the chat_outbox table
+      # and publishes to the matching channels. DSN built from the same
+      # POSTGRES_* vars the server uses; sslmode=disable skips the
+      # useless TLS negotiation attempt on the internal compose network.
+      # Centrifugo 6 treats CENTRIFUGO_CONSUMERS as a JSON-encoded
+      # override of the top-level `consumers` array — this wins over any
+      # definition in centrifugo.json.
+      CENTRIFUGO_CONSUMERS: '[{"name":"postgresql","type":"postgresql","enabled":true,"postgresql":{"dsn":"postgres://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}?sslmode=disable","outbox_table_name":"chat_outbox","num_partitions":1,"partition_select_limit":100,"partition_poll_interval":"300ms","partition_notification_channel":"centrifugo_partition_change"}}]'
     depends_on:
       postgres:
         condition: service_healthy
