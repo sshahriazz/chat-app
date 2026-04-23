@@ -170,9 +170,13 @@ if (isProduction) {
     process.exit(1);
   }
   const dbUrl = env.DATABASE_URL;
-  if (/:chatapp@/.test(dbUrl) || /\/\/chatapp:/.test(dbUrl)) {
+  // Only fail on the EXACT dev-default `chatapp:chatapp` pair — using
+  // `chatapp` as the username with a strong rotated password is fine,
+  // and penalising that combination just makes production redeploys
+  // painful when the PG volume was initialised with the legacy user.
+  if (/\/\/chatapp:chatapp@/.test(dbUrl)) {
     console.error(
-      "[env] refusing to boot: DATABASE_URL appears to use the dev-default `chatapp` credentials.",
+      "[env] refusing to boot: DATABASE_URL is using the dev-default `chatapp:chatapp` credentials. Rotate POSTGRES_PASSWORD.",
     );
     process.exit(1);
   }
