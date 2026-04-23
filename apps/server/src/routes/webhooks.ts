@@ -108,8 +108,9 @@ router.post(
 //
 // Cascade-deletes the user + everything FK'd to them. S3 objects are
 // reaped by the orphan-attachment GC (async) so this response is fast
-// regardless of history size. 202 if the user existed, 404 if not —
-// either is idempotent: retries land the same result.
+// regardless of history size. Always 202 — whether we deleted a row
+// or the user was already gone, the end state matches what the tenant
+// asked for, so retries are safe.
 
 router.post(
   "/users.deleted",
@@ -122,7 +123,7 @@ router.post(
     const { tenantId } = req as ApiKeyAuthenticatedRequest;
     const { externalId } = req.body as { externalId: string };
     const result = await deleteFederatedUser(tenantId, externalId);
-    res.status(result.deleted ? 202 : 404).json({ deleted: result.deleted });
+    res.status(202).json({ deleted: result.deleted });
   },
 );
 

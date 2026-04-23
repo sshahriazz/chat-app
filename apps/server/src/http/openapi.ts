@@ -373,10 +373,9 @@ export function buildOpenApiDocument() {
           tags: ["Webhooks"],
           summary: "Tenant notifies of a deleted user",
           description:
-            "Cascade-deletes the User row + every linked Conversation/Message/Attachment/etc. S3 objects are reaped asynchronously by the orphan-attachment GC.",
+            "Cascade-deletes the User row + every linked Conversation/Message/Attachment/etc. S3 objects are reaped asynchronously by the orphan-attachment GC. Idempotent: always 202 whether the user existed or not — retries are safe.",
           responses: {
-            "202": { description: "Deleted" },
-            "404": commonResponses.NotFound,
+            "202": { description: "Accepted (deleted or already gone)" },
             "401": commonResponses.Unauthorized,
           },
         },
