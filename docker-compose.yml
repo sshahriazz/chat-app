@@ -150,7 +150,7 @@ services:
       migrate:
         condition: service_completed_successfully
     environment:
-      NODE_ENV: production
+      NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
       TZ: UTC
       DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
@@ -237,7 +237,7 @@ services:
       server:
         condition: service_healthy
     environment:
-      NODE_ENV: production
+      NODE_ENV: ${NODE_ENV:-production}
       PORT: 3000
       HOSTNAME: 0.0.0.0
     ports:
