@@ -175,6 +175,11 @@ services:
       # Tenancy admin gate. Unset → admin endpoints return 403.
       # Rotate in Dokploy env when bootstrapping real tenants.
       MASTER_API_KEY: ${MASTER_API_KEY:-}
+      # Base URL that Scalar's "Try it" prepends to every OpenAPI path.
+      # Unset → falls back to `${PUBLIC_URL}/api`. Set to
+      # `https://<host>/chat-api` when deploying behind a strip-prefix
+      # ingress so the docs' Try-It buttons hit the right URL.
+      OPENAPI_SERVER_URL: ${OPENAPI_SERVER_URL:-}
       # Optional comma-separated CIDR / IP list. When set, `/api/admin/*`
       # requests from outside this list are rejected with 403 even if
       # they present a valid MASTER_API_KEY. Defense-in-depth against

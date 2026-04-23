@@ -1,6 +1,26 @@
 import { z } from "zod";
 import { createDocument, type ZodOpenApiObject } from "zod-openapi";
-import { publicUrl } from "../env";
+import { env, publicUrl } from "../env";
+
+/**
+ * Resolve the base URL Scalar's "Try it" prepends to every path.
+ * Every spec path starts with `/` (no `/api/` prefix) so the operator
+ * controls whether the final URL goes through a path-prefixed ingress
+ * (`/chat-api`) or directly to the API mount (`/api`).
+ *
+ *   1. `OPENAPI_SERVER_URL` — explicit per-deploy override.
+ *   2. `${publicUrl}/api` — default for deploys where the API is at
+ *      the same origin as the web, under `/api/*`.
+ *   3. `http://localhost:3001/api` — local dev fallback.
+ *
+ * Dokploy `/chat-api` strip-prefix deploys set
+ * `OPENAPI_SERVER_URL=https://chat.example.com/chat-api`.
+ */
+function resolveOpenApiServerUrl(): string {
+  if (env.OPENAPI_SERVER_URL) return env.OPENAPI_SERVER_URL;
+  if (publicUrl) return `${publicUrl.replace(/\/$/, "")}/api`;
+  return "http://localhost:3001/api";
+}
 import {
   MessageModelSchema,
   ConversationModelSchema,
@@ -274,8 +294,11 @@ export function buildOpenApiDocument() {
     },
     servers: [
       {
-        url: publicUrl ?? "http://localhost:3001",
-        description: "Current deployment",
+        url: resolveOpenApiServerUrl(),
+        description:
+          "Current deployment. Paths in this spec are mount-relative " +
+          "(no leading /api) — the server URL above encodes the public " +
+          "prefix (e.g. /api, /chat-api) for the active deploy.",
       },
     ],
     tags: [
@@ -331,7 +354,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/webhooks/users.updated": {
+      "/webhooks/users.updated": {
         post: {
           tags: ["Webhooks"],
           summary: "Tenant pushes a user-profile update",
@@ -345,7 +368,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/webhooks/users.deleted": {
+      "/webhooks/users.deleted": {
         post: {
           tags: ["Webhooks"],
           summary: "Tenant notifies of a deleted user",
@@ -359,7 +382,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/admin/tenants": {
+      "/admin/tenants": {
         post: {
           tags: ["Admin"],
           summary: "Create a new tenant (MASTER_API_KEY)",
@@ -381,7 +404,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/users/search": {
+      "/users/search": {
         get: {
           tags: ["Users"],
           summary: "Search users by name or email",
@@ -406,7 +429,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/users/online": {
+      "/users/online": {
         post: {
           tags: ["Users"],
           summary: "Batch presence lookup",
@@ -423,7 +446,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/init": {
+      "/init": {
         get: {
           tags: ["Conversations"],
           summary: "Single boot call — conversations + centrifugo token",
@@ -454,7 +477,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations": {
+      "/conversations": {
         get: {
           tags: ["Conversations"],
           summary: "List conversations (paginated)",
@@ -500,7 +523,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}": {
+      "/conversations/{id}": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -528,7 +551,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/members": {
+      "/conversations/{id}/members": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -551,7 +574,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/members/{userId}": {
+      "/conversations/{id}/members/{userId}": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
           { name: "userId", in: "path", required: true, schema: { type: "string" } },
@@ -569,7 +592,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/conversations/{id}/messages": {
+      "/conversations/{id}/messages": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -636,7 +659,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/messages/{messageId}": {
+      "/conversations/{id}/messages/{messageId}": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
           { name: "messageId", in: "path", required: true, schema: { type: "string" } },
@@ -668,7 +691,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/messages/{messageId}/reactions": {
+      "/conversations/{id}/messages/{messageId}/reactions": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
           { name: "messageId", in: "path", required: true, schema: { type: "string" } },
@@ -695,7 +718,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/messages/{messageId}/reactions/{emoji}": {
+      "/conversations/{id}/messages/{messageId}/reactions/{emoji}": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
           { name: "messageId", in: "path", required: true, schema: { type: "string" } },
@@ -719,7 +742,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/read": {
+      "/conversations/{id}/read": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -736,7 +759,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/mute": {
+      "/conversations/{id}/mute": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -756,7 +779,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/conversations/{id}/typing": {
+      "/conversations/{id}/typing": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -773,7 +796,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/conversations/{id}/search": {
+      "/conversations/{id}/search": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -795,7 +818,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/search": {
+      "/search": {
         get: {
           tags: ["Search"],
           summary: "Global search across all user's conversations",
@@ -814,7 +837,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/attachments/upload-url": {
+      "/attachments/upload-url": {
         post: {
           tags: ["Attachments"],
           summary: "Mint a presigned S3 upload URL",
@@ -838,7 +861,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/attachments/{id}/download": {
+      "/attachments/{id}/download": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
@@ -859,7 +882,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/centrifugo/connection-token": {
+      "/centrifugo/connection-token": {
         post: {
           tags: ["Centrifugo"],
           summary: "Mint a Centrifugo connection JWT",
@@ -872,7 +895,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/centrifugo/subscription-token": {
+      "/centrifugo/subscription-token": {
         post: {
           tags: ["Centrifugo"],
           summary: "Mint a subscription JWT for a presence channel",
@@ -889,7 +912,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/push/vapid-public-key": {
+      "/push/vapid-public-key": {
         get: {
           tags: ["Push"],
           summary: "Fetch VAPID public key",
@@ -907,7 +930,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/push/subscribe": {
+      "/push/subscribe": {
         post: {
           tags: ["Push"],
           summary: "Register a Push subscription for this browser",
@@ -924,7 +947,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/push/unsubscribe": {
+      "/push/unsubscribe": {
         post: {
           tags: ["Push"],
           summary: "Unregister a Push subscription",
@@ -942,7 +965,7 @@ export function buildOpenApiDocument() {
         },
       },
 
-      "/api/me/active": {
+      "/me/active": {
         post: {
           tags: ["Users"],
           summary: "Heartbeat — bump `lastActiveAt` for presence",
@@ -953,7 +976,7 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      "/api/me/broadcast-profile": {
+      "/me/broadcast-profile": {
         post: {
           tags: ["Users"],
           summary: "Broadcast profile change to peers",

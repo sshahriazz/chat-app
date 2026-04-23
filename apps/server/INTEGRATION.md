@@ -399,6 +399,18 @@ Full interactive playground: **`https://chat.technext.it/chat-api/docs`**.
 
 Every authenticated endpoint requires `Authorization: Bearer <jwt>`.
 
+### Path conventions in this doc
+
+Paths below are **mount-relative** — they don't include a leading `/api` or `/chat-api`. The actual base URL depends on how the operator exposed the API:
+
+| Deploy shape | Base URL |
+|---|---|
+| Direct to the server container | `http://host:3001/api` |
+| Same-origin Next.js proxy | `https://host/api` |
+| Path-prefix ingress (Dokploy + Traefik) | `https://host/chat-api` |
+
+Concatenate: `baseURL + /me` → `https://chat.technext.it/chat-api/me` in prod, `http://localhost:3001/api/me` locally. The OpenAPI spec's `servers[0].url` reflects the active deploy's base URL — set the operator's `OPENAPI_SERVER_URL` env to match.
+
 ### Identity
 
 | Method | Path | Purpose |

@@ -26,6 +26,22 @@ const EnvSchema = z.object({
   // via an alias below.
   PUBLIC_URL: z.string().url().optional(),
   BETTER_AUTH_URL: z.string().url().optional(),
+  // Overrides the server URL shown in the OpenAPI document (and used
+  // as the base for Scalar's "Try it" buttons). Set per-deployment to
+  // match however the API is publicly reached:
+  //   - direct docker: http://localhost:3001/api
+  //   - Dokploy with /chat-api strip-prefix: https://chat.example/chat-api
+  //   - api.example.com subdomain: https://api.example.com/api
+  // Defaults to `${publicUrl}/api` or `http://localhost:3001/api`.
+  OPENAPI_SERVER_URL: z
+    .preprocess(
+      // `${X:-}` in compose expands to "" when the var is unset; Zod's
+      // URL validator rejects "". Treat empty strings as absent so the
+      // resolver can fall back to the default.
+      (v) => (typeof v === "string" && v.trim() === "" ? undefined : v),
+      z.string().url().optional(),
+    )
+    .optional(),
   CENTRIFUGO_API_KEY: z.string().min(1),
   CENTRIFUGO_TOKEN_SECRET: z.string().min(1),
   CENTRIFUGO_URL: z.url(),
