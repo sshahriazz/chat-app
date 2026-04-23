@@ -26,10 +26,11 @@ import { ChatProvider, useChat } from "@/context/ChatContext";
 import { ConversationList } from "@/components/sidebar/ConversationList";
 import { ChatView } from "@/components/chat/ChatView";
 import { GlobalSearchSpotlight } from "@/components/search/GlobalSearchSpotlight";
+import { TenantBadge } from "@/components/layout/TenantBadge";
 
 function AppContent() {
   const { user, signOut } = useAuth();
-  const { setActiveConversation, activeConversationId } = useChat();
+  const { setActiveConversation } = useChat();
   const { setColorScheme } = useMantineColorScheme();
   const computedColorScheme = useComputedColorScheme("light");
   const [navbarOpen, { toggle: toggleNavbar, close: closeNavbar }] =
@@ -62,6 +63,7 @@ function AppContent() {
             <Text fw={700} size="lg">
               Chat App
             </Text>
+            <TenantBadge />
           </Group>
           <Group gap="xs">
             <ActionIcon

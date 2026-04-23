@@ -1,11 +1,15 @@
+import crypto from "node:crypto";
 import { Router } from "express";
+import argon2 from "argon2";
 import { z } from "zod";
 import "zod-openapi";
 import { validate } from "../http/validate";
 import { env } from "../env";
 import { ForbiddenError, NotFoundError } from "../http/errors";
 import { mintUserToken } from "../http/jwt-tenant";
-import { getTenantById } from "../lib/tenant";
+import { getTenantById, wrapSecret } from "../lib/tenant";
+import { prisma } from "../db";
+import { DEMO_TENANTS } from "../lib/demo-personas";
 
 /**
  * Dev-only helper: mint a tenant-signed user JWT using the target
@@ -98,8 +102,60 @@ router.post(
       externalId: body.externalId,
       expiresIn: body.ttlSeconds ?? 3600,
     });
-    
+
   },
 );
+
+// ─── Demo personas + seed ─────────────────────────────────────
+//
+// The reference web client ships a persona-picker sign-in screen that
+// demonstrates tenant + scope isolation end-to-end. These two routes
+// back it:
+//
+//   GET  /api/dev/personas    → list the pre-defined demo personas
+//   POST /api/dev/seed-demo   → idempotently create the backing
+//                               Tenant rows so /mint-token can sign
+//                               tokens for them.
+//
+// The demo tenants carry random apiKey/jwtSecret values — nobody
+// actually uses the apiKey side (no webhook flows in the demo) and
+// the JWT flow only needs jwtSecret server-side. We never surface
+// these values to the client; persona login goes through mint-token
+// which reads them internally.
+
+const ARGON2_OPTS = {
+  type: argon2.argon2id,
+  memoryCost: 19456,
+  timeCost: 2,
+  parallelism: 1,
+} as const;
+
+router.get("/personas", (_req, res) => {
+  res.json({ tenants: DEMO_TENANTS });
+});
+
+router.post("/seed-demo", async (_req, res) => {
+  const results: Array<{ tenantId: string; created: boolean }> = [];
+  for (const t of DEMO_TENANTS) {
+    const existing = await prisma.tenant.findUnique({ where: { id: t.tenantId } });
+    if (existing) {
+      results.push({ tenantId: t.tenantId, created: false });
+      continue;
+    }
+    const rawApiKey = crypto.randomBytes(32).toString("base64url");
+    const rawJwtSecret = crypto.randomBytes(32).toString("base64url");
+    await prisma.tenant.create({
+      data: {
+        id: t.tenantId,
+        name: t.tenantLabel,
+        apiKeyHash: await argon2.hash(rawApiKey, ARGON2_OPTS),
+        apiKeyPrefix: rawApiKey.slice(0, 8),
+        jwtSecret: wrapSecret(rawJwtSecret),
+      },
+    });
+    results.push({ tenantId: t.tenantId, created: true });
+  }
+  res.json({ results });
+});
 
 export default router;

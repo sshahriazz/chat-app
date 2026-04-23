@@ -53,6 +53,12 @@ interface SessionMeta {
   name: string;
   email: string;
   image?: string | null;
+  /** Optional second-level partition. Set by persona sign-in; the
+   *  email/password form leaves this unset so those users stay
+   *  tenant-wide under `default`. */
+  scope?: string | null;
+  /** Pretty tenant name for UI display. Not sent to the server. */
+  tenantLabel?: string;
 }
 
 function readSessionMeta(): SessionMeta | null {
@@ -81,11 +87,23 @@ async function mintToken(input: {
   name: string;
   email?: string;
   image?: string | null;
+  scope?: string | null;
 }): Promise<string> {
+  const payload: Record<string, unknown> = {
+    tenantId: input.tenantId,
+    externalId: input.externalId,
+    name: input.name,
+    email: input.email,
+    image: input.image,
+  };
+  // Only send `scope` when the caller explicitly supplied it — `undefined`
+  // tells the server "leave existing scope alone," while an explicit
+  // `null` promotes the user to tenant-wide.
+  if (input.scope !== undefined) payload.scope = input.scope;
   const res = await fetch(`${baseURL}/api/dev/mint-token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -122,6 +140,12 @@ async function openSession(meta: SessionMeta): Promise<SessionUser> {
     name: meta.name,
     email: meta.email,
     image: meta.image ?? null,
+    // Only forward `scope` when the meta actually has the key — same
+    // semantics as mintToken above. Re-authing on mount preserves the
+    // stored scope without clobbering it.
+    ...(Object.prototype.hasOwnProperty.call(meta, "scope")
+      ? { scope: meta.scope }
+      : {}),
   });
   setAuthToken(token);
   writeSessionMeta(meta);
@@ -179,6 +203,34 @@ function useSession(): SessionHookResult {
   return state;
 }
 
+export interface PersonaLoginInput {
+  tenantId: string;
+  tenantLabel: string;
+  externalId: string;
+  name: string;
+  image?: string | null;
+  scope?: string | null;
+}
+
+/** Public read of the current session metadata — used by the chat
+ *  header to render the tenant + scope badge. Returns null when
+ *  unauthenticated. */
+export function getSessionMeta(): {
+  tenantId: string;
+  tenantLabel: string | null;
+  externalId: string;
+  scope: string | null;
+} | null {
+  const m = readSessionMeta();
+  if (!m) return null;
+  return {
+    tenantId: m.tenantId,
+    tenantLabel: m.tenantLabel ?? null,
+    externalId: m.externalId,
+    scope: m.scope ?? null,
+  };
+}
+
 export const authClient = {
   useSession,
 
@@ -212,6 +264,39 @@ export const authClient = {
         };
       }
     },
+  },
+
+  /**
+   * Persona sign-in — used by the demo picker. Mints a token for the
+   * target tenant + scope + externalId. Unlike email/password login
+   * (which always uses tenant `default`), this flow exercises the
+   * tenant isolation + scope machinery end-to-end.
+   */
+  signInAsPersona: async (
+    input: PersonaLoginInput,
+  ): Promise<{ error: { message: string } | null }> => {
+    try {
+      // Seed demo tenants on first run — idempotent, cheap.
+      await fetch(`${baseURL}/api/dev/seed-demo`, { method: "POST" }).catch(
+        () => {
+          /* non-fatal; mint-token will 404 if tenant is missing */
+        },
+      );
+      await openSession({
+        tenantId: input.tenantId,
+        tenantLabel: input.tenantLabel,
+        externalId: input.externalId,
+        name: input.name,
+        email: "",
+        image: input.image ?? null,
+        scope: input.scope ?? null,
+      });
+      return { error: null };
+    } catch (err) {
+      return {
+        error: { message: (err as Error).message || "Sign in failed" },
+      };
+    }
   },
 
   signUp: {

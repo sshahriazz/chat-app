@@ -15,9 +15,10 @@ import {
   Button,
 } from "@mantine/core";
 import { useDebouncedValue } from "@mantine/hooks";
-import { IconSearch } from "@tabler/icons-react";
+import { IconSearch, IconShield } from "@tabler/icons-react";
 import { useEffect } from "react";
 import { api } from "@/lib/api";
+import { getSessionMeta } from "@/lib/auth-client";
 import { useChat } from "@/context/ChatContext";
 import { UserAvatar } from "@/components/common/UserAvatar";
 import type { SearchUser, Conversation } from "@/lib/types";
@@ -105,6 +106,8 @@ export function NewChatModal({ opened, onClose }: NewChatModalProps) {
           fullWidth
         />
 
+        <ScopeHint />
+
         <TextInput
           placeholder="Search users by name or email..."
           leftSection={<IconSearch size={16} />}
@@ -177,5 +180,25 @@ export function NewChatModal({ opened, onClose }: NewChatModalProps) {
         )}
       </Stack>
     </Modal>
+  );
+}
+
+/**
+ * Tells the signed-in user WHICH peers this search can return. Hidden
+ * for tenant-wide users (nothing surprising for them). For scoped
+ * users, makes the isolation rule explicit so a "where's Carlos?"
+ * question has an obvious answer.
+ */
+function ScopeHint() {
+  const meta = getSessionMeta();
+  if (!meta || meta.scope === null) return null;
+  return (
+    <Group gap={6} wrap="nowrap" c="dimmed">
+      <IconShield size={14} />
+      <Text size="xs">
+        Scoped to <code>{meta.scope}</code> — only same-scope + tenant-wide
+        users will appear.
+      </Text>
+    </Group>
   );
 }

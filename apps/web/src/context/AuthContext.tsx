@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useContext, type ReactNode } from "react";
-import { authClient } from "@/lib/auth-client";
+import { authClient, type PersonaLoginInput } from "@/lib/auth-client";
 import type { User } from "@/lib/types";
 
 interface AuthState {
@@ -9,6 +9,7 @@ interface AuthState {
   isLoading: boolean;
   signUp: (name: string, email: string, password: string) => Promise<void>;
   signIn: (email: string, password: string) => Promise<void>;
+  signInAsPersona: (persona: PersonaLoginInput) => Promise<void>;
   signOut: () => Promise<void>;
 }
 
@@ -49,6 +50,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (typeof window !== "undefined") window.location.reload();
   };
 
+  const signInAsPersona = async (persona: PersonaLoginInput) => {
+    const { error } = await authClient.signInAsPersona(persona);
+    if (error) throw new Error(error.message);
+    if (typeof window !== "undefined") window.location.reload();
+  };
+
   const signOut = async () => {
     await authClient.signOut();
     if (typeof window !== "undefined") window.location.reload();
@@ -56,7 +63,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, isLoading: isPending, signUp, signIn, signOut }}
+      value={{
+        user,
+        isLoading: isPending,
+        signUp,
+        signIn,
+        signInAsPersona,
+        signOut,
+      }}
     >
       {children}
     </AuthContext.Provider>

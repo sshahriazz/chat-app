@@ -5,6 +5,7 @@ import {
   useContext,
   useState,
   useEffect,
+  useLayoutEffect,
   useCallback,
   useMemo,
   useRef,
@@ -128,14 +129,26 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const typingTimeoutsRef = useRef<Map<string, NodeJS.Timeout>>(new Map());
   const lastTypingSentRef = useRef(0);
+  // Mirror frequently-read state into refs so stable callbacks can
+  // reach the latest value without re-binding. Writes happen in a
+  // `useEffect` (not during render) so concurrent rendering can
+  // safely replay this component without producing inconsistent refs.
   const activeConvRef = useRef(activeConversationId);
-  activeConvRef.current = activeConversationId;
   const conversationsRef = useRef(conversations);
-  conversationsRef.current = conversations;
   const userRef = useRef(user);
-  userRef.current = user;
   const messagesRef = useRef(messages);
-  messagesRef.current = messages;
+  useEffect(() => {
+    activeConvRef.current = activeConversationId;
+  }, [activeConversationId]);
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
   // Highest seq we've seen for the currently-open conversation. A gap in
   // incoming seq values means we missed a message and need to refetch.
   const lastSeqActiveRef = useRef<number>(0);
@@ -594,14 +607,35 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   // setMessages([]) + refetch). With `force_recovery: true` set on the
   // `user` namespace in centrifugo.json, the broker replays any missed
   // events on reconnect, so there's nothing for us to re-pull over HTTP.
+  // Reset derived UI state synchronously when the active conversation
+  // changes. React's "adjust state while rendering" pattern
+  // (https://react.dev/learn/you-might-not-need-an-effect) — the new
+  // conversation paints with cleared state on the first render,
+  // without the cascading re-render that a setState-in-effect would
+  // cause. The fetch + ref bookkeeping below still runs in useEffect
+  // because it's an actual side effect.
+  const [prevActiveConvId, setPrevActiveConvId] = useState(activeConversationId);
+  if (prevActiveConvId !== activeConversationId) {
+    setPrevActiveConvId(activeConversationId);
+    if (activeConversationId) {
+      setIsLoadingMessages(true);
+      setMessages([]);
+      setReadPositions([]);
+      setTypingUsers([]);
+      setUnreadAnchorId(null);
+      setActiveUserIds(new Set());
+      // Opening a conversation implies the sidebar should stop showing
+      // unread count for it. The actual markAsRead HTTP call fires
+      // later from the message list; this is just visual catch-up.
+      const openedId = activeConversationId;
+      setConversations((prev) =>
+        prev.map((c) => (c.id === openedId ? { ...c, unreadCount: 0 } : c)),
+      );
+    }
+  }
+
   useEffect(() => {
     if (!activeConversationId || !user) return;
-
-    setIsLoadingMessages(true);
-    setMessages([]);
-    setReadPositions([]);
-    setTypingUsers([]);
-    setUnreadAnchorId(null);
 
     lastSeqActiveRef.current = 0;
 
@@ -636,10 +670,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => setIsLoadingMessages(false));
 
-    setConversations((prev) =>
-      prev.map((c) => (c.id === activeConversationId ? { ...c, unreadCount: 0 } : c)),
-    );
-
     api.post("/api/me/active").catch(() => {});
   }, [activeConversationId, user]);
 
@@ -647,10 +677,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   //
   // Re-runs on conversation change AND on WS reconnect, but only touches
   // `activeUserIds` (+ typing timeout cleanup). Message state is untouched.
+  // The initial `setActiveUserIds(new Set())` reset is handled in the
+  // adjust-during-render block above so this effect stays pure-side-effect.
   useEffect(() => {
     if (!activeConversationId || !centrifugoReady) return;
-
-    setActiveUserIds(new Set());
 
     centrifugo.subscribePresence(activeConversationId, {
       getToken: async (channel) => {
@@ -1035,28 +1065,33 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setActiveConversationId(id);
   }, []);
 
-  // Latest-handler ref. Assigned during render so children render after us
-  // always see up-to-date implementations via the proxy below.
+  // Latest-handler ref. Written in a layout effect — not during render
+  // — so concurrent rendering can replay this component without
+  // leaving stale implementations visible to children. `useLayoutEffect`
+  // (rather than `useEffect`) guarantees children that mount after us
+  // see the fresh handlers synchronously on their first render.
   const actionsRef = useRef<ChatActions | null>(null);
-  actionsRef.current = {
-    sendMessage,
-    retrySendMessage,
-    editMessage,
-    deleteMessage,
-    loadMoreMessages,
-    jumpToMessage,
-    sendTyping,
-    markAsRead,
-    toggleReaction,
-    muteConversation,
-    renameGroup,
-    addMembers,
-    removeMember,
-    leaveGroup,
-    refreshConversations,
-    setActiveConversation,
-    loadMoreConversations,
-  };
+  useLayoutEffect(() => {
+    actionsRef.current = {
+      sendMessage,
+      retrySendMessage,
+      editMessage,
+      deleteMessage,
+      loadMoreMessages,
+      jumpToMessage,
+      sendTyping,
+      markAsRead,
+      toggleReaction,
+      muteConversation,
+      renameGroup,
+      addMembers,
+      removeMember,
+      leaveGroup,
+      refreshConversations,
+      setActiveConversation,
+      loadMoreConversations,
+    };
+  });
 
   // Frozen proxy object — its identity never changes, so consumers of
   // `useChatActions()` don't re-render on state churn. Each method reads
