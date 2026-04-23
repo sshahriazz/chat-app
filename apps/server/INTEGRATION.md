@@ -240,6 +240,42 @@ curl -X POST https://chat.technext.it/chat-api/webhooks/users.deleted \
 
 Response: `202` if the user existed, `404` if not. Both are safe to retry.
 
+### Request signing (recommended)
+
+Webhooks are authenticated by `Authorization: Bearer <apiKey>`. For extra safety, include an HMAC signature so a leaked key alone isn't enough to forge requests — the attacker also needs the ability to sign.
+
+Compute `HMAC-SHA256(apiKey, rawRequestBody)` and send it hex-encoded in a header:
+
+```
+X-Chat-Signature: sha256=<hex>
+```
+
+The server verifies the signature whenever the header is present. If the operator sets `WEBHOOK_SIGNATURE_REQUIRED=true`, every webhook call **must** include a valid signature or it returns `401`.
+
+#### Node.js example
+
+```ts
+import crypto from "node:crypto";
+
+const body = JSON.stringify({ externalId: "user_42", name: "Alice" });
+const signature = crypto
+  .createHmac("sha256", process.env.CHAT_API_KEY!)
+  .update(body)
+  .digest("hex");
+
+await fetch("https://chat.technext.it/chat-api/webhooks/users.updated", {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${process.env.CHAT_API_KEY}`,
+    "Content-Type": "application/json",
+    "X-Chat-Signature": `sha256=${signature}`,
+  },
+  body,
+});
+```
+
+The signature is computed over the **raw body bytes you send**, not a pretty-printed / re-serialized version — use the exact string you pass to `fetch`.
+
 ### Rate limits
 
 - 100 req/min per tenant — blocks a compromised key from flooding events.
@@ -396,6 +432,8 @@ Per-user quota: 5 GB by default.
 | `400 One or more userIds are invalid` on add-member | You passed a userId that belongs to a different tenant (or doesn't exist). |
 | `403 Forbidden` on admin endpoint | Missing / wrong `MASTER_API_KEY`. Talk to the operator. |
 | `429 Too Many Requests` on webhooks | Hit the per-tenant 100/min or per-user 10/min bucket. Debounce your updates. |
+| `401 Missing X-Chat-Signature` on webhooks | The operator has set `WEBHOOK_SIGNATURE_REQUIRED=true`. Sign the body with `HMAC-SHA256(apiKey, rawBody)`. |
+| `401 Invalid X-Chat-Signature` | Signature doesn't match. Common causes: signed a pretty-printed version while sending compact JSON, or hashed with the wrong key. |
 | WebSocket drops every ~1 hour | Connection token expired. Wire up `getToken` to refetch `/init`. |
 
 Full API reference + interactive playground: **`/chat-api/docs`**.

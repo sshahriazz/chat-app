@@ -13,6 +13,11 @@ import { findTenantByApiKey } from "../lib/tenant";
 
 export interface ApiKeyAuthenticatedRequest extends Request {
   tenantId: string;
+  /** The raw API key presented in `Authorization: Bearer`. Stashed on
+   *  the request so downstream middleware (e.g. webhook signature
+   *  verification) can HMAC request bodies with it without re-reading
+   *  the header. Do not log or echo this value. */
+  apiKey: string;
 }
 
 function extractBearer(req: Request): string | null {
@@ -32,7 +37,9 @@ export async function requireApiKey(
     if (!key) throw new UnauthorizedError("Missing API key");
     const tenant = await findTenantByApiKey(key);
     if (!tenant) throw new UnauthorizedError("Invalid API key");
-    (req as ApiKeyAuthenticatedRequest).tenantId = tenant.id;
+    const r = req as ApiKeyAuthenticatedRequest;
+    r.tenantId = tenant.id;
+    r.apiKey = key;
     next();
   } catch (err) {
     next(err);

@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import argon2 from "argon2";
 import { prisma } from "../db";
+import { env } from "../env";
+import { logger } from "./logger";
 
 /**
  * Tenant management. A Tenant is a third-party app that uses this chat
@@ -11,14 +13,19 @@ import { prisma } from "../db";
  *   - `apiKey` — surfaced once at create/rotate, never stored raw.
  *     Argon2-hashed in `Tenant.apiKeyHash`. Used by the tenant's backend
  *     to call server-to-server endpoints (webhooks, admin operations).
- *   - `jwtSecret` — stored raw (HMAC requires the plaintext to verify).
- *     Used to sign short-lived user JWTs; the chat server verifies
- *     them in `requireUserJwt`.
+ *     First 8 chars are stored in `apiKeyPrefix` (indexed) so auth is
+ *     O(log N tenants) + 1 Argon2 verify instead of N verifies.
+ *   - `jwtSecret` — stored wrapped (AES-256-GCM) if
+ *     `JWT_SECRET_ENCRYPTION_KEY` is set, plaintext otherwise. HMAC
+ *     verification still needs the plaintext in memory; the wrap is a
+ *     DB-leak defense.
  *
  * Rotation is key-replace, not key-additional: after rotation the old
  * value stops working immediately. Callers must coordinate the swap
  * with their tenant-side config.
  */
+
+const API_KEY_PREFIX_LEN = 8;
 
 /** Random 32 bytes → 43-char base64url. Plenty for an API key. */
 function generateRandomKey(bytes = 32): string {
@@ -49,6 +56,70 @@ export async function verifyApiKey(raw: string, hash: string): Promise<boolean> 
   }
 }
 
+// ─── jwtSecret at-rest envelope encryption ───────────────────────
+//
+// Format of a wrapped secret: `enc:v1:<iv_b64url>:<ct_b64url>:<tag_b64url>`.
+// AES-256-GCM with a random 12-byte IV per wrap. The key comes from
+// `JWT_SECRET_ENCRYPTION_KEY` (base64, 32 bytes). Rows produced before
+// the env var was set are stored plaintext — `unwrapSecret` detects the
+// `enc:v1:` prefix and decides.
+
+const ENC_PREFIX = "enc:v1:";
+
+function encryptionKey(): Buffer | null {
+  const b64 = env.JWT_SECRET_ENCRYPTION_KEY;
+  if (!b64) return null;
+  const key = Buffer.from(b64, "base64");
+  if (key.length !== 32) {
+    logger.error(
+      "[tenant] JWT_SECRET_ENCRYPTION_KEY must be 32 bytes (base64). Ignoring; secrets will be stored plaintext.",
+      { len: key.length },
+    );
+    return null;
+  }
+  return key;
+}
+
+export function wrapSecret(plain: string): string {
+  const key = encryptionKey();
+  if (!key) return plain;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ct = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return (
+    ENC_PREFIX +
+    iv.toString("base64url") +
+    ":" +
+    ct.toString("base64url") +
+    ":" +
+    tag.toString("base64url")
+  );
+}
+
+export function unwrapSecret(stored: string): string {
+  if (!stored.startsWith(ENC_PREFIX)) return stored; // legacy plaintext
+  const key = encryptionKey();
+  if (!key) {
+    throw new Error(
+      "JWT_SECRET_ENCRYPTION_KEY must be set to decrypt wrapped tenant secrets",
+    );
+  }
+  const parts = stored.slice(ENC_PREFIX.length).split(":");
+  if (parts.length !== 3) throw new Error("Malformed wrapped secret");
+  const iv = Buffer.from(parts[0], "base64url");
+  const ct = Buffer.from(parts[1], "base64url");
+  const tag = Buffer.from(parts[2], "base64url");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
+  return pt.toString("utf8");
+}
+
+function prefixOf(raw: string): string {
+  return raw.slice(0, API_KEY_PREFIX_LEN);
+}
+
 export interface CreatedTenant {
   id: string;
   name: string;
@@ -69,7 +140,12 @@ export async function createTenant(name: string): Promise<CreatedTenant> {
   const apiKeyHash = await hashApiKey(apiKey);
 
   const tenant = await prisma.tenant.create({
-    data: { name, apiKeyHash, jwtSecret },
+    data: {
+      name,
+      apiKeyHash,
+      apiKeyPrefix: prefixOf(apiKey),
+      jwtSecret: wrapSecret(jwtSecret),
+    },
     select: { id: true, name: true },
   });
 
@@ -85,7 +161,7 @@ export async function rotateApiKey(tenantId: string): Promise<string> {
   const apiKeyHash = await hashApiKey(apiKey);
   await prisma.tenant.update({
     where: { id: tenantId },
-    data: { apiKeyHash },
+    data: { apiKeyHash, apiKeyPrefix: prefixOf(apiKey) },
   });
   return apiKey;
 }
@@ -99,30 +175,54 @@ export async function rotateJwtSecret(tenantId: string): Promise<string> {
   const jwtSecret = generateRandomKey();
   await prisma.tenant.update({
     where: { id: tenantId },
-    data: { jwtSecret },
+    data: { jwtSecret: wrapSecret(jwtSecret) },
   });
   return jwtSecret;
 }
 
 /**
- * Look up a tenant by presented API key. Returns the tenant id (or null).
- * Iterates tenants and Argon2-verifies — O(N tenants) per auth call,
- * which is fine up to a few thousand tenants. For larger deployments,
- * index-by-prefix or switch to token-binding.
+ * Look up a tenant by presented API key.
+ *
+ * Two-tier lookup:
+ *   1. Fast path: filter tenants to those with the matching
+ *      `apiKeyPrefix`. Typically exactly one row. O(log N) on the
+ *      index + 1 Argon2 verify.
+ *   2. Fallback: legacy tenants stored before the prefix column was
+ *      added have `apiKeyPrefix = NULL`. Iterate just those and verify.
+ *      As legacy keys are rotated, the fallback set shrinks to empty.
+ *
+ * Both tiers use Argon2 verify, so a valid key is always accepted even
+ * if its prefix cache is stale for some reason.
  */
 export async function findTenantByApiKey(rawKey: string): Promise<{
   id: string;
   jwtSecret: string;
 } | null> {
   if (!rawKey) return null;
-  const tenants = await prisma.tenant.findMany({
+
+  // 1. Indexed prefix lookup.
+  const prefix = prefixOf(rawKey);
+  const prefixMatches = await prisma.tenant.findMany({
+    where: { apiKeyPrefix: prefix },
     select: { id: true, apiKeyHash: true, jwtSecret: true },
   });
-  for (const t of tenants) {
+  for (const t of prefixMatches) {
     if (await verifyApiKey(rawKey, t.apiKeyHash)) {
-      return { id: t.id, jwtSecret: t.jwtSecret };
+      return { id: t.id, jwtSecret: unwrapSecret(t.jwtSecret) };
     }
   }
+
+  // 2. Legacy rows with NULL prefix (rotated away over time).
+  const legacy = await prisma.tenant.findMany({
+    where: { apiKeyPrefix: null },
+    select: { id: true, apiKeyHash: true, jwtSecret: true },
+  });
+  for (const t of legacy) {
+    if (await verifyApiKey(rawKey, t.apiKeyHash)) {
+      return { id: t.id, jwtSecret: unwrapSecret(t.jwtSecret) };
+    }
+  }
+
   return null;
 }
 
@@ -130,8 +230,10 @@ export async function getTenantById(tenantId: string): Promise<{
   id: string;
   jwtSecret: string;
 } | null> {
-  return prisma.tenant.findUnique({
+  const row = await prisma.tenant.findUnique({
     where: { id: tenantId },
     select: { id: true, jwtSecret: true },
   });
+  if (!row) return null;
+  return { id: row.id, jwtSecret: unwrapSecret(row.jwtSecret) };
 }

@@ -42,6 +42,12 @@ model Tenant {
   id         String   @id @default(uuid())
   name       String
   apiKeyHash String   @map("api_key_hash")
+  // First 8 base64url chars of the raw API key. Indexed so API-key
+  // auth is O(log N) + a single Argon2 verify, instead of one Argon2
+  // verify per tenant (a DoS vector once we have many tenants).
+  // Nullable for legacy rows that pre-date the column — those still
+  // resolve via the full-scan fallback in findTenantByApiKey.
+  apiKeyPrefix String? @map("api_key_prefix")
   jwtSecret  String   @map("jwt_secret")
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
@@ -54,6 +60,7 @@ model Tenant {
   attachments         Attachment[]
   pushSubscriptions   PushSubscription[]
 
+  @@index([apiKeyPrefix])
   @@map("tenant")
 }
 

@@ -3,7 +3,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import cors from "cors";
 import helmet from "helmet";
 import pinoHttp from "pino-http";
-import { env } from "./env";
+import { env, publicUrl } from "./env";
 import { logger } from "./infra/logger";
 import { prisma } from "./infra/prisma";
 import { redis } from "./infra/redis";
@@ -27,10 +27,10 @@ const app = express();
 /**
  * CORS allowlist resolution order:
  *   1. `CORS_ALLOWED_ORIGINS` env (comma-separated) — explicit override
- *   2. `BETTER_AUTH_URL` — the app's public URL, which is required and
- *      must also be the browser's origin since everything is same-origin
- *      behind the Next.js proxy. Falling back to it means "I set the
- *      public URL, origins Just Work"
+ *   2. `publicUrl` — the app's public URL (PUBLIC_URL, or legacy
+ *      BETTER_AUTH_URL). Must be the browser's origin since everything
+ *      is same-origin behind the Next.js proxy. Falling back to it
+ *      means "I set the public URL, origins Just Work".
  *   3. Dev fallback
  *
  * env.ts already hard-fails at boot if CORS_ALLOWED_ORIGINS is unset
@@ -39,7 +39,7 @@ const app = express();
  */
 const allowedOrigins: string[] = (
   env.CORS_ALLOWED_ORIGINS ??
-  env.BETTER_AUTH_URL ??
+  publicUrl ??
   "http://localhost:3000,http://192.168.0.103:3000"
 )
   .split(",")
@@ -49,7 +49,7 @@ const allowedOrigins: string[] = (
 logger.info(
   {
     nodeEnv: env.NODE_ENV,
-    publicUrl: env.BETTER_AUTH_URL,
+    publicUrl,
     corsAllowedOrigins: allowedOrigins,
     trustProxy: env.TRUST_PROXY,
     s3Endpoint: env.S3_ENDPOINT,
@@ -190,9 +190,19 @@ app.use("/api/users", express.json({ limit: "32kb" }), userRoutes);
 app.use("/api/attachments", express.json({ limit: "8kb" }), attachmentRoutes);
 app.use("/api/push", express.json({ limit: "4kb" }), pushRoutes);
 // Tenancy: webhooks (tenant backends → us) + admin (operator → us).
-// Both dormant in PR 1 — mounted but no existing user/session code paths
-// reach them yet.
-app.use("/api/webhooks", express.json({ limit: "8kb" }), webhookRoutes);
+// Webhooks get a body parser that stashes the raw bytes on `req.rawBody`
+// so `requireWebhookSignature` (inside the router) can HMAC the
+// unmodified payload with the tenant's apiKey.
+app.use(
+  "/api/webhooks",
+  express.json({
+    limit: "8kb",
+    verify: (req, _res, buf) => {
+      (req as unknown as { rawBody: Buffer }).rawBody = buf;
+    },
+  }),
+  webhookRoutes,
+);
 app.use("/api/admin", express.json({ limit: "4kb" }), adminRoutes);
 // Dev-only mint-token endpoint. Middleware inside returns 404 in prod
 // unless DEV_MINT_ENABLED=true + ALLOW_DEV_MINT_TENANTS is set.

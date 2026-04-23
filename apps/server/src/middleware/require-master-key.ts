@@ -8,8 +8,13 @@ import { ForbiddenError, UnauthorizedError } from "../http/errors";
  * keys. The operator sets `MASTER_API_KEY` in deploy config; requests
  * carry it as `Authorization: Bearer <key>`.
  *
- * Uses `timingSafeEqual` to avoid leaking the prefix of the configured
- * key via response-time side channels.
+ * Layered defenses:
+ *  1. Optional IP allowlist (`ADMIN_IP_ALLOWLIST`) checked FIRST so a
+ *     leaked key alone isn't enough — the request must also come from
+ *     a blessed source. Compared against `req.ip`, which is the real
+ *     client thanks to `trust proxy`.
+ *  2. `timingSafeEqual` master-key compare so the bearer check doesn't
+ *     leak the key prefix via response timing.
  */
 
 function extractBearer(req: Request): string | null {
@@ -17,6 +22,23 @@ function extractBearer(req: Request): string | null {
   if (!header || typeof header !== "string") return null;
   const match = header.match(/^Bearer\s+(.+)$/);
   return match ? match[1] : null;
+}
+
+let allowlist: Set<string> | null = null;
+function parseAllowlist(): Set<string> | null {
+  if (allowlist !== null) return allowlist;
+  const raw = env.ADMIN_IP_ALLOWLIST;
+  if (!raw) {
+    allowlist = new Set();
+    return allowlist;
+  }
+  allowlist = new Set(
+    raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  return allowlist;
 }
 
 export function requireMasterKey(
@@ -30,6 +52,15 @@ export function requireMasterKey(
         "Admin endpoints disabled: set MASTER_API_KEY to enable.",
       );
     }
+
+    const list = parseAllowlist();
+    if (list && list.size > 0) {
+      const ip = req.ip ?? "";
+      if (!list.has(ip)) {
+        throw new ForbiddenError("Source IP not allowed for admin endpoints");
+      }
+    }
+
     const provided = extractBearer(req);
     if (!provided) throw new UnauthorizedError("Missing master key");
     const a = Buffer.from(provided);

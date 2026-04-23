@@ -155,33 +155,49 @@ services:
       TZ: UTC
       DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
       REDIS_URL: redis://redis:6379
-      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-secret-change-in-production-min-32-chars}
-      # The server is only reachable through the web proxy; its self-URL
-      # should be the PUBLIC URL of the web app.
-      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      # The server's public base URL (used for OpenAPI server listing +
+      # absolute-URL links). Compose default is the web host because
+      # Next rewrites route `/api/*` through the web proxy in the
+      # reference deployment.
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:3000}
       CENTRIFUGO_URL: http://centrifugo:8000
       CENTRIFUGO_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
       CENTRIFUGO_TOKEN_SECRET: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
-      # Fall back to BETTER_AUTH_URL so users who only configure the
+      # Fall back to PUBLIC_URL so operators who only configure the
       # public URL don't end up with Express rejecting cross-origin
       # requests from their own domain.
-      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-${BETTER_AUTH_URL:-http://localhost:3000}}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-${PUBLIC_URL:-http://localhost:3000}}
       # Two proxy hops in the Dokploy/compose deploy: Traefik → web (Next)
       # → server. `trust proxy: 2` makes Express honor X-Forwarded-* and
       # report req.ip as the real client — critical for rate limiting
-      # and for better-auth's secure-cookie detection.
+      # + admin IP allowlist enforcement.
       TRUST_PROXY: ${TRUST_PROXY:-2}
-      # Tenancy admin gate. Unset in dev → admin endpoints return 403.
+      # Tenancy admin gate. Unset → admin endpoints return 403.
       # Rotate in Dokploy env when bootstrapping real tenants.
       MASTER_API_KEY: ${MASTER_API_KEY:-}
+      # Optional comma-separated CIDR / IP list. When set, `/api/admin/*`
+      # requests from outside this list are rejected with 403 even if
+      # they present a valid MASTER_API_KEY. Defense-in-depth against
+      # key leaks. Leave unset to allow admin from any source.
+      ADMIN_IP_ALLOWLIST: ${ADMIN_IP_ALLOWLIST:-}
       TENANT_JWT_CLOCK_SKEW_SEC: ${TENANT_JWT_CLOCK_SKEW_SEC:-30}
-      AUTH_MODE: ${AUTH_MODE:-both}
-      # Local dev + the reference web app need the dev-mint endpoint
-      # mounted so the demo sign-in flow works. Real production
-      # deployments set DEV_MINT_ENABLED=false and leave the allowlist
-      # empty, which returns 404.
-      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-true}
-      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-default}
+      AUTH_MODE: ${AUTH_MODE:-jwt}
+      # Dev-only shortcut that mounts POST /api/dev/mint-token. Safe
+      # defaults: OFF. Local dev should set DEV_MINT_ENABLED=true +
+      # ALLOW_DEV_MINT_TENANTS=default via a .env.dev (never in prod).
+      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-false}
+      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-}
+      # Optional: base64-encoded 32-byte key that wraps Tenant.jwtSecret
+      # at rest (AES-256-GCM). If unset, secrets are stored plaintext
+      # (HMAC requires plaintext at verify time, so this is a DB-at-rest
+      # defense — unwrap happens in memory only). Existing plaintext
+      # rows are still readable; new writes go through the wrap.
+      JWT_SECRET_ENCRYPTION_KEY: ${JWT_SECRET_ENCRYPTION_KEY:-}
+      # Optional: if "true", every POST /api/webhooks/* must carry a
+      # valid X-Chat-Signature header (HMAC-SHA256 of the raw body
+      # signed with the tenant's apiKey). Off by default so existing
+      # tenants don't break; flip on once your tenants ship the signer.
+      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-false}
       # S3 split clients (see apps/server/src/lib/s3.ts):
       #   S3_ENDPOINT        — internal, used for HEAD/DELETE/etc.
       #   S3_PUBLIC_URL_BASE — public, used to mint presigned PUT/GET

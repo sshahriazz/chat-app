@@ -37,7 +37,7 @@ router.post(
   requireAuth,
   validate({ body: SubscriptionTokenBodySchema }),
   async (req, res) => {
-    const { user } = req as AuthenticatedRequest;
+    const { user, tenantId } = req as AuthenticatedRequest;
     const { channel } = req.body as { channel: string };
 
     const match = channel.match(/^presence:conv_(.+)$/);
@@ -45,8 +45,16 @@ router.post(
 
     const conversationId = match[1];
 
-    const member = await prisma.conversationMember.findUnique({
-      where: { conversationId_userId: { conversationId, userId: user.id } },
+    // findFirst with the conversation.tenantId filter is belt-and-
+    // braces: cross-tenant memberships can't be forged after the
+    // add-member fix, but this keeps the token issuer honest in case
+    // of future drift.
+    const member = await prisma.conversationMember.findFirst({
+      where: {
+        conversationId,
+        userId: user.id,
+        conversation: { tenantId },
+      },
     });
 
     if (!member) throw new ForbiddenError("not a member");

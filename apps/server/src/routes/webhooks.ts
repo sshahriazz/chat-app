@@ -6,6 +6,7 @@ import {
   requireApiKey,
   type ApiKeyAuthenticatedRequest,
 } from "../middleware/require-api-key";
+import { requireWebhookSignature } from "../middleware/webhook-signature";
 import {
   applyTenantUserUpdate,
   deleteFederatedUser,
@@ -81,6 +82,7 @@ export const UsersDeletedWebhookBodySchema = z
 router.post(
   "/users.updated",
   requireApiKey,
+  requireWebhookSignature,
   tenantBucket,
   userBucket,
   validate({ body: UsersUpdatedWebhookBodySchema }),
@@ -112,6 +114,7 @@ router.post(
 router.post(
   "/users.deleted",
   requireApiKey,
+  requireWebhookSignature,
   tenantBucket,
   userBucket,
   validate({ body: UsersDeletedWebhookBodySchema }),

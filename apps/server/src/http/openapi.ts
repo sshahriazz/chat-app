@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { createDocument, type ZodOpenApiObject } from "zod-openapi";
-import { env } from "../env";
+import { publicUrl } from "../env";
 import {
   MessageModelSchema,
   ConversationModelSchema,
@@ -274,7 +274,7 @@ export function buildOpenApiDocument() {
     },
     servers: [
       {
-        url: env.BETTER_AUTH_URL ?? "http://localhost:3001",
+        url: publicUrl ?? "http://localhost:3001",
         description: "Current deployment",
       },
     ],
