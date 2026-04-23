@@ -111,6 +111,19 @@ async function onAcmeUserUpdate(user) {
 
 That's it. **Acme doesn't operate a chat user table. Acme doesn't sync users. Acme just mints tokens and pushes updates.**
 
+### Aside: what about `/api/dev/mint-token`?
+
+You'll notice the chat server exposes a `POST /api/dev/mint-token` route that **also** mints user JWTs. It's natural to think: "oh great, I'll just call that from Acme's frontend and skip step (a)."
+
+**Don't.** That endpoint is purely a dev-only courtesy for the open-source reference web client in this repo — the app in `apps/web` has no backend of its own, so we fake what Acme's backend does on a server-side endpoint named `dev` for clarity. In production it's gated behind two env switches (`DEV_MINT_ENABLED=false` + an allowlist that real tenants must never appear in), and it returns 404 / 403 by default.
+
+If Acme called it from their frontend, they'd be doing two dangerous things at once:
+
+1. **Leaking `jwtSecret` indirectly** — the endpoint would need *their* secret to sign tokens, meaning either the chat server knows Acme's secret (it does — that's normal) **or** Acme's frontend would have to pass it (bad) **or** any caller could mint tokens for any user (catastrophic).
+2. **Handing the chat server auth responsibility** — now every attacker who hits the URL can impersonate Alice. That's the opposite of what federation is for.
+
+So Acme's backend is always the one calling `jwt.sign(...)`. The `/api/dev/mint-token` route is a teaching tool, not a production API. Real tenants never touch it.
+
 ---
 
 ## Stage 3 — Alice opens Acme's app

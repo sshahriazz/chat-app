@@ -102,7 +102,44 @@ Response:
 
 ## 3. Minting user JWTs
 
-Every request from your frontend to the chat server carries a JWT signed with your tenant's `jwtSecret`. The JWT is short-lived (≤ 1 hour is a good default). Your backend is the only party that signs them — never ship `jwtSecret` to the browser.
+Every request from your frontend to the chat server carries a JWT signed with your tenant's `jwtSecret`. The JWT is short-lived (≤ 1 hour is a good default). **Your backend is the only party that signs them** — never ship `jwtSecret` to the browser.
+
+### You mint, not us
+
+The chat server **does not expose a production endpoint that mints JWTs for your users**. This is intentional and is the security core of the federated model:
+
+- You already run auth for your users (OAuth, SSO, password — whatever).
+- Your `jwtSecret` is cryptographic proof that *you* vouch for a user's identity when you sign `{ sub: userId }`.
+- If the chat server had a live `/mint-token` endpoint for your real tenant, anyone who hit it could mint tokens for any of your users — defeating the whole model.
+
+So the minting always happens **inside your backend**, with a `jwt.sign(...)` call using the `jwtSecret` you received at onboarding.
+
+```
+┌─ Production, real tenant ────────────────────────────────────┐
+│                                                              │
+│  1. Your user logs into your app (your auth)                 │
+│  2. Your FRONTEND asks your BACKEND for a chat token         │
+│  3. Your BACKEND signs a JWT with jwtSecret and returns it   │
+│  4. Your frontend calls chat.example.com with Bearer <jwt>   │
+│                                                              │
+│  The chat server is never in step 1–3.                       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### ⚠️ Do not use `/api/dev/mint-token` in production
+
+This server ships a `POST /api/dev/mint-token` endpoint that *looks* like it mints tokens for you. **It's not for you.** It exists so the open-source reference web client in this repo can demonstrate the flow without requiring every reader to stand up a backend first.
+
+In production deploys, the endpoint is gated behind two independent switches both of which default to off:
+
+| Switch | Default | Purpose |
+|---|---|---|
+| `DEV_MINT_ENABLED` | `false` | If false, the route returns 404. |
+| `ALLOW_DEV_MINT_TENANTS` | `""` (empty) | Per-tenant allowlist. Real tenants must never appear here. |
+
+Both have to be wrong for the endpoint to mint a token for a real tenant. If you ever see the error `Dev mint not allowed for this tenant in production`, that's the allowlist protecting a real tenant from being impersonated — it's working as designed, and the fix is **not** to add your tenant to the allowlist.
+
+If you see the endpoint advertised in your IDE or in the OpenAPI docs and wonder "should I call this?" — the answer is **no**. Sign JWTs in your backend with `jwt.sign(...)`, as shown below.
 
 ### Claims
 
