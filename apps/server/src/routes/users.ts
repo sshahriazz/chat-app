@@ -9,6 +9,7 @@ import {
 } from "../http/schemas";
 import { deleteObject, keyFromPublicUrl } from "../lib/s3";
 import { invalidateUserProfile } from "../lib/user-cache";
+import { userScopeFilter } from "../lib/scope-filter";
 import { logger } from "../lib/logger";
 
 const router: Router = Router();
@@ -29,13 +30,17 @@ router.get(
   searchLimiter,
   validate({ query: UserSearchQuerySchema }),
   async (req, res) => {
-    const { user, tenantId } = req as AuthenticatedRequest;
+    const { user, tenantId, scope } = req as AuthenticatedRequest;
     const { q } = req.query as { q: string };
 
     const users = await prisma.user.findMany({
       where: {
         tenantId,
         id: { not: user.id },
+        // Scope isolation: a scoped requester only sees same-scope +
+        // tenant-wide users. `userScopeFilter` returns {} for
+        // unscoped requesters so this is effectively a no-op for them.
+        AND: [userScopeFilter(scope)],
         OR: [
           { name: { contains: q, mode: "insensitive" } },
           { email: { contains: q, mode: "insensitive" } },
@@ -72,11 +77,15 @@ router.post(
   generalLimiter,
   validate({ body: OnlineUsersBodySchema }),
   async (req, res) => {
-    const { tenantId } = req as AuthenticatedRequest;
+    const { tenantId, scope } = req as AuthenticatedRequest;
     const { userIds } = req.body as { userIds: string[] };
 
     const users = await prisma.user.findMany({
-      where: { tenantId, id: { in: userIds } },
+      where: {
+        tenantId,
+        id: { in: userIds },
+        AND: [userScopeFilter(scope)],
+      },
       select: { id: true, lastActiveAt: true },
     });
 

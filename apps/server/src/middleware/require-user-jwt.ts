@@ -47,11 +47,22 @@ export async function requireUserJwt(
       throw new UnauthorizedError("Invalid user token");
     }
 
+    // Normalize scope: treat empty string / whitespace as unscoped.
+    // The tenant should be deliberate about null-vs-value; a stray
+    // empty string from a buggy signer shouldn't carve a phantom
+    // partition.
+    const rawScope = claims.scope;
+    const scope =
+      typeof rawScope === "string" && rawScope.trim().length > 0
+        ? rawScope
+        : null;
+
     const user = await upsertFederatedUser(tenant.id, {
       externalId: claims.sub,
       name: claims.name,
       image: claims.image ?? null,
       email: claims.email ?? null,
+      scope,
     });
 
     const r = req as AuthenticatedRequest;
@@ -68,6 +79,7 @@ export async function requireUserJwt(
       expiresAt: new Date(claims.exp * 1000),
     };
     r.tenantId = tenant.id;
+    r.scope = scope;
     next();
   } catch (err) {
     next(err);

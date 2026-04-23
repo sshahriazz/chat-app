@@ -78,6 +78,21 @@ model User {
   // FKs / Centrifugo channels don't need to change.
   tenantId     String    @map("tenant_id")
   externalId   String    @map("external_id")
+  // Optional second-level scope *within* a tenant. Lets a single tenant
+  // partition its users into isolated contexts (project chats, support
+  // tickets, deal rooms, per-client CRM spaces) without creating a new
+  // tenant per context.
+  //
+  // Semantics:
+  //   - NULL = tenant-wide. This user can discover/message any user in
+  //     the tenant, and vice versa (support agents, admins).
+  //   - Non-null = scoped. This user can only discover/message users
+  //     with the SAME scope or NULL scope, and vice versa.
+  //
+  // Source of truth is the `scope` claim on the tenant-signed JWT,
+  // re-materialized on every authenticated request via
+  // `upsertFederatedUser`.
+  scope        String?   @map("scope")
   name         String
   email        String?
   image        String?
@@ -94,6 +109,7 @@ model User {
 
   @@unique([tenantId, externalId])
   @@index([tenantId])
+  @@index([tenantId, scope])
   @@map("user")
 }
 

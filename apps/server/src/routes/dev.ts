@@ -4,8 +4,8 @@ import "zod-openapi";
 import { validate } from "../http/validate";
 import { env } from "../env";
 import { ForbiddenError, NotFoundError } from "../http/errors";
-import { prisma } from "../db";
 import { mintUserToken } from "../http/jwt-tenant";
+import { getTenantById } from "../lib/tenant";
 
 /**
  * Dev-only helper: mint a tenant-signed user JWT using the target
@@ -37,6 +37,10 @@ const MintTokenBodySchema = z
     name: z.string().min(1).max(128),
     image: z.string().url().max(2048).nullable().optional(),
     email: z.string().email().max(254).nullable().optional(),
+    // Optional second-level partition inside the tenant. Non-null
+    // restricts user discovery + add-member to same-scope + tenant-wide
+    // peers. Null/absent = tenant-wide (admin-style).
+    scope: z.string().min(1).max(128).nullable().optional(),
     ttlSeconds: z.number().int().positive().max(24 * 60 * 60).optional(),
   })
   .meta({ id: "DevMintTokenBody" });
@@ -52,6 +56,7 @@ router.post(
       name: string;
       image?: string | null;
       email?: string | null;
+      scope?: string | null;
       ttlSeconds?: number;
     };
 
@@ -70,10 +75,10 @@ router.post(
       }
     }
 
-    const tenant = await prisma.tenant.findUnique({
-      where: { id: body.tenantId },
-      select: { id: true, jwtSecret: true },
-    });
+    // `getTenantById` handles AES-GCM unwrap when JWT_SECRET_ENCRYPTION_KEY
+    // is set. Reading the `jwt_secret` column directly would hand us the
+    // `enc:v1:…` ciphertext and every minted token would fail verify.
+    const tenant = await getTenantById(body.tenantId);
     if (!tenant) throw new NotFoundError("Tenant not found");
 
     const token = mintUserToken(tenant.id, tenant.jwtSecret, {
@@ -81,6 +86,9 @@ router.post(
       name: body.name,
       image: body.image ?? null,
       email: body.email ?? null,
+      // `scope: undefined` → omitted from the token, so upsertFederatedUser
+      // will leave any existing scope alone. Explicit null → tenant-wide.
+      ...(body.scope !== undefined ? { scope: body.scope } : {}),
       ttlSeconds: body.ttlSeconds,
     });
 

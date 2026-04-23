@@ -80,19 +80,49 @@ Every request from your frontend to the chat server carries a JWT signed with yo
 | `name` | ✅ | Display name. Embedded in realtime events so peers see it without extra lookups. |
 | `image` | optional | Avatar URL. |
 | `email` | optional | Display-only — the chat server does not use it for auth or dedup. |
+| `scope` | optional | Second-level partition inside your tenant. See **Scopes** below. |
 | `exp` | ✅ | Expiry timestamp (seconds). |
 | `iat` | ✅ | Issued-at timestamp (seconds). |
 
 Algorithm: **HS256**. No other algorithm is accepted.
+
+### Scopes — partitioning inside a single tenant
+
+Use `scope` when one tenant hosts many independent chat contexts and users in one context shouldn't discover or message users in another.
+
+| Example | Who gets which scope |
+|---|---|
+| Per-project chats | project members: `scope: "project_42"`; PMs who jump between: no scope |
+| Support tickets | customer: `scope: "cust_123"`; support agents: no scope |
+| Deal rooms / CRM clients | external party: `scope: "deal_a"`; internal staff: no scope |
+| Team-wide collaboration (Slack-style) | nobody scoped — tenant-wide is fine |
+
+Rules the server enforces:
+
+- A **scoped** user (`scope: "X"` in the JWT) can only find + add users whose `scope` is `"X"` or `null`.
+- An **unscoped** user (no `scope` claim or `scope: null`) can find + add any user in the tenant. Use this for support agents, admins, and internal staff who span scopes.
+- Scope is **only** enforced on user discovery (`/users/search`, add-member, online-users). It is **not** a per-conversation scope — once a conversation exists, its membership defines who can read it, regardless of scope. A scoped support customer and an unscoped agent can chat freely in a conversation they both belong to.
+- The `User.scope` column updates on every auth when the JWT supplies a different `scope`. Omit the claim to leave the stored value untouched (useful when a webhook doesn't know the scope).
 
 ### Node.js (`jsonwebtoken`)
 
 ```ts
 import jwt from "jsonwebtoken";
 
-export function mintChatToken(userId: string, name: string, image?: string) {
+export function mintChatToken(
+  userId: string,
+  name: string,
+  opts: { image?: string; scope?: string | null } = {},
+) {
   return jwt.sign(
-    { sub: userId, name, image },
+    {
+      sub: userId,
+      name,
+      image: opts.image,
+      // Omit `scope` entirely when undefined so you don't accidentally
+      // stamp `scope: undefined` onto a tenant-wide user's token.
+      ...(opts.scope !== undefined ? { scope: opts.scope } : {}),
+    },
     process.env.CHAT_JWT_SECRET!,
     {
       issuer: process.env.CHAT_TENANT_ID!,

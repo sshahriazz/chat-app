@@ -9,6 +9,7 @@ import {
 } from "../lib/member-cache";
 import { invalidateConversationMeta } from "../lib/conversation-cache";
 import { invalidateUserProfile } from "../lib/user-cache";
+import { userScopeFilter } from "../lib/scope-filter";
 import { pushToUsers } from "../lib/push";
 import { logger } from "../lib/logger";
 import { headObjectSize, deleteObject, keyFromPublicUrl } from "../lib/s3";
@@ -138,7 +139,7 @@ router.post(
   requireAuth,
   validate({ body: CreateConversationBodySchema }),
   async (req, res) => {
-  const { user, tenantId } = req as AuthenticatedRequest;
+  const { user, tenantId, scope } = req as AuthenticatedRequest;
   const { type, name, memberIds } = req.body as {
     type: "direct" | "group";
     name?: string;
@@ -149,12 +150,17 @@ router.post(
     throw new BadRequestError("type and memberIds are required");
   }
 
-  // Every `memberIds` entry must resolve to a User in this tenant —
-  // otherwise a tenant could add another tenant's userId as a member
-  // and leak the conversation into that tenant's sidebar. Resolved
-  // once here, used for both the direct-dupe lookup and the create.
+  // Every `memberIds` entry must resolve to a User that is (a) in this
+  // tenant and (b) visible under the creator's scope. Without the
+  // scope filter, a user in Project A could pass a userId from
+  // Project B and pull them into a Project A conversation (same
+  // cross-tenant leak pattern as before, one level down).
   const resolvedMembers = await prisma.user.findMany({
-    where: { tenantId, id: { in: memberIds } },
+    where: {
+      tenantId,
+      id: { in: memberIds },
+      AND: [userScopeFilter(scope)],
+    },
     select: { id: true },
   });
   if (resolvedMembers.length !== memberIds.length) {
@@ -340,7 +346,7 @@ router.put("/conversations/:id", requireAuth, validate({ body: RenameConversatio
 // ─── Add members (promotes a direct chat to a group when expanding) ──
 
 router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembersBodySchema }), async (req, res) => {
-  const { user, tenantId } = req as AuthenticatedRequest;
+  const { user, tenantId, scope } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const { userIds, name } = req.body as { userIds: string[]; name?: string };
 
@@ -376,12 +382,17 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
 
     const trulyNewIds = userIds.filter((uid) => !existingMemberIds.includes(uid));
 
-    // CRITICAL: filter target users by tenantId. Without this, tenant A
-    // could pass a userId from tenant B and inject them into a tenant A
-    // conversation — tenant B's user would then see the conversation
-    // appear in their sidebar (cross-tenant leak).
+    // CRITICAL: filter target users by tenantId AND scope. Without the
+    // tenantId filter, tenant A could inject tenant B's userId into a
+    // tenant A conversation. Without the scope filter, a scoped user
+    // (e.g. in project_a) could inject a user from project_b into
+    // their conversation — same leak, one level down.
     const newUsers = await rt.tx.user.findMany({
-      where: { tenantId, id: { in: trulyNewIds } },
+      where: {
+        tenantId,
+        id: { in: trulyNewIds },
+        AND: [userScopeFilter(scope)],
+      },
       select: { id: true, name: true },
     });
 

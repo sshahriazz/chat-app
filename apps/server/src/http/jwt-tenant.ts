@@ -15,6 +15,10 @@ import { env } from "../env";
  *   image       — avatar URL (embedded in events)
  *   email       — optional, display-only
  *   iss         — tenant id; picks which secret to verify with
+ *   scope       — optional second-level partition inside the tenant.
+ *                 Non-null restricts user discovery + add-member to
+ *                 peers with the same scope (or unscoped tenant-wide
+ *                 users). Null/absent = tenant-wide.
  *   exp         — enforced; tenants should mint short (≤ 24h) tokens
  *
  * We deliberately DON'T put internal chat-server user ids in here —
@@ -27,6 +31,7 @@ export interface TenantUserClaims {
   name: string;
   image?: string | null;
   email?: string | null;
+  scope?: string | null;
   iss: string; // tenantId
   iat: number;
   exp: number;
@@ -42,6 +47,7 @@ export function mintUserToken(
     name: string;
     image?: string | null;
     email?: string | null;
+    scope?: string | null;
     ttlSeconds?: number;
   },
 ): string {
@@ -52,6 +58,11 @@ export function mintUserToken(
       name: claims.name,
       image: claims.image ?? undefined,
       email: claims.email ?? undefined,
+      // Only include `scope` in the JWT if the caller actually passed
+      // one — leaving it undefined keeps tokens minimal and prevents
+      // accidental "scope: null" signals from being stamped on tokens
+      // the tenant didn't mean to scope.
+      ...(claims.scope !== undefined ? { scope: claims.scope } : {}),
     },
     jwtSecret,
     {

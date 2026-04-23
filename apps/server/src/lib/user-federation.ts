@@ -32,6 +32,8 @@ export interface FederatedUserInput {
   name: string;
   image?: string | null;
   email?: string | null;
+  /** Optional second-level partition inside the tenant. Null = tenant-wide. */
+  scope?: string | null;
 }
 
 export interface MaterializedUser {
@@ -41,6 +43,7 @@ export interface MaterializedUser {
   name: string;
   image: string | null;
   email: string | null;
+  scope: string | null;
 }
 
 /**
@@ -59,7 +62,7 @@ export async function upsertFederatedUser(
     where: { tenantId_externalId: { tenantId, externalId: claims.externalId } },
     select: {
       id: true, tenantId: true, externalId: true,
-      name: true, image: true, email: true,
+      name: true, image: true, email: true, scope: true,
     },
   });
 
@@ -68,8 +71,15 @@ export async function upsertFederatedUser(
     const imageChanged = (existing.image ?? null) !== (claims.image ?? null);
     const emailChanged =
       claims.email !== undefined && (claims.email ?? null) !== (existing.email ?? null);
+    // Only treat scope as "changed" when the caller explicitly supplied
+    // one. `scope: undefined` means "don't touch" so a webhook that
+    // doesn't know the scope can still update name/image without
+    // accidentally promoting a scoped user to tenant-wide.
+    const scopeProvided = claims.scope !== undefined;
+    const scopeChanged =
+      scopeProvided && (existing.scope ?? null) !== (claims.scope ?? null);
 
-    if (!nameChanged && !imageChanged && !emailChanged) {
+    if (!nameChanged && !imageChanged && !emailChanged && !scopeChanged) {
       return {
         id: existing.id,
         tenantId: existing.tenantId,
@@ -77,6 +87,7 @@ export async function upsertFederatedUser(
         name: existing.name,
         image: existing.image ?? null,
         email: existing.email ?? null,
+        scope: existing.scope ?? null,
       };
     }
 
@@ -86,15 +97,24 @@ export async function upsertFederatedUser(
         name: claims.name,
         image: claims.image ?? null,
         ...(emailChanged ? { email: claims.email ?? null } : {}),
+        ...(scopeChanged ? { scope: claims.scope ?? null } : {}),
         updatedAt: new Date(),
       },
       select: {
         id: true, tenantId: true, externalId: true,
-        name: true, image: true, email: true,
+        name: true, image: true, email: true, scope: true,
       },
     });
     await invalidateUserProfile(updated.id);
-    return updated;
+    return {
+      id: updated.id,
+      tenantId: updated.tenantId,
+      externalId: updated.externalId,
+      name: updated.name,
+      image: updated.image ?? null,
+      email: updated.email ?? null,
+      scope: updated.scope ?? null,
+    };
   }
 
   // First-time materialization. `upsert` compiles to Postgres
@@ -112,6 +132,7 @@ export async function upsertFederatedUser(
       name: claims.name,
       image: claims.image ?? null,
       email: claims.email ?? null,
+      scope: claims.scope ?? null,
       createdAt: new Date(),
       updatedAt: new Date(),
     },
@@ -122,10 +143,18 @@ export async function upsertFederatedUser(
     },
     select: {
       id: true, tenantId: true, externalId: true,
-      name: true, image: true, email: true,
+      name: true, image: true, email: true, scope: true,
     },
   });
-  return row;
+  return {
+    id: row.id,
+    tenantId: row.tenantId,
+    externalId: row.externalId,
+    name: row.name,
+    image: row.image ?? null,
+    email: row.email ?? null,
+    scope: row.scope ?? null,
+  };
 }
 
 /**
