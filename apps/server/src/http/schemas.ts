@@ -142,6 +142,19 @@ export const OnlineUsersBodySchema = z
   })
   .meta({ id: "OnlineUsersBody" });
 
+// Browseable listing of tenant users. `cursor` is an opaque base64url
+// blob minted by the server (encodes the last `(name, id)` of the
+// previous page); clients treat it as a token to pass back verbatim.
+// A fabricated or tampered cursor is tolerated — it's decoded
+// defensively and silently falls back to the first page rather than
+// throwing, so bad cursors don't break the UI.
+export const TenantUserListQuerySchema = z
+  .object({
+    cursor: z.string().min(1).max(1024).optional(),
+    limit: z.coerce.number().int().positive().max(100).optional(),
+  })
+  .meta({ id: "TenantUserListQuery" });
+
 // ─── Attachments ─────────────────────────────────────────────
 
 const MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024;

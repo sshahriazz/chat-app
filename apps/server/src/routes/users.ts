@@ -1,10 +1,12 @@
 import { Router } from "express";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/auth";
+import { requireTenantWide } from "../middleware/require-tenant-wide";
 import { generalLimiter, searchLimiter } from "../middleware/rate-limit";
 import { prisma } from "../db";
 import { validate } from "../http/validate";
 import {
   OnlineUsersBodySchema,
+  TenantUserListQuerySchema,
   UserSearchQuerySchema,
 } from "../http/schemas";
 import { deleteObject, keyFromPublicUrl } from "../lib/s3";
@@ -20,6 +22,46 @@ const ONLINE_WINDOW_MS = 60_000;
 function isOnline(lastActiveAt: Date | null | undefined): boolean {
   if (!lastActiveAt) return false;
   return Date.now() - new Date(lastActiveAt).getTime() < ONLINE_WINDOW_MS;
+}
+
+// ─── Keyset cursor helpers for tenant user listing ───────────
+//
+// Opaque base64url blob encoding `(name, id)` — the sort key of the
+// last row on the previous page. Short field names keep the cursor
+// small for URL-friendly round-trips.
+//
+// `decode` is defensive: any malformed input (tampered, truncated,
+// copied across environments) returns null, and the caller treats
+// null as "start from the first page" rather than erroring out.
+// That keeps a bad cursor from breaking the UI on refresh.
+
+interface UserListCursor {
+  name: string;
+  id: string;
+}
+
+function encodeUserListCursor(cursor: UserListCursor): string {
+  return Buffer.from(
+    JSON.stringify({ n: cursor.name, i: cursor.id }),
+    "utf8",
+  ).toString("base64url");
+}
+
+function decodeUserListCursor(raw: string | undefined): UserListCursor | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+    if (
+      parsed &&
+      typeof parsed.n === "string" &&
+      typeof parsed.i === "string"
+    ) {
+      return { name: parsed.n, id: parsed.i };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Search users by name or email ────────────────────────────
@@ -66,6 +108,150 @@ router.get(
     }));
 
     res.json(results);
+  },
+);
+
+// ─── Tenant-wide user search (cross-scope discovery) ─────────
+//
+// Mirror of `/search` but without `userScopeFilter`. Callable only by
+// tenant-wide identities (`requireTenantWide` rejects scoped requesters
+// with 403), so scope stays a real isolation boundary: a scoped user
+// cannot reach this endpoint to enumerate users outside their partition.
+//
+// Reuses `searchLimiter` — same cost profile as `/search` (trigram /
+// ILIKE scan with LIMIT 20), same abuse surface.
+
+router.get(
+  "/tenant/search",
+  requireAuth,
+  requireTenantWide,
+  searchLimiter,
+  validate({ query: UserSearchQuerySchema }),
+  async (req, res) => {
+    const { user, tenantId } = req as AuthenticatedRequest;
+    const { q } = req.query as { q: string };
+
+    const users = await prisma.user.findMany({
+      where: {
+        tenantId,
+        id: { not: user.id },
+        OR: [
+          { name: { contains: q, mode: "insensitive" } },
+          { email: { contains: q, mode: "insensitive" } },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        image: true,
+        lastActiveAt: true,
+      },
+      take: 20,
+    });
+
+    const results = users.map((u) => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      image: u.image,
+      lastActiveAt: u.lastActiveAt,
+      online: isOnline(u.lastActiveAt),
+    }));
+
+    res.json(results);
+  },
+);
+
+// ─── Browseable tenant user listing ──────────────────────────
+//
+// Keyset-paginated listing intended for UIs that want to scroll
+// through every user in the tenant (search-as-you-type caps at 20
+// and isn't browseable past that). Ordered by `name ASC, id ASC`
+// for a stable total order — id is the tiebreaker when two users
+// share a name so the cursor remains unambiguous.
+//
+// Why keyset over offset:
+//   - Constant-time per page. Offset pagination does a Postgres
+//     skip of N rows per request; a deep page at offset=10000 has
+//     to scan (and discard) 10000 rows every time.
+//   - Stable under inserts. If a new user is created while the
+//     client is paginating, offset pagination shifts the window
+//     and can duplicate or skip rows. Keyset reads from "after the
+//     last name/id I saw" and is immune.
+//
+// Behind `requireTenantWide` — only unscoped identities can
+// enumerate the full tenant. Reuses `searchLimiter` because the
+// cost profile (ordered scan + LIMIT) is similar to `/search`.
+
+router.get(
+  "/tenant",
+  requireAuth,
+  requireTenantWide,
+  searchLimiter,
+  validate({ query: TenantUserListQuerySchema }),
+  async (req, res) => {
+    const { user, tenantId } = req as AuthenticatedRequest;
+    const { cursor: rawCursor, limit: limitParam } = req.query as {
+      cursor?: string;
+      limit?: number;
+    };
+
+    const limit = limitParam ?? 50;
+    const cursor = decodeUserListCursor(rawCursor);
+
+    // Compound keyset predicate:
+    //   (name, id) > (cursor.name, cursor.id)
+    // expressed as Prisma OR since there's no tuple-compare operator
+    // in the client. Matches the ORDER BY clause exactly so the
+    // index pushdown stays correct.
+    const keysetFilter = cursor
+      ? {
+          OR: [
+            { name: { gt: cursor.name } },
+            { name: cursor.name, id: { gt: cursor.id } },
+          ],
+        }
+      : {};
+
+    // take `limit + 1` as a "has more" probe: if we get limit+1 rows,
+    // there's another page and we slice off the sentinel before
+    // returning. Avoids a separate count query.
+    const rows = await prisma.user.findMany({
+      where: {
+        tenantId,
+        id: { not: user.id },
+        ...keysetFilter,
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        image: true,
+        lastActiveAt: true,
+      },
+      orderBy: [{ name: "asc" }, { id: "asc" }],
+      take: limit + 1,
+    });
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const last = page[page.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeUserListCursor({ name: last.name, id: last.id })
+        : null;
+
+    const users = page.map((u) => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+      image: u.image,
+      lastActiveAt: u.lastActiveAt,
+      online: isOnline(u.lastActiveAt),
+    }));
+
+    res.json({ users, nextCursor });
   },
 );
 

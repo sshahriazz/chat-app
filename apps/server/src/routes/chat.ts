@@ -10,6 +10,8 @@ import {
 import { invalidateConversationMeta } from "../lib/conversation-cache";
 import { invalidateUserProfile } from "../lib/user-cache";
 import { userScopeFilter } from "../lib/scope-filter";
+import { acquireDmLock } from "../lib/dm-lock";
+import { requireTenantWide } from "../middleware/require-tenant-wide";
 import { pushToUsers } from "../lib/push";
 import { logger } from "../lib/logger";
 import { headObjectSize, deleteObject, keyFromPublicUrl } from "../lib/s3";
@@ -54,6 +56,36 @@ const router: Router = Router();
 /** Extract a single string param (Express 5 params can be string | string[]) */
 function param(value: string | string[]): string {
   return Array.isArray(value) ? value[0] : value;
+}
+
+/**
+ * Hard cap on per-conversation membership.
+ *
+ * Fan-out today is O(N): each message insert enqueues one outbox row
+ * whose `channels` array holds every member's `user:{userId}` channel,
+ * and Centrifugo broadcasts once per channel. That works comfortably
+ * into the hundreds; past ~1000 the cost per-write becomes visible
+ * (outbox payload size, Centrifugo internal fan-out, push dispatch
+ * query) and the design shifts: at that point the right move is a
+ * dedicated `conv:{id}` broadcast channel that members subscribe to
+ * on join, turning O(N) publish into O(1). We cap at 1000 here as
+ * the guardrail against hitting that cliff accidentally. If/when a
+ * product need emerges for bigger rooms, introduce the broadcast
+ * channel path BEFORE raising this cap.
+ *
+ * The create-time zod schemas already cap `memberIds` at 50 per
+ * request; the cap here closes the loophole where successive
+ * `POST /conversations/:id/members` calls could grow a group
+ * unboundedly one batch at a time.
+ */
+const MAX_GROUP_MEMBERS = 1000;
+
+function ensureGroupCap(currentCount: number, addingCount: number): void {
+  if (currentCount + addingCount > MAX_GROUP_MEMBERS) {
+    throw new BadRequestError(
+      `Group cannot exceed ${MAX_GROUP_MEMBERS} members`,
+    );
+  }
 }
 
 
@@ -167,35 +199,47 @@ router.post(
     throw new BadRequestError("One or more memberIds are invalid");
   }
 
-  if (type === "direct") {
-    if (memberIds.length !== 1) {
-      throw new BadRequestError("Direct chats require exactly one other member");
-    }
-
-    // Check for existing direct conversation
-    const existing = await prisma.conversation.findFirst({
-      where: {
-        tenantId,
-        type: "direct",
-        AND: [
-          { members: { some: { userId: user.id } } },
-          { members: { some: { userId: memberIds[0] } } },
-        ],
-      },
-      include: { members: { include: { user: true } } },
-    });
-
-    if (existing) {
-      res.json(existing);
-      return;
-    }
+  if (type === "direct" && memberIds.length !== 1) {
+    throw new BadRequestError("Direct chats require exactly one other member");
   }
 
-
   const allMemberIds = [user.id, ...memberIds.filter((id) => id !== user.id)];
+  // Cap check at create: safe to do outside the tx because the conversation
+  // doesn't exist yet, so there's no concurrent member add to race against.
+  ensureGroupCap(0, allMemberIds.length);
 
+  // `wasExisting` signals "direct chat already existed" so we can respond
+  // 200 (found) vs 201 (created) and skip unnecessary cache invalidation.
+  // Declared outside `withRealtime` because the closure mutates it.
+  let wasExisting = false;
 
   const conversation = await withRealtime(async (rt) => {
+    if (type === "direct") {
+      // Serialize same-pair direct creates across concurrent requests.
+      // The dedup check + create that follows both run under the lock,
+      // so the classic TOCTOU (two requests both miss the findFirst and
+      // each insert a Conversation) is eliminated. Lock releases with
+      // the tx, so there's no janitor path.
+      await acquireDmLock(rt.tx, tenantId, user.id, memberIds[0]);
+
+      const existing = await rt.tx.conversation.findFirst({
+        where: {
+          tenantId,
+          type: "direct",
+          AND: [
+            { members: { some: { userId: user.id } } },
+            { members: { some: { userId: memberIds[0] } } },
+          ],
+        },
+        include: { members: { include: { user: true } } },
+      });
+
+      if (existing) {
+        wasExisting = true;
+        return existing;
+      }
+    }
+
     const conv = await rt.tx.conversation.create({
       data: {
         tenantId,
@@ -236,15 +280,149 @@ router.post(
     return conv;
   });
 
-  // Cache warms lazily on next read, but invalidate pre-emptively in case a
-  // prior (e.g. ghost) entry lingered.
-  await Promise.all([
-    invalidateConversation(conversation.id),
-    invalidateConversationMeta(conversation.id),
-  ]);
+  if (!wasExisting) {
+    // Cache warms lazily on next read, but invalidate pre-emptively in
+    // case a prior (e.g. ghost) entry lingered. Dedup-hit path skips this:
+    // membership didn't change, the cache is still valid.
+    await Promise.all([
+      invalidateConversation(conversation.id),
+      invalidateConversationMeta(conversation.id),
+    ]);
+  }
 
-  res.status(201).json(conversation);
+  res.status(wasExisting ? 200 : 201).json(conversation);
 });
+
+// ─── Create tenant-wide conversation (cross-scope) ───────────
+//
+// Mirror of `POST /conversations` but without `userScopeFilter` on member
+// validation. Reachable only by tenant-wide identities (`requireTenantWide`
+// rejects scoped callers with 403), so a scoped user cannot initiate a
+// chat that reaches outside their partition.
+//
+// Scoped users CAN be *added* as members here — membership is the authz
+// primitive downstream (message send, presence, typing, push). Their
+// ability to later *invite* more users to this conversation still flows
+// through `POST /conversations/:id/members`, which applies `userScopeFilter`
+// to their own scope — so a scoped user added to a tenant-wide group
+// can only pull in same-scope or tenant-wide peers. Scope stays a
+// boundary; tenant-wide is a distinct, explicit mode.
+//
+// Direct-chat dedup uses the same advisory lock as the scoped endpoint
+// so cross-endpoint races (tenant-wide caller racing a scoped caller
+// who found the other party under scope filter) are also serialized.
+
+router.post(
+  "/conversations/tenant",
+  requireAuth,
+  requireTenantWide,
+  validate({ body: CreateConversationBodySchema }),
+  async (req, res) => {
+    const { user, tenantId } = req as AuthenticatedRequest;
+    const { type, name, memberIds } = req.body as {
+      type: "direct" | "group";
+      name?: string;
+      memberIds: string[];
+    };
+
+    if (!type || !memberIds?.length) {
+      throw new BadRequestError("type and memberIds are required");
+    }
+
+    // Tenant-wide: validate members against tenantId only. Scope filter
+    // deliberately omitted; `requireTenantWide` has already authorized
+    // the caller to cross scope boundaries. The tenantId check is
+    // still mandatory — without it, a caller could pass userIds from
+    // another tenant and pull them in (same cross-tenant leak pattern
+    // the scoped endpoint guards against).
+    const resolvedMembers = await prisma.user.findMany({
+      where: { tenantId, id: { in: memberIds } },
+      select: { id: true },
+    });
+    if (resolvedMembers.length !== memberIds.length) {
+      throw new BadRequestError("One or more memberIds are invalid");
+    }
+
+    if (type === "direct" && memberIds.length !== 1) {
+      throw new BadRequestError("Direct chats require exactly one other member");
+    }
+
+    const allMemberIds = [user.id, ...memberIds.filter((id) => id !== user.id)];
+    ensureGroupCap(0, allMemberIds.length);
+
+    let wasExisting = false;
+
+    const conversation = await withRealtime(async (rt) => {
+      if (type === "direct") {
+        await acquireDmLock(rt.tx, tenantId, user.id, memberIds[0]);
+
+        const existing = await rt.tx.conversation.findFirst({
+          where: {
+            tenantId,
+            type: "direct",
+            AND: [
+              { members: { some: { userId: user.id } } },
+              { members: { some: { userId: memberIds[0] } } },
+            ],
+          },
+          include: { members: { include: { user: true } } },
+        });
+
+        if (existing) {
+          wasExisting = true;
+          return existing;
+        }
+      }
+
+      const conv = await rt.tx.conversation.create({
+        data: {
+          tenantId,
+          type,
+          name: type === "group" ? name : null,
+          createdBy: user.id,
+          members: {
+            create: allMemberIds.map((userId) => ({
+              tenantId,
+              userId,
+              role: userId === user.id ? "owner" : "member",
+            })),
+          },
+        },
+        include: { members: { include: { user: true } } },
+      });
+
+      if (type === "group") {
+        const otherCount = allMemberIds.filter((id) => id !== user.id).length;
+        await rt.createSystemMessage(
+          conv.id,
+          user.id,
+          `${user.name} created the tenant-wide group${name ? ` "${name}"` : ""} with ${otherCount} member${otherCount !== 1 ? "s" : ""}`,
+        );
+      }
+
+      const eventPayload = await rt.tx.conversation.findUniqueOrThrow({
+        where: { id: conv.id },
+        select: CONVERSATION_EVENT_SELECT,
+      });
+      await rt.enqueueToConversation(
+        conv.id,
+        { type: "conversation_updated", conversation: eventPayload },
+        `conv_created_${conv.id}`,
+      );
+
+      return conv;
+    });
+
+    if (!wasExisting) {
+      await Promise.all([
+        invalidateConversation(conversation.id),
+        invalidateConversationMeta(conversation.id),
+      ]);
+    }
+
+    res.status(wasExisting ? 200 : 201).json(conversation);
+  },
+);
 
 // ─── List conversations ───────────────────────────────────────
 
@@ -372,6 +550,14 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
   const promotionName = wasDirect && name?.trim() ? name.trim() : null;
 
   const result = await withRealtime(async (rt) => {
+    // Serialize concurrent add-member batches on this conversation so the
+    // member-count read and the createMany insert can't interleave across
+    // requests. Without this, two parallel batches both read N=998 members,
+    // both add 5, and the group ends at 1008 — past the cap. Advisory
+    // lock is tx-scoped, keyed per-conversation, and auto-releases on
+    // commit/rollback; cost is one cheap local Postgres call.
+    await rt.tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`conv:${id}`}::text, 0))`;
+
     // Skip users who are already members to keep the event payload accurate.
     const existingMemberIds = (
       await rt.tx.conversationMember.findMany({
@@ -403,6 +589,13 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
     if (newUsers.length !== trulyNewIds.length) {
       throw new BadRequestError("One or more userIds are invalid");
     }
+
+    // Enforce per-group membership cap under the conversation lock above.
+    // Count uses rt.tx so it sees our own pending writes in this tx.
+    const currentCount = await rt.tx.conversationMember.count({
+      where: { conversationId: id },
+    });
+    ensureGroupCap(currentCount, newUsers.length);
 
     if (wasDirect) {
       // Promote the *other* original direct member from "member" → "admin"
@@ -1251,24 +1444,81 @@ router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBod
     throw new BadRequestError("messageId is required");
   }
 
-  // Verify message exists in this conversation (tenant-scoped)
+  // Verify the message exists in this tenant/conversation, and capture
+  // its `seq`. The seq is the monotonic ordering key used below to tell
+  // "does this advance the read marker or regress it?".
   const message = await prisma.message.findFirst({
     where: { id: messageId, conversationId: id, tenantId },
+    select: { seq: true },
   });
 
   if (!message) {
     throw new NotFoundError("Message not found");
   }
 
-  await withRealtime(async (rt) => {
-    await rt.tx.conversationMember.update({
-      where: { conversationId_userId: { conversationId: id, userId: user.id } },
-      data: {
-        lastReadMessageId: messageId,
-        lastReadAt: new Date(),
-        unreadCount: 0,
-      },
-    });
+  const advanced = await withRealtime(async (rt) => {
+    // Monotonic conditional UPDATE.
+    //
+    // Two bugs the previous unconditional UPDATE had:
+    //   1. Read-marker regression — two concurrent mark-read calls from
+    //      the same user (scroll-up then scroll-down; background tab
+    //      catching up while foreground already advanced) landing in the
+    //      opposite order of intent would let the older request clobber
+    //      the newer one. Unread badge reappears, messages flash back.
+    //   2. Lost unread bumps — `unread_count = 0` overwrites any
+    //      `unread_count += 1` from concurrent new-message inserts. A
+    //      message that arrived between my read-target-fetch and my
+    //      update would leave the count at 0 even though the user
+    //      hasn't seen it.
+    //
+    // Both are fixed in one statement:
+    //   - WHERE clause compares the target message's seq against the
+    //     member's CURRENT lastReadMessage's seq; no-op when regressing.
+    //   - unread_count is recomputed from a subquery over messages
+    //     newer than the just-read seq, so concurrent inserts are
+    //     reflected correctly (including any that committed between
+    //     the outer findFirst and this UPDATE).
+    //
+    // Under READ COMMITTED, Postgres re-checks the WHERE predicate under
+    // the row lock after waiting for any concurrent writer, so the seq
+    // comparison is evaluated against the latest committed value — the
+    // UPDATE is race-free without an advisory lock.
+    //
+    // Raw SQL because Prisma's builder cannot express a conditional
+    // UPDATE with a cross-table subquery in a single statement.
+    const affected = await rt.tx.$executeRaw`
+      UPDATE conversation_members cm
+      SET last_read_message_id = ${messageId},
+          last_read_at = NOW(),
+          unread_count = (
+            SELECT COUNT(*)::int
+            FROM messages m
+            WHERE m.conversation_id = cm.conversation_id
+              AND m.sender_id <> cm.user_id
+              AND m.deleted_at IS NULL
+              AND m.seq > ${message.seq}::int
+          )
+      FROM conversations c
+      WHERE cm.conversation_id = ${id}
+        AND cm.user_id = ${user.id}
+        AND c.id = cm.conversation_id
+        AND c.tenant_id = ${tenantId}
+        AND (
+          cm.last_read_message_id IS NULL
+          OR ${message.seq}::int > (
+            SELECT seq FROM messages WHERE id = cm.last_read_message_id
+          )
+        )
+    `;
+
+    // No-op: this mark-read regressed the pointer. Don't bump lastActiveAt
+    // (the user didn't actually advance their read position) and don't
+    // emit a read_receipt — peers already saw the newer receipt that was
+    // emitted by the earlier, winning call.
+    if (affected === 0) {
+      return false;
+    }
+
     await rt.tx.user.update({
       where: { id: user.id },
       data: { lastActiveAt: new Date() },
@@ -1285,9 +1535,10 @@ router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBod
       `read_${user.id}_${id}_${messageId}`,
       { exclude: user.id },
     );
+    return true;
   });
 
-  res.json({ ok: true });
+  res.json({ ok: true, advanced });
 });
 
 // ─── Mute / unmute conversation ───────────────────────────────
@@ -1403,7 +1654,7 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, val
 // ─── Remove reaction ──────────────────────────────────────────
 
 router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", requireAuth, async (req, res) => {
-  const { user } = req as AuthenticatedRequest;
+  const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
   const emoji = decodeURIComponent(param(req.params.emoji));
@@ -1412,15 +1663,55 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
     throw new BadRequestError("emoji must be 1-16 chars");
   }
 
-  const deleted = await prisma.reaction.deleteMany({
-    where: { messageId, userId: user.id, emoji },
+  // Gate symmetrically with the add handler: message must exist in this
+  // tenant/conversation and the caller must currently be a member. Without
+  // this, a user who was removed from the conversation but still has a
+  // lingering reaction row could emit a reaction_removed event into a
+  // room they no longer belong to. Harmless but asymmetric.
+  const message = await prisma.message.findFirst({
+    where: {
+      id: messageId,
+      conversationId: id,
+      tenantId,
+      conversation: { members: { some: { userId: user.id } } },
+    },
+    select: { id: true },
   });
-
-  if (deleted.count === 0) {
-    throw new NotFoundError("Reaction not found");
+  if (!message) {
+    throw new NotFoundError("Message not found");
   }
 
   await withRealtime(async (rt) => {
+    // Three things that MUST be atomic with the event enqueue, all now
+    // inside the same transaction + outbox write:
+    //   1. Resolve the reaction row's id BEFORE deleting — used as the
+    //      outbox idempotency key below.
+    //   2. Delete the row.
+    //   3. Enqueue the `reaction_removed` event.
+    //
+    // Previously the deleteMany ran OUTSIDE withRealtime, so a rollback
+    // of the event tx would leave the row deleted with no event — peers
+    // kept showing the stale reaction until a full reload. Moving it
+    // inside makes both land-together-or-not-at-all via the outbox.
+    //
+    // Idempotency key notes: using the reaction's own UUID instead of
+    // `(messageId, userId, emoji, Date.now())` — Date.now() defeated
+    // retry dedup on the client side, and the timestamp-less emoji
+    // form would collide on add→remove→re-add→remove (same tuple,
+    // Centrifugo dedupes the second remove event → UI bug). The row
+    // id is unique per reaction lifetime so the key is stable across
+    // retries and distinct across re-adds.
+    const row = await rt.tx.reaction.findUnique({
+      where: {
+        messageId_userId_emoji: { messageId, userId: user.id, emoji },
+      },
+      select: { id: true },
+    });
+    if (!row) {
+      throw new NotFoundError("Reaction not found");
+    }
+    await rt.tx.reaction.delete({ where: { id: row.id } });
+
     await rt.enqueueToConversation(
       id,
       {
@@ -1430,7 +1721,7 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
         emoji,
         userId: user.id,
       },
-      `reaction_remove_${messageId}_${user.id}_${emoji}_${Date.now()}`,
+      `reaction_remove_${row.id}`,
     );
   });
 
