@@ -29,6 +29,64 @@ function nsLabel(prefix: string): string {
  * picking incompatible keys for the same data.
  */
 
+// ─── Periodic hit/miss summary ───────────────────────────────
+//
+// In-process counters rolled up into one log line every CACHE_STATS_
+// INTERVAL_MS so operators can glance at the logs and see whether the
+// cache is actually being exercised. Prometheus gives the same numbers
+// at `/metrics`, but a human-readable log line doesn't need a scraper
+// to answer the "is Redis actually working?" question.
+//
+// A namespace with 0 activity in a window is omitted; a window with no
+// activity at all skips the log line entirely. So in an idle system
+// you won't see anything — which itself is a signal that the app isn't
+// serving traffic.
+
+const CACHE_STATS_INTERVAL_MS = 60_000;
+
+type NsStats = { hits: number; misses: number; errors: number };
+const cacheStats = new Map<string, NsStats>();
+
+function bump(ns: string, result: "hit" | "miss" | "error"): void {
+  let entry = cacheStats.get(ns);
+  if (!entry) {
+    entry = { hits: 0, misses: 0, errors: 0 };
+    cacheStats.set(ns, entry);
+  }
+  if (result === "hit") entry.hits++;
+  else if (result === "miss") entry.misses++;
+  else entry.errors++;
+}
+
+const statsTimer = setInterval(() => {
+  if (cacheStats.size === 0) return;
+  const summary: Record<
+    string,
+    { hits: number; misses: number; errors: number; ratio: number }
+  > = {};
+  let anyActivity = false;
+  for (const [ns, s] of cacheStats) {
+    const total = s.hits + s.misses;
+    if (total === 0 && s.errors === 0) continue;
+    anyActivity = true;
+    summary[ns] = {
+      hits: s.hits,
+      misses: s.misses,
+      errors: s.errors,
+      ratio: total > 0 ? Math.round((s.hits / total) * 1000) / 1000 : 0,
+    };
+  }
+  if (anyActivity) {
+    logger.info(
+      { windowSec: CACHE_STATS_INTERVAL_MS / 1000, stats: summary },
+      "[cache] stats",
+    );
+  }
+  cacheStats.clear();
+}, CACHE_STATS_INTERVAL_MS);
+// Don't block shutdown waiting for the next tick.
+statsTimer.unref();
+
 export const CACHE_NS = {
   /** Better-auth session → user + session info. Short TTL bounds the
    *  revocation window. Keyed on the raw cookie value, not the user id,
@@ -86,12 +144,15 @@ export async function cacheGet<T>(
     const raw = await redis.get(key(ns, id));
     if (raw === null) {
       recordCacheOp(label, "get", "miss");
+      bump(label, "miss");
       return null;
     }
     recordCacheOp(label, "get", "hit");
+    bump(label, "hit");
     return JSON.parse(raw, reviveDates) as T;
   } catch (err) {
     recordCacheOp(label, "get", "error");
+    bump(label, "error");
     logger.warn(
       { err: { message: (err as Error).message }, ns: ns.prefix, id },
       "[cache] get failed",
@@ -177,11 +238,17 @@ export async function cacheBatchGetOrSet<T>(
 ): Promise<Map<string, T>> {
   const result = new Map<string, T>();
   if (ids.length === 0) return result;
+  const label = nsLabel(ns.prefix);
 
   let cached: (string | null)[] = [];
+  let mgetFailed = false;
   try {
     cached = await redis.mget(...ids.map((id) => key(ns, id)));
   } catch (err) {
+    mgetFailed = true;
+    // Every requested id is accounted as an error for visibility, then
+    // we fall through to `loader` below so the request still completes.
+    for (let i = 0; i < ids.length; i++) bump(label, "error");
     logger.warn(
       { err: { message: (err as Error).message }, ns: ns.prefix },
       "[cache] mget failed",
@@ -193,12 +260,15 @@ export async function cacheBatchGetOrSet<T>(
   for (let i = 0; i < ids.length; i++) {
     const raw = cached[i];
     if (raw === null) {
+      if (!mgetFailed) bump(label, "miss");
       misses.push(ids[i]);
       continue;
     }
     try {
       result.set(ids[i], JSON.parse(raw, reviveDates) as T);
+      bump(label, "hit");
     } catch {
+      bump(label, "error");
       misses.push(ids[i]);
     }
   }
