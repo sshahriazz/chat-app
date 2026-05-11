@@ -1,15 +1,18 @@
 /**
  * API client base URL.
  *
- * Defaults to empty string → same-origin. Requests go to `/api/...` and
- * Next.js rewrites (next.config.ts) proxy them to the backend at
- * `API_PROXY_URL`. Benefits: no CORS, the session cookie lives on one
- * domain, and Dokploy only needs one domain routed at the web service.
+ * Production (Traefik-direct): leave empty. Requests go to `/api/...`
+ * relative to the page origin (e.g. `chat.technext.it/api/...`).
+ * Traefik on the Dokploy host routes that path to the `server`
+ * container directly — the `web` container is not in the request
+ * path. Same-origin means no CORS preflights.
  *
- * Override via `NEXT_PUBLIC_API_BASE_URL` if you need cross-origin
- * requests (e.g. local dev without the rewrite, or a split deployment
- * where web and server live on separate domains). Value is baked into
- * the client bundle at build time.
+ * Local dev: set to `http://localhost:3001` (passed as a build arg
+ * by `compose.dev.yml`). The browser at `localhost:3000` calls
+ * `localhost:3001/api/...` cross-origin; the server's CORS middleware
+ * allows it via the dev origin in `CORS_ALLOWED_ORIGINS`.
+ *
+ * Value is baked into the client bundle at `next build` time.
  */
 import { getAuthToken } from "./auth-token";
 

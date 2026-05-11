@@ -19,8 +19,11 @@ import {
  * user id. Real tenants wire up their own password flow on their own
  * backend; only the JWT + upsert contract ends at this server.
  *
- * Same-origin base URL — the Next.js server proxies `/api/*` through
- * to the Express backend, so no CORS and no explicit API host needed.
+ * Base URL resolution: prod uses `/api/...` relative to the page
+ * origin and Traefik routes it directly to the server container (no
+ * `web` proxy). Local dev sets `NEXT_PUBLIC_API_BASE_URL` to
+ * `http://localhost:3001` via `compose.dev.yml` so the browser
+ * cross-origins to the host-bound server port.
  */
 
 const baseURL =

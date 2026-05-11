@@ -11,14 +11,19 @@ let connected = false;
 const presenceSubs = new Map<string, Subscription>();
 
 function getWsUrl() {
-  // Same-origin by default: `ws(s)://<page-host>/connection/websocket`
-  // is proxied to Centrifugo by the custom Next server (`server.mjs`).
-  // Keeping the browser on one origin means one TLS cert and no CORS;
-  // the Centrifugo container doesn't need a public host port at all.
+  // Production (Traefik-direct): leave NEXT_PUBLIC_CENTRIFUGO_URL unset.
+  // The browser opens `wss://<page-host>/connection/websocket` and
+  // Traefik routes that path to the `centrifugo` container directly
+  // (no `web` proxy in the middle). One origin = one TLS cert, no
+  // CORS, Centrifugo never needs a public host port.
   //
-  // Override with `NEXT_PUBLIC_CENTRIFUGO_URL` if you want the browser
-  // to connect to Centrifugo directly (e.g. dedicated subdomain +
-  // Traefik route).
+  // Local dev: NEXT_PUBLIC_CENTRIFUGO_URL is set to
+  // `ws://localhost:8000/connection/websocket` via compose.dev.yml,
+  // because there's no Traefik on the laptop and Centrifugo's port
+  // 8000 is host-bound by the dev overlay.
+  //
+  // Custom deployment: override with NEXT_PUBLIC_CENTRIFUGO_URL if you
+  // route Centrifugo on a dedicated subdomain.
   const explicit = process.env.NEXT_PUBLIC_CENTRIFUGO_URL;
   if (explicit) return explicit;
   if (typeof window !== "undefined") {

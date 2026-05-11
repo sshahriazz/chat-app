@@ -18,6 +18,17 @@
 # (no overlay) — secrets become required, ports stay internal.
 
 services:
+  # In prod, Traefik routes /api, /connection/websocket, /chatapp on the
+  # same origin as the UI — so the browser uses relative paths. Locally
+  # there's no Traefik, so the browser has to be told the absolute URLs
+  # of each backend port. NEXT_PUBLIC_* are baked at build time, so
+  # they're passed as build args here (not runtime env).
+  web:
+    build:
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+        NEXT_PUBLIC_CENTRIFUGO_URL: ws://localhost:8000/connection/websocket
+
   postgres:
     ports:
       - "${POSTGRES_HOST_PORT:-5433}:5432"
