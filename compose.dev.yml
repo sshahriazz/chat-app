@@ -64,3 +64,12 @@ services:
       DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-true}
       ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-default,demo_acme,demo_beta}
       WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-false}
+
+      # Dev URLs that differ from prod. In prod the API + storage live
+      # on the same origin as the UI via Traefik; locally they're on
+      # separate host-bound ports, so we override the URLs the server
+      # generates. These are forced (no `${VAR:-…}`) so even a stale
+      # value in root `.env` (e.g. S3_PUBLIC_URL_BASE pointing at
+      # localhost:3000 from the old proxy days) can't break dev.
+      S3_PUBLIC_URL_BASE: http://localhost:9000/chatapp
+      OPENAPI_SERVER_URL: http://localhost:3001/api
