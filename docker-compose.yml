@@ -72,7 +72,37 @@ services:
     networks: [dokploy-network]
     volumes:
       - ./centrifugo.json:/centrifugo/config.json:ro
-    command: centrifugo -c config.json
+    # Centrifugo v6 doesn't split slice env vars on commas — it takes
+    # whatever string you pass and treats it as a single element. Both
+    # halves of the stack want one canonical CORS_ALLOWED_ORIGINS env
+    # (comma-separated, the server's convention), so we convert at
+    # startup to Centrifugo's indexed-env format:
+    #   CENTRIFUGO_CLIENT_ALLOWED_ORIGINS_0=https://a.com
+    #   CENTRIFUGO_CLIENT_ALLOWED_ORIGINS_1=https://b.com
+    # This is the documented way Centrifugo accepts slice config via
+    # env vars, and it's idempotent (the helper unsets the original
+    # var, so re-running doesn't double-export).
+    command:
+      - sh
+      - -c
+      - |
+        if [ -n "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" ]; then
+          oldifs=$$IFS
+          IFS=','
+          set -- $$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS
+          IFS=$$oldifs
+          unset CENTRIFUGO_CLIENT_ALLOWED_ORIGINS
+          i=0
+          for origin in "$$@"; do
+            # Trim leading/trailing whitespace.
+            origin=$$(echo "$$origin" | awk '{$$1=$$1; print}')
+            if [ -n "$$origin" ]; then
+              eval "export CENTRIFUGO_CLIENT_ALLOWED_ORIGINS_$$i=\"$$origin\""
+              i=$$((i+1))
+            fi
+          done
+        fi
+        exec centrifugo -c config.json
     environment:
       # Centrifugo env vars override matching keys in the config JSON.
       # Keeping secrets in env (driven by the root `.env`) means the
