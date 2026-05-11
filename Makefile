@@ -62,6 +62,9 @@ dev-restart: ## Restart a single service (usage: make dev-restart S=centrifugo)
 	@test -n "$(S)" || (echo "Usage: make dev-restart S=<service>" && exit 1)
 	$(COMPOSE_DEV) restart $(S)
 
+dev-recreate: ## Force-rebuild images AND recreate every container (use after compose/dockerfile changes)
+	$(COMPOSE_DEV) up -d --build --force-recreate
+
 dev-ps: ## List dev containers + their health
 	$(COMPOSE_DEV) ps
 
