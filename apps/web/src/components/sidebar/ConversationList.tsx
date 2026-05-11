@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Stack,
   TextInput,
@@ -18,6 +18,7 @@ import {
   IconPlus,
   IconBell,
   IconBellOff,
+  IconWorld,
 } from "@tabler/icons-react";
 import { notifications as mantineNotifications } from "@mantine/notifications";
 import {
@@ -26,8 +27,10 @@ import {
   enablePushSubscription,
 } from "@/lib/notify";
 import { useChat } from "@/context/ChatContext";
+import { getSessionMeta } from "@/lib/auth-client";
 import { ConversationItem } from "./ConversationItem";
 import { NewChatModal } from "./NewChatModal";
+import { TenantDirectory } from "./TenantDirectory";
 
 interface ConversationListProps {
   onSelect?: (id: string) => void;
@@ -44,6 +47,13 @@ export function ConversationList({ onSelect }: ConversationListProps) {
   } = useChat();
   const [search, setSearch] = useState("");
   const [newChatOpen, setNewChatOpen] = useState(false);
+  const [directoryOpen, setDirectoryOpen] = useState(false);
+
+  // The tenant directory is only actionable for unscoped identities —
+  // the server's `requireTenantWide` gate 403s scoped callers, and it
+  // would be confusing to show a launcher that always errors. Read
+  // once per render; session meta is stable for the session.
+  const canBrowseTenant = getSessionMeta()?.scope === null;
 
   const filtered = conversations.filter((c) => {
     if (!search) return true;
@@ -52,27 +62,13 @@ export function ConversationList({ onSelect }: ConversationListProps) {
     return c.members.some((m) => m.user.name.toLowerCase().includes(q));
   });
 
-  // Stable per-id click handlers so memoized ConversationItem rows don't
-  // invalidate on every parent render. onSelect is pinned to a ref because
-  // it's a prop (potentially changes identity) but we never want a click
-  // handler's identity to flip for that reason.
-  const onSelectRef = useRef(onSelect);
-  onSelectRef.current = onSelect;
-  const clickersRef = useRef(new Map<string, () => void>());
-  const getClicker = useCallback(
-    (id: string) => {
-      let fn = clickersRef.current.get(id);
-      if (!fn) {
-        fn = () => {
-          setActiveConversation(id);
-          onSelectRef.current?.(id);
-        };
-        clickersRef.current.set(id, fn);
-      }
-      return fn;
-    },
-    [setActiveConversation],
-  );
+  // Inline per-render click handlers. Previously cached in a ref-backed
+  // Map to keep identity stable for memoized ConversationItem rows, but
+  // React 19's `react-hooks/refs` rule forbids reading/writing refs
+  // during render. The savings were marginal — the list is typically
+  // <50 rows and ConversationItem's relevant props (active, conversation)
+  // already flip per parent render when the active id changes — so
+  // rebuilding closures is the simpler, rule-clean trade.
 
   return (
     <>
@@ -83,13 +79,28 @@ export function ConversationList({ onSelect }: ConversationListProps) {
           </Text>
           <Group gap={4}>
             <NotificationsToggle />
-            <ActionIcon
-              variant="light"
-              size="lg"
-              onClick={() => setNewChatOpen(true)}
-            >
-              <IconPlus size={18} />
-            </ActionIcon>
+            {canBrowseTenant && (
+              <Tooltip label="Browse tenant directory" position="bottom">
+                <ActionIcon
+                  variant="light"
+                  size="lg"
+                  onClick={() => setDirectoryOpen(true)}
+                  aria-label="Browse tenant directory"
+                >
+                  <IconWorld size={18} />
+                </ActionIcon>
+              </Tooltip>
+            )}
+            <Tooltip label="New chat" position="bottom">
+              <ActionIcon
+                variant="light"
+                size="lg"
+                onClick={() => setNewChatOpen(true)}
+                aria-label="New chat"
+              >
+                <IconPlus size={18} />
+              </ActionIcon>
+            </Tooltip>
           </Group>
         </Group>
 
@@ -118,7 +129,10 @@ export function ConversationList({ onSelect }: ConversationListProps) {
                   key={c.id}
                   conversation={c}
                   active={c.id === activeConversationId}
-                  onClick={getClicker(c.id)}
+                  onClick={() => {
+                    setActiveConversation(c.id);
+                    onSelect?.(c.id);
+                  }}
                 />
               ))}
               {/* Only show "Load more" when there's no search filter active —
@@ -144,16 +158,26 @@ export function ConversationList({ onSelect }: ConversationListProps) {
         opened={newChatOpen}
         onClose={() => setNewChatOpen(false)}
       />
+      {canBrowseTenant && (
+        <TenantDirectory
+          opened={directoryOpen}
+          onClose={() => setDirectoryOpen(false)}
+        />
+      )}
     </>
   );
 }
 
 function NotificationsToggle() {
-  const [perm, setPerm] = useState<NotificationPermission>("default");
-
-  useEffect(() => {
-    setPerm(getNotificationPermission());
-  }, []);
+  // Lazy initializer reads the current permission once on mount. The
+  // component is "use client", so SSR never runs this — the Notification
+  // global is always available at initializer-time. Previously this was
+  // done in a useEffect, but React 19's `react-hooks/set-state-in-effect`
+  // rule flags setState in effect bodies. Lazy init is the idiomatic
+  // replacement when the value is synchronously available at mount.
+  const [perm, setPerm] = useState<NotificationPermission>(() =>
+    getNotificationPermission(),
+  );
 
   // If the user has already granted permission in a past session, make sure
   // the browser is still registered for Web Push. Idempotent — re-subscribing
