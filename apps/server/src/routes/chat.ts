@@ -556,7 +556,9 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
     // both add 5, and the group ends at 1008 — past the cap. Advisory
     // lock is tx-scoped, keyed per-conversation, and auto-releases on
     // commit/rollback; cost is one cheap local Postgres call.
-    await rt.tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`conv:${id}`}::text, 0))`;
+    // `$executeRaw` (not `$queryRaw`): pg_advisory_xact_lock returns void,
+    // which Prisma's query engine refuses to deserialize.
+    await rt.tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`conv:${id}`}::text, 0))`;
 
     // Skip users who are already members to keep the event payload accurate.
     const existingMemberIds = (

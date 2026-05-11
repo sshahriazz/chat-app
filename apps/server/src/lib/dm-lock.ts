@@ -34,5 +34,10 @@ export async function acquireDmLock(
 ): Promise<void> {
   const [a, b] = [userA, userB].sort();
   const key = `dm:${tenantId}:${a}:${b}`;
-  await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}::text, 0))`;
+  // Use `$executeRaw`, not `$queryRaw`: `pg_advisory_xact_lock` returns
+  // `void`, and Prisma's query engine refuses to deserialize a void
+  // column ("Failed to deserialize column of type 'void'"). `$executeRaw`
+  // doesn't try to materialize rows, so it's the right primitive for a
+  // statement we only call for its side effect.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}::text, 0))`;
 }
