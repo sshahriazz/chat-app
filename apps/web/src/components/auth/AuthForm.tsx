@@ -23,6 +23,7 @@ import { useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
 import { IconUsers, IconMail } from "@tabler/icons-react";
 import { useAuth } from "@/context/AuthContext";
+import { API_BASE_URL } from "@/lib/api";
 
 interface DemoPersona {
   externalId: string;
@@ -216,8 +217,10 @@ function PersonaPicker() {
     let cancelled = false;
     // Kick off the demo seed in parallel with fetching the persona
     // list. Both are idempotent and complete in well under a second.
-    void fetch("/api/dev/seed-demo", { method: "POST" }).catch(() => {});
-    fetch("/api/dev/personas")
+    void fetch(`${API_BASE_URL}/api/dev/seed-demo`, { method: "POST" }).catch(
+      () => {},
+    );
+    fetch(`${API_BASE_URL}/api/dev/personas`)
       .then((r) =>
         r.ok ? r.json() : Promise.reject(new Error("load failed")),
       )
