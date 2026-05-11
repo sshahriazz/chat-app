@@ -9,16 +9,15 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { env } from "../env";
 
 /**
- * Generic S3-compatible client. Works for AWS S3 (leave `endpoint` unset),
+ * S3-compatible storage. Works for AWS S3 (leave `S3_ENDPOINT` unset),
  * Cloudflare R2, MinIO, Backblaze B2, Wasabi, etc.
  *
  * The server never touches bytes. It only:
  *   1. Mints a presigned PUT URL (valid ~5 min).
  *   2. Records metadata in the `attachments` table.
  *
- * Clients upload directly to object storage, then POST the message
- * with the `attachmentId`(s) we gave them. Bandwidth cost + latency
- * stay with object storage, not our app tier.
+ * Clients upload directly to object storage; bandwidth + latency stay
+ * with the storage tier, not the app tier.
  */
 
 function missingVar(name: string): never {
@@ -46,59 +45,68 @@ function requireS3Config() {
 }
 
 /**
- * Single S3 client pointed at the INTERNAL endpoint (e.g. `http://minio:9000`).
- * Both presigning and server-side operations (HEAD/DELETE) use it.
+ * Two S3 clients, each pointed at a different endpoint:
  *
- * Why sign against the internal hostname?
+ *   internalClient → S3_ENDPOINT (e.g. http://minio:9000)
+ *     Reached over the docker network. Used for server-only operations
+ *     (HEAD, DELETE) where there's no proxy in front of MinIO.
  *
- * Next.js's built-in rewrite proxy uses http-proxy with `changeOrigin:
- * true` (hardcoded — no way to configure via next.config.ts). That means
- * when a browser PUTs to `https://chat.example.com/<bucket>/<key>?sig=…`,
- * the web container rewrites the Host header to `minio:9000` before
- * forwarding to MinIO. SigV4 validates using the Host header MinIO
- * *receives*, not the URL the browser typed — so to pass validation the
- * signature must have been computed with Host=minio:9000.
+ *   presignClient → origin of S3_PUBLIC_URL_BASE (e.g. https://chat.technext.it)
+ *     Used purely to sign URLs the browser will use directly. The
+ *     browser PUTs/GETs to `chat.technext.it/<bucket>/<key>` with
+ *     `Host: chat.technext.it`; Traefik forwards to MinIO preserving
+ *     that Host header; MinIO verifies SigV4 against the received Host.
+ *     The signature must be computed against that same public Host, or
+ *     verification 403s — which is what this split achieves.
  *
- * The presigned URL returned to the browser is then rewritten (below) so
- * its origin matches the public host. That only changes the URL string —
- * the signature payload stays the same, and MinIO still sees what it
- * expects after the Host rewrite.
+ * Earlier versions used a single client signed against `minio:9000` and
+ * then rewrote the URL's origin to the public host before handing it to
+ * the browser. That worked only because Next.js's `http-proxy` rewrote
+ * `Host` back to `minio:9000` while forwarding — a side effect of `web`
+ * being the reverse proxy. With Traefik routing `/chatapp` direct to
+ * MinIO, the Host arrives unchanged and the old trick collapses.
  */
+let internalClient: S3Client | null = null;
+let presignClient: S3Client | null = null;
 
-let s3Client: S3Client | null = null;
-
-function getS3Client() {
-  if (s3Client) return s3Client;
-  const cfg = requireS3Config();
-  s3Client = new S3Client({
+function buildClient(
+  endpoint: string | undefined,
+  cfg: ReturnType<typeof requireS3Config>,
+): S3Client {
+  return new S3Client({
     region: cfg.region,
-    endpoint: cfg.endpoint,
+    endpoint,
     credentials: {
       accessKeyId: cfg.accessKeyId,
       secretAccessKey: cfg.secretAccessKey,
     },
-    // Custom endpoints (R2/MinIO) need path-style addressing.
-    forcePathStyle: !!cfg.endpoint,
+    // Path-style is required for any custom endpoint (MinIO/R2/etc.).
+    // For AWS-hosted S3 (no endpoint) the SDK uses subdomain style.
+    forcePathStyle: !!endpoint,
   });
-  return s3Client;
 }
 
-/**
- * Rewrite the origin of a presigned URL to the public host while leaving
- * the path and query string (including the signature) untouched.
- *
- *   http://minio:9000/chatapp/<key>?X-Amz-Signature=…
- *          ↓
- *   https://chat.example.com/chatapp/<key>?X-Amz-Signature=…
- *
- * The browser uses the rewritten URL; the Next.js rewrite proxy sends the
- * request on to MinIO with the internal Host header, so SigV4 still
- * validates against the Host the server signed with.
- */
-function rewriteToPublicOrigin(signedUrl: string, publicUrlBase: string): string {
-  const signed = new URL(signedUrl);
-  const publicOrigin = new URL(publicUrlBase).origin;
-  return `${publicOrigin}${signed.pathname}${signed.search}`;
+function getInternalClient(): S3Client {
+  if (internalClient) return internalClient;
+  internalClient = buildClient(requireS3Config().endpoint, requireS3Config());
+  return internalClient;
+}
+
+function getPresignClient(): S3Client {
+  if (presignClient) return presignClient;
+  const cfg = requireS3Config();
+  // Use only the *origin* of the public URL. The SDK in path-style
+  // mode appends `/<bucket>/<key>` itself — keeping the bucket in
+  // the endpoint would double-prefix.
+  // For AWS-hosted S3 (no custom endpoint), there's no Host-rewrite
+  // problem to solve: presigned URLs are subdomain-style and signed
+  // for the actual S3 host. In that case we keep `endpoint: undefined`
+  // so the SDK uses its default subdomain behavior.
+  const publicOrigin = cfg.endpoint
+    ? new URL(cfg.publicUrlBase).origin
+    : undefined;
+  presignClient = buildClient(publicOrigin, cfg);
+  return presignClient;
 }
 
 export interface UploadUrlResult {
@@ -116,7 +124,6 @@ export async function createUploadUrl(params: {
   expiresIn?: number;
 }): Promise<UploadUrlResult> {
   const cfg = requireS3Config();
-  const client = getS3Client();
   const expiresIn = params.expiresIn ?? 5 * 60; // 5 min
 
   const cmd = new PutObjectCommand({
@@ -126,16 +133,15 @@ export async function createUploadUrl(params: {
     ContentLength: params.contentLength,
   });
 
-  const internalUrl = await getSignedUrl(client, cmd, { expiresIn });
-  const uploadUrl = rewriteToPublicOrigin(internalUrl, cfg.publicUrlBase);
+  const uploadUrl = await getSignedUrl(getPresignClient(), cmd, { expiresIn });
   const publicUrl = `${cfg.publicUrlBase}/${params.key}`;
   return { uploadUrl, publicUrl, key: params.key, expiresIn };
 }
 
 /**
  * Signed GET URL that forces the browser to download rather than render.
- * The `ResponseContentDisposition` override is applied per-request, so the
- * same object can still serve inline for <img>/<video> on the public URL.
+ * `ResponseContentDisposition` is applied per-request so the same object
+ * still serves inline for <img>/<video> on the unsigned public URL.
  */
 export async function createDownloadUrl(params: {
   key: string;
@@ -143,7 +149,6 @@ export async function createDownloadUrl(params: {
   expiresIn?: number;
 }): Promise<{ url: string; expiresIn: number }> {
   const cfg = requireS3Config();
-  const client = getS3Client();
   const expiresIn = params.expiresIn ?? 60; // 1 min
 
   // RFC 5987 encoding so non-ASCII filenames survive.
@@ -156,31 +161,26 @@ export async function createDownloadUrl(params: {
     ResponseContentDisposition: disposition,
   });
 
-  const internalUrl = await getSignedUrl(client, cmd, { expiresIn });
-  const url = rewriteToPublicOrigin(internalUrl, cfg.publicUrlBase);
+  const url = await getSignedUrl(getPresignClient(), cmd, { expiresIn });
   return { url, expiresIn };
 }
 
-/**
- * Delete an object by key. Used by the orphan-attachment GC. Missing
- * objects resolve cleanly (S3 delete is idempotent).
- */
 export async function deleteObject(key: string): Promise<void> {
   const cfg = requireS3Config();
-  const client = getS3Client();
-  await client.send(new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }));
+  await getInternalClient().send(
+    new DeleteObjectCommand({ Bucket: cfg.bucket, Key: key }),
+  );
 }
 
 /**
- * HEAD an object and return its actual byte size, or `null` if it doesn't
- * exist. Used by the post-upload verification flow to confirm the
- * bytes the client actually PUT match the size we signed the presign for.
+ * HEAD an object and return its actual byte size, or `null` if missing.
+ * Used by the post-upload verification flow to confirm the bytes the
+ * client actually PUT match the size we signed the presign for.
  */
 export async function headObjectSize(key: string): Promise<number | null> {
   const cfg = requireS3Config();
-  const client = getS3Client();
   try {
-    const res = await client.send(
+    const res = await getInternalClient().send(
       new HeadObjectCommand({ Bucket: cfg.bucket, Key: key }),
     );
     return typeof res.ContentLength === "number" ? res.ContentLength : null;
