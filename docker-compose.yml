@@ -1,27 +1,29 @@
 # Full-stack compose used by Dokploy for deployment.
 #
-# Network topology — only `web` is bound to a host port. Every other
-# service (postgres, redis, centrifugo, minio, server, migrate) talks
-# via the internal compose network and is unreachable from outside
-# Docker. Browser traffic hits web, which proxies through Next.js
-# rewrites (see apps/web/next.config.ts):
+# Network topology — every container talks over the internal compose
+# network. Public ingress is handled by Dokploy's Traefik, which
+# routes paths on `chat.technext.it` (or whatever host you configure)
+# directly to the matching container based on Domain entries in the
+# Dokploy UI. The expected entries are:
 #
-#   /api/*                → server    (HTTP)
-#   /connection/websocket → centrifugo (WebSocket upgrade)
-#   /chatapp/*            → minio     (presigned attachments)
+#   chat.technext.it /                     → web        :3000  (UI)
+#   chat.technext.it /api                  → server     :3001  (REST)
+#   chat.technext.it /connection/websocket → centrifugo :8000  (realtime WS)
+#   chat.technext.it /chatapp              → minio      :9000  (attachments)
 #
-# Next.js's built-in rewrites proxy both HTTP and WS upgrades via
-# `http-proxy` internally — no custom server / external reverse proxy
-# needed.
+# Each container is reached *directly* via Traefik — `web` is no
+# longer in the request path for `/api`, `/connection/websocket`, or
+# `/chatapp`. That decoupling means:
+#   - third-party integrators can hit the API + realtime without
+#     depending on the chat-app's own UI container,
+#   - `web` redeploys don't take down the API or realtime,
+#   - swapping the realtime backend (Centrifugo → something else) is
+#     a Traefik-route change, not a Next.js code change.
 #
-# Rewrite destinations are baked into the web image at build time (Next
-# evaluates `rewrites()` during `next build`). Supply them as build args
-# if you need anything other than the compose service-name defaults.
-
 # All services share `dokploy-network` so they can resolve each other
 # by compose service name (`server`, `redis`, `minio`, …). Dokploy's
-# Traefik lives on that same network; whichever services get domain
-# labels via the Dokploy UI become publicly routable — everyone else
+# Traefik lives on that same network; whichever services get Domain
+# entries via the Dokploy UI become publicly routable — everyone else
 # stays internal.
 networks:
   dokploy-network:
@@ -228,22 +230,18 @@ services:
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       VAPID_SUBJECT: ${VAPID_SUBJECT:-}
 
-  # ─── Web / Next.js (PUBLIC — the only host-bound service) ────
+  # ─── Web / Next.js (UI only — pure presentation layer) ───────
   web:
     build:
       context: .
       dockerfile: apps/web/Dockerfile
       args:
-        # Client-bundle env (browser-facing).
+        # Client-bundle env (browser-facing). Empty defaults make the
+        # browser use same-origin relative paths; Traefik handles
+        # routing `/api`, `/connection/websocket`, and `/chatapp` to
+        # the right backend container.
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
         NEXT_PUBLIC_CENTRIFUGO_URL: ${NEXT_PUBLIC_CENTRIFUGO_URL:-}
-        # Rewrite destinations — baked into the Next routes manifest at
-        # build time. Defaults in the Dockerfile match the compose DNS
-        # names, so no overrides are needed for out-of-the-box `compose up`.
-        API_PROXY_URL: ${API_PROXY_URL:-http://server:3001}
-        WS_PROXY_URL: ${WS_PROXY_URL:-http://centrifugo:8000}
-        STORAGE_PROXY_URL: ${STORAGE_PROXY_URL:-http://minio:9000}
-        STORAGE_BUCKET: ${MINIO_BUCKET:-chatapp}
     restart: unless-stopped
     networks: [dokploy-network]
     depends_on:

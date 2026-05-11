@@ -20,24 +20,14 @@ FROM deps AS build
 WORKDIR /app
 
 # NEXT_PUBLIC_* values are baked into the client JS bundle at build
-# time. Dokploy / compose supply them as build args.
+# time. Dokploy / compose supply them as build args. Default empty
+# string → client uses same-origin relative paths (`/api/...`,
+# `/chatapp/...`, `/connection/websocket`); Traefik routes those
+# directly to the matching backend container, no Next.js proxying.
 ARG NEXT_PUBLIC_API_BASE_URL=""
 ARG NEXT_PUBLIC_CENTRIFUGO_URL=""
 ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL
 ENV NEXT_PUBLIC_CENTRIFUGO_URL=$NEXT_PUBLIC_CENTRIFUGO_URL
-
-# Rewrite destinations are evaluated at `next build` and serialized
-# into the routes-manifest — they HAVE to be set as build args, not
-# runtime envs. Defaults point at compose service names so rebuilding
-# with no overrides produces a working image.
-ARG API_PROXY_URL=http://server:3001
-ARG WS_PROXY_URL=http://centrifugo:8000
-ARG STORAGE_PROXY_URL=http://minio:9000
-ARG STORAGE_BUCKET=chatapp
-ENV API_PROXY_URL=$API_PROXY_URL \
-    WS_PROXY_URL=$WS_PROXY_URL \
-    STORAGE_PROXY_URL=$STORAGE_PROXY_URL \
-    STORAGE_BUCKET=$STORAGE_BUCKET
 
 COPY apps/web apps/web
 COPY tsconfig.base.json ./
