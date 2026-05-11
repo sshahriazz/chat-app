@@ -72,37 +72,30 @@ services:
     networks: [dokploy-network]
     volumes:
       - ./centrifugo.json:/centrifugo/config.json:ro
-    # Centrifugo v6 doesn't split slice env vars on commas — it takes
-    # whatever string you pass and treats it as a single element. Both
-    # halves of the stack want one canonical CORS_ALLOWED_ORIGINS env
-    # (comma-separated, the server's convention), so we convert at
-    # startup to Centrifugo's indexed-env format:
-    #   CENTRIFUGO_CLIENT_ALLOWED_ORIGINS_0=https://a.com
-    #   CENTRIFUGO_CLIENT_ALLOWED_ORIGINS_1=https://b.com
-    # This is the documented way Centrifugo accepts slice config via
-    # env vars, and it's idempotent (the helper unsets the original
-    # var, so re-running doesn't double-export).
+    # Centrifugo v6's env-var parser doesn't split slice values on
+    # commas (whole string → 1-element array). JSON-in-env doesn't
+    # work either (whole `[…]` string → 1-element array containing the
+    # brackets). Indexed env vars (CENTRIFUGO_CLIENT_ALLOWED_ORIGINS_0,
+    # _1, …) are explicitly rejected: Centrifugo logs them as "unknown
+    # var in environment" and ignores them.
+    #
+    # So we patch the mounted config.json with a JSON array built from
+    # comma-separated CORS_ALLOWED_ORIGINS at startup, write the result
+    # to a writable path, and start Centrifugo with that file. The env
+    # var is then unset so Centrifugo's override logic doesn't undo
+    # what we just patched in.
     command:
       - sh
       - -c
       - |
         if [ -n "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" ]; then
-          oldifs=$$IFS
-          IFS=','
-          set -- $$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS
-          IFS=$$oldifs
-          unset CENTRIFUGO_CLIENT_ALLOWED_ORIGINS
-          i=0
-          for origin in "$$@"; do
-            # Trim leading/trailing whitespace.
-            origin=$$(echo "$$origin" | awk '{$$1=$$1; print}')
-            if [ -n "$$origin" ]; then
-              eval "export CENTRIFUGO_CLIENT_ALLOWED_ORIGINS_$$i=\"$$origin\""
-              i=$$((i+1))
-            fi
-          done
+          ORIGINS_JSON=$$(echo "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" | awk -F, '{printf "["; for(i=1;i<=NF;i++) {gsub(/^ +| +$$/, "", $$i); printf "%s%c%s%c", (i>1?",":""), 34, $$i, 34} printf "]"}')
+          sed "s|\"allowed_origins\":[[:space:]]*\[[^]]*\]|\"allowed_origins\": $$ORIGINS_JSON|" /centrifugo/config.json > /tmp/centrifugo.json
+        else
+          cp /centrifugo/config.json /tmp/centrifugo.json
         fi
-        exec centrifugo -c config.json
+        unset CENTRIFUGO_CLIENT_ALLOWED_ORIGINS
+        exec centrifugo -c /tmp/centrifugo.json
     environment:
       # Centrifugo env vars override matching keys in the config JSON.
       # Keeping secrets in env (driven by the root `.env`) means the
