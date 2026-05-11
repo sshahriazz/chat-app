@@ -1,4 +1,16 @@
-import "dotenv/config";
+// Load `.env` from the repo root, not from the server's cwd. There's one
+// canonical .env per workspace; the server reads from that single file
+// regardless of where `pnpm dev` is invoked from. In docker the file
+// doesn't exist and compose-injected process.env wins.
+import { config as loadEnv } from "dotenv";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+loadEnv({
+  path: path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../../.env",
+  ),
+});
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import helmet from "helmet";

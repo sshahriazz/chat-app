@@ -1,0 +1,55 @@
+# Local-development overrides — layered on top of `docker-compose.yml`
+# when you run `make dev` (which uses `-f docker-compose.yml -f compose.dev.yml`).
+#
+# DOKPLOY DOES NOT READ THIS FILE. Production deploys see only
+# `docker-compose.yml`, which stays strict (secrets required, no host-
+# port bindings except web). This file relaxes those constraints for the
+# laptop:
+#
+#   - Binds every backend port to localhost so you can hit Centrifugo,
+#     MinIO, Postgres, etc. directly from your IDE / curl / a separate
+#     `pnpm dev` server.
+#   - Provides dev-default secrets via `:-fallback` for centrifugo so
+#     `docker compose up` works without first generating real ones.
+#   - Loosens `WEBHOOK_SIGNATURE_REQUIRED` and `DEV_MINT_ENABLED` so the
+#     reference client's demo personas + the dev mint endpoint work.
+#
+# To run prod-like locally: `docker compose -f docker-compose.yml up`
+# (no overlay) — secrets become required, ports stay internal.
+
+services:
+  postgres:
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+
+  redis:
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+
+  centrifugo:
+    environment:
+      # Dev fallbacks restored for local-only convenience. compose.dev.yml
+      # is never deployed, so the `dev-secret-change-in-production` value
+      # can never reach prod through this overlay.
+      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
+      CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
+      CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:-admin}
+      CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:-dev-admin-secret}
+    ports:
+      - "${CENTRIFUGO_HOST_PORT:-8000}:8000"
+
+  minio:
+    ports:
+      - "${MINIO_HOST_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+
+  server:
+    ports:
+      - "${SERVER_HOST_PORT:-3001}:3001"
+    environment:
+      # Loud-failure overrides relaxed for the laptop. Mirror these in
+      # Dokploy's panel for prod (they're already strict there).
+      MASTER_API_KEY: ${MASTER_API_KEY:-dev-master-key-laptop-only}
+      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-true}
+      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-default,demo_acme,demo_beta}
+      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-false}
