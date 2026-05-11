@@ -3,7 +3,7 @@
 //
 // SW_VERSION: bump this string whenever the file logic changes so the
 // browser re-checks and replaces a stale worker.
-const SW_VERSION = "2026-04-21-b";
+const SW_VERSION = "2026-05-12-renotify";
 
 self.addEventListener("install", () => {
   console.log("[sw]", SW_VERSION, "install");
@@ -54,6 +54,13 @@ self.addEventListener("push", (event) => {
       await self.registration.showNotification(data.title || "New message", {
         body: data.body || "",
         tag: data.tag,
+        // `tag` groups by conversation so a chatty conv doesn't stack a
+        // pile of separate banners. `renotify` makes the browser
+        // *re-alert* on each new push (sound + banner) even when an
+        // existing notification with the same tag is already open or
+        // sitting in Notification Center — without it, you only ever see
+        // the first banner per conversation until you click it.
+        renotify: true,
         icon: data.icon,
         data: { url: data.url || "/" },
       });
