@@ -75,10 +75,14 @@ services:
       # committed `centrifugo.json` only holds non-sensitive structure
       # (namespaces, engine choice, etc) and Dokploy rotates secrets
       # without editing the file.
-      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
-      CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
-      CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:-admin}
-      CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:-dev-admin-secret}
+      # No `:-fallback` on secrets — if the env var is unset, compose
+      # interpolation produces an empty string and Centrifugo refuses to
+      # boot. That's the intended behavior: a misconfigured deploy fails
+      # loudly instead of silently authenticating against a dev secret.
+      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_SECRET:?CENTRIFUGO_TOKEN_SECRET is required}
+      CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:?CENTRIFUGO_API_KEY is required}
+      CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:?CENTRIFUGO_ADMIN_PASSWORD is required}
+      CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:?CENTRIFUGO_ADMIN_SECRET is required}
       # Must include the browser-facing origin — Centrifugo rejects the
       # WebSocket upgrade otherwise, breaking presence + live events.
       # Falls back to BETTER_AUTH_URL for the same reason as the server's
