@@ -1,353 +1,543 @@
 # Third-Party Integration Guide
 
-This chat backend is **user-agnostic**: your app owns its users, you mint short-lived JWTs on their behalf, and the chat server materializes them lazily. No user sync, no shadow auth system, no double-login.
+How to embed this chat service into your own product. Your app keeps owning its users and its UI; this server provides the messaging primitives (conversations, real-time delivery, attachments, search, push) and stays out of your way.
 
-Throughout this guide, the chat server lives at `https://chat.technext.it/chat-api`. Replace that with whatever host your deployment runs on.
+Throughout this guide the chat service lives at **`https://chat.technext.it`**. Swap that for your operator's host if it differs.
 
 ---
 
 ## Table of contents
 
-1. [Architecture](#1-architecture)
-2. [Onboarding your tenant](#2-onboarding-your-tenant)
-3. [Minting user JWTs](#3-minting-user-jwts)
-4. [Scopes — partitioning inside a tenant](#4-scopes--partitioning-inside-a-tenant)
-5. [Token lifecycle & refresh](#5-token-lifecycle--refresh)
-6. [Calling the chat API](#6-calling-the-chat-api)
-7. [Data shapes](#7-data-shapes)
-8. [Endpoint reference](#8-endpoint-reference)
-9. [Pagination](#9-pagination)
-10. [Idempotency & retries](#10-idempotency--retries)
-11. [Message content format (Tiptap JSON)](#11-message-content-format-tiptap-json)
-12. [File attachments](#12-file-attachments)
-13. [Realtime (Centrifugo)](#13-realtime-centrifugo)
-14. [Realtime event catalog](#14-realtime-event-catalog)
-15. [Web Push notifications](#15-web-push-notifications)
-16. [Webhooks](#16-webhooks)
-17. [Rate limits](#17-rate-limits)
-18. [Error responses](#18-error-responses)
-19. [Security](#19-security)
-20. [Troubleshooting](#20-troubleshooting)
-21. [Capability lifecycle at a glance](#21-capability-lifecycle-at-a-glance)
+1.  [Architecture overview](#1-architecture-overview)
+2.  [Public surface (URLs and ports)](#2-public-surface-urls-and-ports)
+3.  [Quick start — 5 minutes from zero to a working chat](#3-quick-start--5-minutes-from-zero-to-a-working-chat)
+4.  [Onboarding your tenant](#4-onboarding-your-tenant)
+5.  [Minting end-user JWTs](#5-minting-end-user-jwts)
+6.  [Scopes — partitioning within a tenant](#6-scopes--partitioning-within-a-tenant)
+7.  [Token lifecycle & refresh](#7-token-lifecycle--refresh)
+8.  [Calling the chat API](#8-calling-the-chat-api)
+9.  [Data shapes](#9-data-shapes)
+10. [Endpoint reference](#10-endpoint-reference)
+11. [Pagination](#11-pagination)
+12. [Idempotency & retries](#12-idempotency--retries)
+13. [Message content format (Tiptap JSON)](#13-message-content-format-tiptap-json)
+14. [File attachments](#14-file-attachments)
+15. [Real-time delivery (Centrifugo)](#15-real-time-delivery-centrifugo)
+16. [Real-time event catalog](#16-real-time-event-catalog)
+17. [Web Push notifications](#17-web-push-notifications)
+18. [Webhooks (your backend → us)](#18-webhooks-your-backend--us)
+19. [Rate limits](#19-rate-limits)
+20. [Error responses](#20-error-responses)
+21. [Security](#21-security)
+22. [Production checklist](#22-production-checklist)
+23. [Troubleshooting](#23-troubleshooting)
+24. [End-to-end reference: a working Next.js integration](#24-end-to-end-reference-a-working-nextjs-integration)
 
 ---
 
-## 1. Architecture
+## 1. Architecture overview
 
 ```
-┌──────────────────┐   1. your user logs in  ┌──────────────────┐
-│  YOUR FRONTEND   │ ──────────────────────▶ │   YOUR BACKEND   │
-└──────────────────┘                         └──────────────────┘
-         │                                              │
-         │          2. mint a user JWT signed           │
-         │            with your tenant's jwtSecret      │
-         │ ◀──────────────────────────────────────────  │
-         │                                              │
-         │                                              │ 3. (optional) webhooks
-         │                                              │    on profile change
-         │  4. call chat API with                       │
-         │     Authorization: Bearer <jwt>              │
-         ▼                                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       CHAT SERVER                            │
-│  • verifies JWT with your tenant's secret                    │
-│  • upserts a User row on first request (lazy)                │
-│  • exposes chat + realtime APIs                              │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────┐    1. user logs into     ┌──────────────────┐
+│   YOUR APP UI    │       your app           │  YOUR BACKEND    │
+│ (browser/Vercel) │ ◀──────────────────────▶ │ (Next.js, Rails, │
+└──────────────────┘                          │  Django, …)      │
+        │                                     └──────────────────┘
+        │ 2. browser asks YOUR backend                │
+        │    for a chat JWT                           │ 3. signs JWT with
+        │ ◀───────────────────────────────────────────┤    your tenant's
+        │                                             │    jwtSecret
+        │                                             │
+        │ 4. REST calls with Bearer <jwt>             │ 5. (optional) you
+        │    + WS open via centrifuge SDK             │    webhook user
+        ▼                                             │    profile changes
+┌──────────────────────────────────────────────┐      │    over to chat
+│  chat.technext.it/api  (REST, Express)       │ ◀────┘
+│  chat.technext.it/connection/websocket (WS)  │
+│  chat.technext.it/chatapp  (S3-compatible)   │
+└──────────────────────────────────────────────┘
 ```
 
-**Three layers of isolation**, each independent and composable:
+**Two delivery rails:**
 
-| Layer | Enforced by | Controls |
+| | What it does | Where the connection lives |
 |---|---|---|
-| Tenant | `tenantId` on every query | One third-party can't see another's data. |
-| Scope | `User.scope` on user discovery | Inside one tenant, partition users into contexts (project chats, support tickets, deal rooms). |
-| Conversation | `ConversationMember` on reads/writes | Once a conversation exists, only its members see it. |
+| **REST** (`/api`) | Mutations, list calls, history, presigned URLs | Browser → Traefik → server container |
+| **WebSocket** (`/connection/websocket`) | Live events: new messages, edits, reads, typing | Browser → Traefik → Centrifugo container |
 
-**Two secrets per tenant**, both surfaced exactly once at tenant creation:
+**You own users, identity, and your UI.** The chat server:
 
-| Secret | Owner | Used for | Renewable |
-|---|---|---|---|
-| `apiKey` | your backend only | server-to-server calls: webhooks, admin | yes — via rotate |
-| `jwtSecret` | your backend only | signing user JWTs | yes — invalidates every live token |
-
-Your **frontend never sees** `apiKey` or `jwtSecret`. It only sees short-lived user JWTs minted by your backend.
-
-> For the full chronological list of everything a tenant can do — onboarding through rotation — see [§21 Capability lifecycle at a glance](#21-capability-lifecycle-at-a-glance).
+- Materializes users lazily from the JWTs your backend signs (no copy-or-sync flow needed for basic identity).
+- Has no concept of password / OAuth / sessions — those live in your auth system.
+- Optionally accepts webhooks if you want profile updates / deletions to propagate immediately.
 
 ---
 
-## 2. Onboarding your tenant
+## 2. Public surface (URLs and ports)
 
-Ask the operator of this chat server to create a tenant for you. They will run:
+| URL | What lives there | Notes |
+|---|---|---|
+| `https://chat.technext.it/` | Reference UI (chat app's own frontend) | You don't need this. Your app builds its own UI. |
+| `https://chat.technext.it/api/*` | REST API | All `/api/*` paths routed direct to the server container via Traefik. JSON, Bearer auth. |
+| `https://chat.technext.it/api/docs` | OpenAPI playground (Scalar) | Browse + try every endpoint live. |
+| `wss://chat.technext.it/connection/websocket` | Centrifugo WebSocket | Same origin as REST; routed direct to Centrifugo. |
+| `https://chat.technext.it/chatapp/*` | Object storage (S3-compatible) | Direct uploads/downloads from the browser via presigned URLs. |
+
+**All four paths terminate at the same origin** (`chat.technext.it`). There's no Centrifugo-specific subdomain, no separate storage host. Your browser code uses one host name; Traefik routes paths to the right container internally.
+
+If your integrating app runs on a **different origin** (e.g. `https://chamate.com` on Vercel), no proxying is required on your end. The browser opens cross-origin connections directly to `chat.technext.it`. The chat server's CORS allowlist must include your origin — that's the one knob your operator turns per new integration.
+
+---
+
+## 3. Quick start — 5 minutes from zero to a working chat
+
+You'll create one tenant, federate one user, mint a JWT, and send a message — all via `curl`. Once that loop works end-to-end you've validated everything except the WebSocket.
+
+### 3.1 Provision a tenant (operator does this once)
+
+Operator needs `MASTER_API_KEY` from their Dokploy env panel.
 
 ```bash
-curl -X POST https://chat.technext.it/chat-api/admin/tenants \
+curl -X POST https://chat.technext.it/api/admin/tenants \
   -H "Authorization: Bearer $MASTER_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name": "Acme Corp"}'
+  -d '{"name": "Acme App"}'
 ```
 
-Response:
+Response (save `id`, `apiKey`, `jwtSecret` immediately — they are returned only on create):
 
 ```json
 {
-  "id": "tnt_abc123",
-  "name": "Acme Corp",
-  "apiKey": "k_9f8e7d6c...",
-  "jwtSecret": "s_1a2b3c4d..."
+  "id":        "tnt_3f9b...",
+  "name":      "Acme App",
+  "apiKey":    "ak_1c4f...",
+  "jwtSecret": "js_a72e...",
+  "createdAt": "2026-05-12T...",
+  "updatedAt": "2026-05-12T..."
 }
 ```
 
-**Store all three values in your backend's secret manager immediately.** `apiKey` and `jwtSecret` are shown exactly once — if you lose them, the only recovery is rotation (which invalidates the old values).
+### 3.2 Mint a user JWT (your backend would normally do this)
+
+For the smoke test you can hand-sign one with `node`:
+
+```bash
+node -e "
+import('jose').then(async ({ SignJWT }) => {
+  const secret = new TextEncoder().encode('js_a72e...');
+  const token = await new SignJWT({
+    sub:   'alice@acme',
+    name:  'Alice Chen',
+    email: 'alice@example.com',
+    iss:   'tnt_3f9b...',
+    scope: null,
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('1h')
+    .sign(secret);
+  console.log(token);
+});
+"
+```
+
+### 3.3 Call the API with the JWT
+
+```bash
+JWT="eyJhbGciOi..."
+
+# Resolve "who am I" — also creates Alice's User row in the chat DB lazily
+curl -sS https://chat.technext.it/api/me -H "Authorization: Bearer $JWT"
+```
+
+Response:
+```json
+{
+  "id":         "u_a3b1...",      ← internal chat-side id
+  "tenantId":   "tnt_3f9b...",
+  "externalId": "alice@acme",     ← your app's user id (sub claim)
+  "name":       "Alice Chen",
+  ...
+}
+```
+
+### 3.4 Create a DM and send a message
+
+```bash
+# Need a second user — repeat 3.2 with sub="bob@acme" name="Bob Park"
+# Get Bob's internal id from /api/me with Bob's JWT, call it $BOB_ID.
+
+# Create the DM:
+CONV=$(curl -sS -X POST https://chat.technext.it/api/conversations \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d "{\"type\":\"direct\",\"memberIds\":[\"$BOB_ID\"]}")
+CONV_ID=$(echo "$CONV" | jq -r .id)
+
+# Send a message:
+curl -sS -X POST "https://chat.technext.it/api/conversations/$CONV_ID/messages" \
+  -H "Authorization: Bearer $JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "content": { "type": "doc", "content": [
+      { "type": "paragraph", "content": [{ "type": "text", "text": "hello" }] }
+    ]},
+    "type": "text",
+    "clientMessageId": "smoke-test-1"
+  }'
+```
+
+If you got back a message with a `seq` and `id`, you're wired end-to-end. The rest of this guide is about turning that loop into a production integration.
 
 ---
 
-## 3. Minting user JWTs
+## 4. Onboarding your tenant
 
-Every request from your frontend to the chat server carries a JWT signed with your tenant's `jwtSecret`. The JWT is short-lived (≤ 1 hour is a good default). **Your backend is the only party that signs them** — never ship `jwtSecret` to the browser.
+A **Tenant** in this system is your integrating application — one tenant per app, not one tenant per user. Each tenant has:
 
-### You mint, not us
-
-The chat server **does not expose a production endpoint that mints JWTs for your users**. This is intentional and is the security core of the federated model:
-
-- You already run auth for your users (OAuth, SSO, password — whatever).
-- Your `jwtSecret` is cryptographic proof that *you* vouch for a user's identity when you sign `{ sub: userId }`.
-- If the chat server had a live `/mint-token` endpoint for your real tenant, anyone who hit it could mint tokens for any of your users — defeating the whole model.
-
-So the minting always happens **inside your backend**, with a `jwt.sign(...)` call using the `jwtSecret` you received at onboarding.
-
-```
-┌─ Production, real tenant ────────────────────────────────────┐
-│                                                              │
-│  1. Your user logs into your app (your auth)                 │
-│  2. Your FRONTEND asks your BACKEND for a chat token         │
-│  3. Your BACKEND signs a JWT with jwtSecret and returns it   │
-│  4. Your frontend calls chat.example.com with Bearer <jwt>   │
-│                                                              │
-│  The chat server is never in step 1–3.                       │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### ⚠️ Do not use `/api/dev/mint-token` in production
-
-This server ships a `POST /api/dev/mint-token` endpoint that *looks* like it mints tokens for you. **It's not for you.** It exists so the open-source reference web client in this repo can demonstrate the flow without requiring every reader to stand up a backend first.
-
-In production deploys, the endpoint is gated behind two independent switches both of which default to off:
-
-| Switch | Default | Purpose |
+| Field | Purpose | When to use |
 |---|---|---|
-| `DEV_MINT_ENABLED` | `false` | If false, the route returns 404. |
-| `ALLOW_DEV_MINT_TENANTS` | `""` (empty) | Per-tenant allowlist. Real tenants must never appear here. |
+| `id` | Goes in the `iss` (issuer) claim of every JWT you mint | Identifies which tenant a request belongs to |
+| `apiKey` | `Authorization: Bearer <apiKey>` for server-to-server webhook calls (`/api/webhooks/*`) | Profile updates, deletions, anything from your backend → chat |
+| `jwtSecret` | HMAC-SHA256 secret your backend uses to sign user JWTs | One JWT per browser session per user |
 
-Both have to be wrong for the endpoint to mint a token for a real tenant. If you ever see the error `Dev mint not allowed for this tenant in production`, that's the allowlist protecting a real tenant from being impersonated — it's working as designed, and the fix is **not** to add your tenant to the allowlist.
+### 4.1 Store the credentials
 
-If you see the endpoint advertised in your IDE or in the OpenAPI docs and wonder "should I call this?" — the answer is **no**. Sign JWTs in your backend with `jwt.sign(...)`, as shown below.
+Both `apiKey` and `jwtSecret` are surfaced **only on create** and at rotation. There is no way to read them back later. Persist immediately:
 
-### Claims
+- Backend env vars (never in client bundle): `CHAT_TENANT_ID`, `CHAT_TENANT_API_KEY`, `CHAT_TENANT_JWT_SECRET`
+- Treat as same sensitivity as your DB credentials — leakage allows anyone to mint JWTs impersonating any of your users.
 
-| Claim | Required | Max length | Description |
+### 4.2 Rotation
+
+When you suspect compromise or on a regular schedule:
+
+```bash
+# Rotate API key (used by your backend → chat webhooks):
+curl -X POST https://chat.technext.it/api/admin/tenants/$TENANT_ID/api-keys \
+  -H "Authorization: Bearer $MASTER_API_KEY"
+
+# Rotate JWT secret (signing key for end-user JWTs):
+curl -X POST https://chat.technext.it/api/admin/tenants/$TENANT_ID/jwt-secret/rotate \
+  -H "Authorization: Bearer $MASTER_API_KEY"
+```
+
+JWT secret rotation invalidates every JWT your users currently hold. Plan for re-mint on next API call — clients with a 401 should refetch their JWT.
+
+---
+
+## 5. Minting end-user JWTs
+
+Every authenticated browser request from your app to the chat server carries a Bearer JWT signed with your tenant's `jwtSecret`. Your backend mints these on demand for each logged-in user.
+
+### 5.1 Required claims
+
+| Claim | Type | Required | Description |
 |---|---|---|---|
-| `sub` | ✅ | 256 | Your own user id. Stored on the chat server as `User.externalId`. Stable across tokens. |
-| `iss` | ✅ | — | Your tenant id (e.g. `tnt_abc123`). Tells the chat server which `jwtSecret` to verify with. |
-| `name` | ✅ | 128 | Display name. Embedded in realtime events so peers see it without extra lookups. |
-| `image` | optional | 2048 | Avatar URL (must be a valid URL). |
-| `email` | optional | 254 | Display-only — the chat server does not use it for auth or dedup. |
-| `scope` | optional | 128 | Second-level partition inside your tenant. See §4. |
-| `exp` | ✅ | — | Expiry timestamp (seconds since epoch). |
-| `iat` | ✅ | — | Issued-at timestamp (seconds since epoch). |
+| `sub` | string | ✅ | Your app's user id. Stable for the lifetime of the user. Maps to `User.externalId` in the chat DB. |
+| `iss` | string | ✅ | Your tenant's `id` (from create response). Identifies which tenant the JWT belongs to. |
+| `exp` | number | ✅ | Unix expiration timestamp. Recommended: 1 hour (`now + 3600`). |
+| `iat` | number | ✅ | Unix issue timestamp. Set automatically by most libraries. |
+| `name` | string | ✅ | Display name. Shown in the chat UI. |
+| `email` | string | – | Optional. Display only — not unique on the chat side. |
+| `image` | string \| null | – | Avatar URL. Not validated server-side. |
+| `scope` | string \| null | – | See [§6 Scopes](#6-scopes--partitioning-within-a-tenant). `null` or absent = tenant-wide. |
 
-Algorithm: **HS256**. No other algorithm is accepted — tokens signed with RS256, none, or anything else fail with `401 Invalid user token`.
+The HMAC algorithm is **HS256** with `jwtSecret` as the secret.
 
-Clock skew tolerated: **± 30 seconds** by default (configurable per deployment via `TENANT_JWT_CLOCK_SKEW_SEC`).
-
-### Node.js (`jsonwebtoken`)
+### 5.2 Reference implementation — Node.js with `jose`
 
 ```ts
-import jwt from "jsonwebtoken";
+// your-app/lib/chat-token.ts
+import { SignJWT } from "jose";
 
-export function mintChatToken(
-  userId: string,
-  name: string,
-  opts: { image?: string; scope?: string | null; ttlSeconds?: number } = {},
-) {
-  return jwt.sign(
-    {
-      sub: userId,
-      name,
-      image: opts.image,
-      // Omit `scope` entirely when undefined so you don't accidentally
-      // stamp `scope: undefined` onto a tenant-wide user's token.
-      ...(opts.scope !== undefined ? { scope: opts.scope } : {}),
-    },
-    process.env.CHAT_JWT_SECRET!,
-    {
-      issuer: process.env.CHAT_TENANT_ID!,
-      expiresIn: opts.ttlSeconds ?? 3600,
-      algorithm: "HS256",
-    },
-  );
+const secret = new TextEncoder().encode(process.env.CHAT_TENANT_JWT_SECRET!);
+
+export interface ChatTokenOpts {
+  userId: string;       // your app's user id → JWT sub
+  name: string;
+  email?: string | null;
+  image?: string | null;
+  scope?: string | null; // null/undefined = tenant-wide
+  ttlSeconds?: number;   // default 3600
+}
+
+export async function mintChatToken(opts: ChatTokenOpts): Promise<string> {
+  return new SignJWT({
+    sub:   opts.userId,
+    name:  opts.name,
+    email: opts.email ?? undefined,
+    image: opts.image ?? undefined,
+    iss:   process.env.CHAT_TENANT_ID!,
+    scope: opts.scope ?? null,
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(`${opts.ttlSeconds ?? 3600}s`)
+    .sign(secret);
 }
 ```
 
-### Python (`PyJWT`)
+### 5.3 Reference implementation — Python with PyJWT
 
 ```python
+# your_app/chat_token.py
 import jwt, time, os
 
-def mint_chat_token(user_id: str, name: str, *, image=None, scope=None, ttl=3600):
-    now = int(time.time())
-    claims = {
-        "sub": user_id,
-        "name": name,
-        "iss": os.environ["CHAT_TENANT_ID"],
-        "iat": now,
-        "exp": now + ttl,
-    }
-    if image is not None:
-        claims["image"] = image
-    if scope is not None:  # pass "" to unset existing scope? No — the server ignores whitespace-only
-        claims["scope"] = scope
-    return jwt.encode(claims, os.environ["CHAT_JWT_SECRET"], algorithm="HS256")
+def mint_chat_token(user_id, name, *, email=None, image=None, scope=None, ttl=3600):
+    return jwt.encode(
+        {
+            "sub":   user_id,
+            "name":  name,
+            "email": email,
+            "image": image,
+            "iss":   os.environ["CHAT_TENANT_ID"],
+            "scope": scope,
+            "iat":   int(time.time()),
+            "exp":   int(time.time()) + ttl,
+        },
+        os.environ["CHAT_TENANT_JWT_SECRET"],
+        algorithm="HS256",
+    )
 ```
 
-### Go (`github.com/golang-jwt/jwt/v5`)
+### 5.4 Reference implementation — Go
 
 ```go
-func MintChatToken(userID, name string, opts ...TokenOpt) (string, error) {
+// your_app/chat_token.go
+package chat
+
+import (
+    "os"
+    "time"
+    "github.com/golang-jwt/jwt/v5"
+)
+
+type TokenOpts struct {
+    UserID, Name, Email, Image string
+    Scope                       *string
+    TTL                         time.Duration
+}
+
+func MintToken(opts TokenOpts) (string, error) {
     now := time.Now()
+    ttl := opts.TTL
+    if ttl == 0 { ttl = time.Hour }
+
     claims := jwt.MapClaims{
-        "sub":  userID,
-        "name": name,
-        "iss":  os.Getenv("CHAT_TENANT_ID"),
-        "iat":  now.Unix(),
-        "exp":  now.Add(time.Hour).Unix(),
+        "sub":   opts.UserID,
+        "iss":   os.Getenv("CHAT_TENANT_ID"),
+        "name":  opts.Name,
+        "email": opts.Email,
+        "image": opts.Image,
+        "scope": opts.Scope,
+        "iat":   now.Unix(),
+        "exp":   now.Add(ttl).Unix(),
     }
-    for _, opt := range opts { opt(claims) }
     tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-    return tok.SignedString([]byte(os.Getenv("CHAT_JWT_SECRET")))
+    return tok.SignedString([]byte(os.Getenv("CHAT_TENANT_JWT_SECRET")))
 }
 ```
 
-### Expose a mint endpoint on your backend
+### 5.5 Expose a mint endpoint on your backend
 
-```
-GET /api/chat-token   →  { token: string, expiresAt: number }
+The browser will call this each time it needs a fresh JWT. Auth is handled by your existing session system — only signed-in users get a token:
+
+```ts
+// your-app/app/api/chat/token/route.ts  (Next.js App Router)
+import { mintChatToken } from "@/lib/chat-token";
+import { auth } from "@/lib/auth";  // your existing session resolver
+
+export async function POST() {
+  const session = await auth();
+  if (!session?.user) return new Response("unauthorized", { status: 401 });
+
+  const token = await mintChatToken({
+    userId: session.user.id,
+    name:   session.user.name,
+    email:  session.user.email,
+    image:  session.user.image,
+    scope:  null, // or session.user.team, etc — see §6
+  });
+
+  return Response.json({ token });
+}
 ```
 
-Your frontend hits this on boot and again whenever the current token is within ~5 minutes of expiry. Set `Cache-Control: no-store` on the response.
+> ⚠️ **Never expose `CHAT_TENANT_JWT_SECRET` to the browser.** It must stay server-side. The browser only ever sees the minted JWT.
 
 ---
 
-## 4. Scopes — partitioning inside a tenant
+## 6. Scopes — partitioning within a tenant
 
-Use `scope` when one tenant hosts many independent chat contexts and users in one context shouldn't discover or message users in another.
+`scope` is an optional second-level partition inside a tenant. It lets one tenant carry many isolated contexts (projects, support tickets, deal rooms, classrooms) without spinning up a new tenant per context.
 
-| Example | Who gets which scope |
+### 6.1 Two kinds of identities
+
+| `scope` value | Identity type | Can see |
+|---|---|---|
+| `null` (or omitted) | **Tenant-wide** | Every user in this tenant, regardless of their scope |
+| `"project_alpha"` (any string) | **Scoped** | Only same-scope users (`"project_alpha"`) + tenant-wide users (`null`) |
+
+### 6.2 Server-enforced rules
+
+- User search (`GET /api/users/search`) returns only same-scope + tenant-wide peers for scoped callers.
+- Tenant-wide search (`GET /api/users/tenant/search`) and directory (`GET /api/users/tenant`) require `scope === null` (403 otherwise).
+- Creating a DM/group across scopes (`POST /api/conversations/tenant`) requires `scope === null`.
+- Adding a member with a different scope fails with 403.
+
+### 6.3 Picking scopes
+
+| Use case | Recommendation |
 |---|---|
-| Per-project chats | project members: `scope: "project_42"`; PMs who jump between: no scope |
-| Support tickets | customer: `scope: "cust_123"`; support agents: no scope |
-| Deal rooms / CRM clients | external party: `scope: "deal_a"`; internal staff: no scope |
-| Team-wide (Slack-style) | nobody scoped — tenant-wide |
+| Slack-style — one open chat for the whole org | Always `scope: null`. No scoping at all. |
+| Project-based — each project has its own chat, admins span all | Project members: `scope: "project_<id>"`. Admins: `scope: null`. |
+| Support — customer ↔ agent chats, customers can't see each other | Customers: `scope: "ticket_<id>"` (one scope per ticket). Agents: `scope: null`. |
+| Classroom — students per class, teachers can DM any student | Students: `scope: "class_<id>"`. Teachers: `scope: null`. |
 
-### Rules the server enforces
+### 6.4 Scope transitions
 
-- A **scoped** user (`scope: "X"` in the JWT) can only find + add users whose `scope` is `"X"` or `null`.
-- An **unscoped** user (no `scope` claim or `scope: null`) can find + add any user in the tenant. Use this for support agents, admins, and internal staff who span scopes.
-- Scope is **only** enforced on user discovery (`/users/search`, `/users/online`, add-member, conversation-create). Once a conversation exists, membership is the only check — a scoped customer and an unscoped agent can chat freely in a conversation they both belong to.
-- The `User.scope` column updates on every auth when the JWT supplies a different `scope`. **Omit the claim** to leave the stored value untouched — useful when a webhook doesn't know the scope. Setting `scope: null` explicitly re-promotes the user to tenant-wide.
+If a user moves from one scope to another (project transfer, role promotion):
 
-### Scope transitions (a user moves from project A to project B)
-
-Re-mint their JWT with the new scope. The very next authenticated request re-materializes `User.scope`. Any live Centrifugo subscriptions stay valid — scope only affects *future* user discovery, not existing membership.
-
-```ts
-// On your backend when assignment changes
-const token = mintChatToken(user.id, user.name, { scope: "project_b" });
-// Push it to the browser (e.g. via a websocket event on your own channel) and
-// the next chat-server request re-materializes scope. No force-logout needed.
-```
-
-If you need a user to see **multiple scopes simultaneously** (e.g. an engineer on two projects), give them different `externalId`s per scope: `alice@acme.com__project_a` and `alice@acme.com__project_b`. They'll appear as two separate users on the chat server side with different internal UUIDs and different conversation lists. Or: mark them tenant-wide (`scope: null`) if they should span everything.
+1. **Update the `scope` claim** on the next JWT you mint for them. The chat server re-materializes `User.scope` on every authenticated request.
+2. **Existing conversation memberships are not moved.** A scoped user who was in a same-scope group keeps seeing that group even after their scope changes (the membership row predates the new scope).
+3. To enforce stricter isolation, your backend should remove the user from conversations whose context no longer applies. There's a `DELETE /api/conversations/:id/members/:userId` endpoint for that.
 
 ---
 
-## 5. Token lifecycle & refresh
+## 7. Token lifecycle & refresh
 
-### Mint → use → expire
+JWTs are short-lived bearer tokens. Your client should be designed to **mint, use, expire, re-mint** without user friction.
 
-```
- t=0      t=3300s                t=3600s
-  │          │                      │
-  ▼          ▼                      ▼
- mint ──────────── valid ───────────┼────── rejected (401 Invalid user token)
-             │                      │
-             └── refetch /chat-token so the new token overlaps the old
-```
+### 7.1 Suggested TTL
 
-### Recommended client strategy
+| Context | Recommended `exp` |
+|---|---|
+| Production browser sessions | 1 hour |
+| Long-lived background workers | 5 minutes (re-mint per task) |
+| One-off scripts | 5 minutes |
+| Server-side rendering with no client | 1 minute (re-mint per render) |
 
-1. On app boot, fetch `/chat-token` from your backend once.
-2. Decode the `exp` claim client-side (no signature verification needed) to know when it expires.
-3. When ~5 minutes from expiry, refetch `/chat-token`. Store the new token atomically.
-4. For Centrifugo, wire up `getToken` so the WebSocket lib can refetch on its own schedule (Centrifugo connection tokens are separate — they come from `/chat-api/init`).
-
-The reference web app in this repo does exactly this: see [apps/web/src/lib/auth-token.ts](../web/src/lib/auth-token.ts) and [apps/web/src/context/ChatContext.tsx](../web/src/context/ChatContext.tsx).
-
-### What happens mid-session if a token expires?
-
-HTTP requests: `401 Invalid user token`. The client should detect `401` on any chat-server call, refetch `/chat-token`, and retry.
-
-WebSocket: Centrifugo calls your configured `getToken` function before the token expires. If `getToken` throws or returns an expired token, the connection drops; Centrifugo auto-reconnects on a backoff once you return a fresh token.
-
-### JWT secret rotation
-
-If the operator (or you) rotates the tenant's `jwtSecret` via the admin API, **every live token is invalidated instantly**. Your backend must coordinate the swap:
-
-1. Update your secret manager to the new `jwtSecret`.
-2. Existing JWTs in browsers still reference the old secret → they fail on the next request.
-3. Browser retries `/chat-token` → your backend mints a new one with the new secret → requests succeed.
-
-There's a brief window (seconds) where users see `401` and retry. The reference client handles this transparently.
-
----
-
-## 6. Calling the chat API
-
-Every chat-server request needs `Authorization: Bearer <jwt>` and (for writes) `Content-Type: application/json`.
+### 7.2 Client-side refresh strategy
 
 ```ts
-const res = await fetch("https://chat.technext.it/chat-api/me", {
-  headers: { Authorization: `Bearer ${chatToken}` },
+// your-app/lib/chat-fetch.ts
+let cachedJwt: string | null = null;
+let expiresAt: number = 0;
+
+async function getJwt(force = false): Promise<string> {
+  const now = Date.now();
+  // Refresh 1 minute before expiry to avoid races.
+  if (!force && cachedJwt && now < expiresAt - 60_000) return cachedJwt;
+
+  const res = await fetch("/api/chat/token", { method: "POST" });
+  if (!res.ok) throw new Error("failed to mint chat token");
+  const { token, expiresIn } = await res.json();
+  cachedJwt = token;
+  expiresAt = now + expiresIn * 1000;
+  return token;
+}
+
+export async function chatFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  let jwt = await getJwt();
+  const url = `${process.env.NEXT_PUBLIC_CHAT_API_URL}${path}`;
+  const doFetch = (t: string) =>
+    fetch(url, {
+      ...init,
+      headers: {
+        ...init.headers,
+        Authorization: `Bearer ${t}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+  let res = await doFetch(jwt);
+  if (res.status === 401) {
+    // JWT expired between refresh + use, or secret was rotated server-side.
+    jwt = await getJwt(true);
+    res = await doFetch(jwt);
+  }
+  if (!res.ok) throw new Error(`chat ${path}: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+```
+
+### 7.3 WebSocket token refresh
+
+Centrifuge has its own connection token (different from your chat JWT — it's minted by the chat server using your JWT). The SDK calls a `getToken` callback when its current token is about to expire:
+
+```ts
+const cf = new Centrifuge(WS_URL, {
+  token: initialToken,
+  getToken: async () => {
+    const { token } = await chatFetch<{ token: string }>(
+      "/centrifugo/connection-token",
+      { method: "POST" },
+    );
+    return token;
+  },
 });
-const me = await res.json();
-// me.id = chat-server internal UUID — use this for senderId, channel names, etc.
 ```
 
-### Internal id vs externalId
-
-The server exposes an **internal user id** (UUID) that's distinct from your `externalId`:
-
-- `externalId` — your id. Stable, lives in the JWT `sub` claim, stored on `User.externalId`.
-- `id` — chat-server UUID. Stable after first mint. Used for `senderId`, Centrifugo channels, FK references.
-
-Your frontend stores the internal `id` after the first `GET /me` call. That's what you'll see in every event the chat server emits (`message.senderId`, channel names like `user:<id>`, `conversation.createdBy`, etc).
+You don't need to time anything yourself — the SDK handles its own clock.
 
 ---
 
-## 7. Data shapes
+## 8. Calling the chat API
 
-The canonical shapes the server returns, all typed in [apps/web/src/lib/types.ts](../web/src/lib/types.ts).
+### 8.1 Base URL
+
+Production: **`https://chat.technext.it/api`**
+
+In the integrating app, expose this as a build-time public env so the bundle ships with the right URL:
+
+```bash
+# your-app/.env.production
+NEXT_PUBLIC_CHAT_API_URL=https://chat.technext.it/api
+NEXT_PUBLIC_CHAT_WS_URL=wss://chat.technext.it/connection/websocket
+NEXT_PUBLIC_CHAT_STORAGE_URL=https://chat.technext.it/chatapp
+```
+
+### 8.2 Headers on every request
+
+```
+Authorization: Bearer <user-jwt>
+Content-Type:  application/json   (on POST/PUT)
+```
+
+### 8.3 CORS
+
+The chat server returns `Access-Control-Allow-Origin: <your-origin>` for any origin in the operator's `CORS_ALLOWED_ORIGINS` allowlist. Operator must add your production origin (`https://chamate.com`, `https://app.acme.com`) to that list before your real users can connect.
+
+### 8.4 Internal id vs. externalId
+
+| Field | Where it's used | Who controls it |
+|---|---|---|
+| `User.externalId` | The `sub` claim of your JWT | You (your app's user id) |
+| `User.id` | Chat server's internal UUID | Chat server (created on first JWT) |
+
+When the chat API asks for `userId` (member arrays, mention payloads, etc.) it wants the **internal `id`**, not your external id. Get the internal id once via `GET /api/me` after the user's first authenticated call, and cache it on your end.
+
+---
+
+## 9. Data shapes
+
+These shapes are what `/api/*` endpoints accept and return. Times are ISO-8601 UTC strings.
 
 ### User
 
 ```ts
 interface User {
-  id: string;              // chat-server internal UUID
-  name: string;
-  email: string;           // may be "" if no email claim
-  image: string | null;
-  lastActiveAt?: string | null;  // ISO timestamp, optional
+  id:           string;       // chat-internal UUID
+  tenantId:     string;
+  externalId:   string;       // your sub claim
+  scope:        string | null;
+  name:         string;
+  email:        string | null;
+  image:        string | null;
+  lastActiveAt: string | null;
+  createdAt:    string;
+  updatedAt:    string;
 }
 ```
 
@@ -355,30 +545,31 @@ interface User {
 
 ```ts
 interface Conversation {
-  id: string;
-  type: "direct" | "group";
-  name: string | null;     // null for direct; group name for group
-  createdBy: string;       // internal user id
-  createdAt: string;
-  updatedAt: string;
-  version: number;         // bumps on member change, rename
-  members: ConversationMember[];
-  unreadCount?: number;    // per-caller, on list endpoints
-  muted?: boolean;         // per-caller, on list endpoints
-  lastMessage?: Message | null;  // most recent non-deleted
+  id:          string;
+  tenantId:    string;
+  type:        "direct" | "group";
+  name:        string | null;       // null for direct chats
+  createdBy:   string;              // creator's internal User.id
+  createdAt:   string;
+  updatedAt:   string;
+  version:     number;              // bumped on member/meta changes
+  currentSeq:  number;              // last message's seq
+  members:     ConversationMember[];
+  unreadCount: number;              // *for the caller*, not all members
+  muted:       boolean;             // *for the caller*
+  lastMessage: Message | null;
 }
 
 interface ConversationMember {
-  id: string;
-  conversationId: string;
-  userId: string;
-  role: "owner" | "admin" | "member";
-  joinedAt: string;
-  unreadCount: number;
-  lastReadMessageId: string | null;
-  lastReadAt: string | null;
-  muted: boolean;
-  user: User;
+  id:                 string;
+  userId:             string;
+  role:               "owner" | "admin" | "member";
+  joinedAt:           string;
+  lastReadMessageId:  string | null;
+  lastReadAt:         string | null;
+  muted:              boolean;
+  unreadCount:        number;
+  user:               Pick<User, "id" | "name" | "email" | "image" | "lastActiveAt">;
 }
 ```
 
@@ -386,34 +577,22 @@ interface ConversationMember {
 
 ```ts
 interface Message {
-  id: string;
-  conversationId: string;
-  senderId: string;
-  content: MessageContent;        // Tiptap JSON — see §11
-  plainContent: string;           // flat text mirror
-  type: "text" | "system" | "image";
-  seq: number;                    // monotonic within a conversation
-  clientMessageId: string | null; // your dedup key — see §10
-  replyTo: {
-    id: string;
-    content: MessageContent;
-    plainContent: string;
-    senderId: string;
-    sender: { id: string; name: string };
-  } | null;
-  attachments: Attachment[];
-  reactions: Reaction[];
-  editedAt: string | null;
-  deletedAt: string | null;       // soft-delete marker; UI should gray out
-  createdAt: string;
-  sender: { id: string; name: string; image: string | null };
-}
-
-interface Reaction {
-  id: string;
-  emoji: string;      // ≤16 chars (grapheme cluster)
-  userId: string;
-  user: { id: string; name: string };
+  id:              string;
+  tenantId:        string;
+  conversationId:  string;
+  senderId:        string;          // User.id
+  content:         TiptapDoc;       // see §13
+  plainContent:    string;          // flattened text for search/preview
+  type:            "text" | "system" | "image";
+  replyToId:       string | null;
+  editedAt:        string | null;
+  deletedAt:       string | null;
+  createdAt:       string;
+  seq:             number;          // per-conversation monotonic
+  clientMessageId: string | null;   // your idempotency key, see §12
+  sender:          Pick<User, "id" | "name">;
+  attachments?:    Attachment[];
+  reactions?:      Reaction[];
 }
 ```
 
@@ -421,230 +600,210 @@ interface Reaction {
 
 ```ts
 interface Attachment {
-  id: string;
-  url: string;         // publicly accessible S3 URL
-  contentType: string; // MIME type the uploader declared
-  filename: string;
-  size: number;        // bytes
-  width: number | null;   // pixels, for images
-  height: number | null;
+  id:          string;
+  messageId:   string | null;       // null for orphaned pre-upload rows
+  uploaderId:  string;
+  url:         string;              // public URL — works for image/video tags
+  contentType: string;
+  filename:    string;
+  size:        number;
+  width:       number | null;
+  height:      number | null;
+  createdAt:   string;
 }
 ```
 
 ---
 
-## 8. Endpoint reference
+## 10. Endpoint reference
 
-Full interactive playground: **`https://chat.technext.it/chat-api/docs`**.
+Full interactive playground: **`https://chat.technext.it/api/docs`** (Scalar UI — also serves the raw OpenAPI spec at `/api/openapi.json`).
 
-Every authenticated endpoint requires `Authorization: Bearer <jwt>`.
-
-### Path conventions in this doc
-
-Paths below are **mount-relative** — they don't include a leading `/api` or `/chat-api`. The actual base URL depends on how the operator exposed the API:
-
-| Deploy shape | Base URL |
-|---|---|
-| Direct to the server container | `http://host:3001/api` |
-| Same-origin Next.js proxy | `https://host/api` |
-| Path-prefix ingress (Dokploy + Traefik) | `https://host/chat-api` |
-
-Concatenate: `baseURL + /me` → `https://chat.technext.it/chat-api/me` in prod, `http://localhost:3001/api/me` locally. The OpenAPI spec's `servers[0].url` reflects the active deploy's base URL — set the operator's `OPENAPI_SERVER_URL` env to match.
+Paths below are relative to the API base (`https://chat.technext.it/api`).
 
 ### Identity
 
-| Method | Path | Purpose |
+| Method | Path | Description |
 |---|---|---|
-| `GET` | `/me` | The caller's internal id + profile |
-| `POST` | `/me/active` | Bump `lastActiveAt` (call from your app on user activity; rate-limited) |
-| `POST` | `/me/broadcast-profile` | Force a `user_updated` fan-out after a profile change (alternative to the webhook) |
-| `DELETE` | `/me` | GDPR delete: cascade-removes the caller's rows + S3 attachments |
+| `GET` | `/me` | Resolve current user. Also lazily creates User row on first call. |
+| `GET` | `/init` | Bootstrap: returns first page of conversations + a Centrifugo connection token in one round-trip. Recommended for app startup. |
+| `POST` | `/me/active` | Heartbeat — update `lastActiveAt`. Call every ~30s while user is active. |
+| `POST` | `/me/broadcast-profile` | Tell every conversation peer that your profile changed. Cheap, idempotent. |
+| `DELETE` | `/me` | GDPR delete — wipes the user's messages, attachments, subscriptions. |
 
-### Users
+### Users (discovery)
 
-| Method | Path | Purpose |
+| Method | Path | Description |
 |---|---|---|
-| `POST` | `/users/search?q=...` | Autocomplete. Min 2 chars, max 128. Returns ≤50 users matching name/email. Scope-filtered. |
-| `POST` | `/users/online` | `{ userIds: string[] }` → `[{ id, lastActiveAt, online }]`. Batch online check. |
+| `GET` | `/users/search?q=…` | Typeahead. Returns same-scope + tenant-wide peers for scoped callers; everyone in the tenant for tenant-wide. |
+| `GET` | `/users/tenant?cursor=…&limit=30` | **Tenant-wide only.** Paginated directory of every user in the tenant. 403 for scoped callers. |
+| `GET` | `/users/tenant/search?q=…` | **Tenant-wide only.** Cross-scope typeahead. |
 
 ### Conversations
 
-| Method | Path | Body | Purpose |
-|---|---|---|---|
-| `GET` | `/conversations?limit=&before=` | — | Paginated list (§9). Returns `{ conversations, nextCursor }`. |
-| `POST` | `/conversations` | `{ type, name?, memberIds }` | Create. `type: "direct"` requires exactly one member. |
-| `GET` | `/conversations/:id` | — | Details. 404 if you're not a member. |
-| `PUT` | `/conversations/:id` | `{ name }` | Rename. Owner/admin only, group only. |
-| `POST` | `/conversations/:id/members` | `{ userIds, name? }` | Add. `name` is only honored when promoting a direct chat to group. |
-| `DELETE` | `/conversations/:id/members/:userId` | — | Remove someone, or leave if `userId` is your own. |
-| `POST` | `/conversations/:id/mute` | `{ muted: boolean }` | Mute/unmute for the caller only. |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/conversations?limit=50&cursor=…` | List the caller's conversations, paginated. |
+| `GET` | `/conversations/:id` | Get one. |
+| `POST` | `/conversations` | Create a DM or group within the caller's scope. Body: `{ type: "direct" \| "group", name?, memberIds[] }` |
+| `POST` | `/conversations/tenant` | **Tenant-wide only.** Same shape, but member ids can span scopes. |
+| `PUT` | `/conversations/:id` | Rename. Body: `{ name }` |
+| `POST` | `/conversations/:id/members` | Add. Body: `{ memberIds[] }`. Enforces 1000-member cap. |
+| `DELETE` | `/conversations/:id/members/:userId` | Remove a member. |
+| `POST` | `/conversations/:id/leave` | Leave a conversation. |
+| `POST` | `/conversations/:id/read` | Mark conversation read. Body: `{ upToMessageId }`. Idempotent. |
+| `POST` | `/conversations/:id/mute` | Mute. Body: `{ muted: true \| false }` |
+| `POST` | `/conversations/:id/typing` | Broadcast typing indicator. Fire-and-forget. |
 
 ### Messages
 
-| Method | Path | Body | Purpose |
-|---|---|---|---|
-| `GET` | `/conversations/:id/messages?before=&anchor=&limit=` | — | History. §9 for pagination. `anchor=<messageId>` centers a window. |
-| `POST` | `/conversations/:id/messages` | `{ content, replyToId?, clientMessageId?, attachmentIds? }` | Send. §10 for idempotency, §11 for content shape. |
-| `PUT` | `/conversations/:id/messages/:messageId` | `{ content }` | Edit. Only the sender, only text (not system). |
-| `DELETE` | `/conversations/:id/messages/:messageId` | — | Soft-delete. Sender only. Content is zeroed; `deletedAt` set. |
-| `POST` | `/conversations/:id/read` | `{ messageId }` | Mark read up through that message. Clears unread count, broadcasts `read_receipt`. |
-| `POST` | `/conversations/:id/messages/:messageId/reactions` | `{ emoji }` | React. Grapheme cluster ≤16 chars. |
-| `DELETE` | `/conversations/:id/messages/:messageId/reactions/:emoji` | — | Remove your reaction. `emoji` must be URL-encoded. |
-| `POST` | `/conversations/:id/typing` | — | Broadcast typing (throttled; see §17). |
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/conversations/:id/messages?limit=50&cursor=…` | History, newest-first. |
+| `POST` | `/conversations/:id/messages` | Send. Body: `{ content, type, replyToId?, attachmentIds?, clientMessageId? }` |
+| `PUT` | `/conversations/:id/messages/:messageId` | Edit. Body: `{ content }` |
+| `DELETE` | `/conversations/:id/messages/:messageId` | Soft-delete. |
+| `POST` | `/conversations/:id/messages/:messageId/reactions` | Add. Body: `{ emoji }` |
+| `DELETE` | `/conversations/:id/messages/:messageId/reactions/:emoji` | Remove. |
 
 ### Search
 
-| Method | Path | Purpose |
+| Method | Path | Description |
 |---|---|---|
-| `GET` | `/conversations/:id/search?q=...` | Fuzzy + substring search inside one conversation. |
-| `GET` | `/search?q=...` | Global across every conversation you're a member of. |
+| `GET` | `/search?q=…` | Global trigram-fuzzy search across every conversation the caller is in. |
+| `GET` | `/conversations/:id/search?q=…` | Same, scoped to one conversation. |
 
 ### Attachments
 
-| Method | Path | Purpose |
+| Method | Path | Description |
 |---|---|---|
-| `POST` | `/attachments/upload-url` | Mint a presigned S3 PUT URL + create the orphan Attachment row. |
-| `GET` | `/attachments/:id/download` | 302 to a short-lived signed URL with `Content-Disposition: attachment`. |
+| `POST` | `/attachments/upload-url` | Mint a presigned PUT URL. See [§14](#14-file-attachments). |
+| `GET` | `/attachments/:id/download` | 302 → presigned GET URL with `Content-Disposition: attachment`. |
 
-### Centrifugo
+### Centrifugo tokens
 
-| Method | Path | Purpose |
+| Method | Path | Description |
 |---|---|---|
-| `POST` | `/centrifugo/connection-token` | Mint a Centrifugo connection token (alternative to `/init`). |
-| `POST` | `/centrifugo/subscription-token` | Mint a subscription token for `presence:conv_<id>` channels. |
+| `POST` | `/centrifugo/connection-token` | Mint a short-lived JWT for the Centrifugo WS handshake. |
+| `POST` | `/centrifugo/subscription-token` | Mint a token for a specific channel (e.g. `presence:conv_<id>`). |
 
-### Push
+### Web Push
 
-| Method | Path | Body | Purpose |
-|---|---|---|---|
-| `GET` | `/push/vapid-public-key` | — | Fetch VAPID public key for `pushManager.subscribe`. |
-| `POST` | `/push/subscribe` | `{ endpoint, keys: { p256dh, auth } }` | Register a Web Push subscription. |
-| `POST` | `/push/unsubscribe` | `{ endpoint }` | Unregister. |
-
-### Bootstrap
-
-| Method | Path | Purpose |
+| Method | Path | Description |
 |---|---|---|
-| `GET` | `/init?limit=` | One-shot: conversation list + Centrifugo connection token. Use on app start. |
+| `GET` | `/push/vapid-public-key` | Returns the server's VAPID public key for `pushManager.subscribe`. |
+| `POST` | `/push/subscribe` | Register a browser endpoint. Body: `{ endpoint, keys: { p256dh, auth } }` |
+| `POST` | `/push/unsubscribe` | Body: `{ endpoint }` |
 
-### Webhooks (tenant backend → us, auth via `apiKey`)
+### Webhooks (your backend → chat)
 
-| Method | Path | Body | Purpose |
-|---|---|---|---|
-| `POST` | `/webhooks/users.updated` | `{ externalId, name, image?, email? }` | Push a profile change. |
-| `POST` | `/webhooks/users.deleted` | `{ externalId }` | Cascade-delete a user. |
+Auth: `Authorization: Bearer <tenant.apiKey>` plus optional `X-Chat-Signature: sha256=<hex>`.
 
-### Admin (operator → us, auth via `MASTER_API_KEY`)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/webhooks/users.updated` | Upsert user profile. Idempotent. |
+| `POST` | `/webhooks/users.deleted` | Delete a user (GDPR or unsubscribe path). |
 
-| Method | Path | Purpose |
+### Admin (operator → chat)
+
+Auth: `Authorization: Bearer <MASTER_API_KEY>`.
+
+| Method | Path | Description |
 |---|---|---|
 | `POST` | `/admin/tenants` | Create a tenant. |
-| `GET` | `/admin/tenants` | List tenants (metadata only). |
-| `POST` | `/admin/tenants/:id/api-keys` | Rotate `apiKey`. |
-| `POST` | `/admin/tenants/:id/jwt-secret/rotate` | Rotate `jwtSecret`. |
+| `GET` | `/admin/tenants` | List tenants (secrets masked). |
+| `POST` | `/admin/tenants/:id/api-keys` | Rotate tenant `apiKey`. |
+| `POST` | `/admin/tenants/:id/jwt-secret/rotate` | Rotate tenant `jwtSecret`. |
 
 ---
 
-## 9. Pagination
+## 11. Pagination
 
-All paginated endpoints use **cursor pagination**, not offset. Cursors are opaque strings you pass back as-is.
+Everywhere the API paginates, it uses **opaque keyset cursors** — never offsets. Send the `cursor` you got from the previous response unchanged.
 
-### Conversations
+### 11.1 Conversations
 
-```
-GET /conversations?limit=50&before=<ISO_TIMESTAMP>
-```
+```ts
+const r = await chatFetch<{
+  conversations: Conversation[];
+  nextCursor:    string | null;
+}>("/conversations?limit=50");
 
-Response:
-
-```json
-{
-  "conversations": [...],
-  "nextCursor": "2026-04-22T18:30:00.000Z"
+if (r.nextCursor) {
+  const next = await chatFetch(`/conversations?limit=50&cursor=${encodeURIComponent(r.nextCursor)}`);
 }
 ```
 
-When `nextCursor` is `null`, there are no more pages. Pass it as `before=` on the next request.
+Ordering: most-recent-active first.
 
-### Messages
+### 11.2 Messages
 
-```
-GET /conversations/:id/messages?limit=50&before=<messageId>
-```
-
-- Default order: newest → oldest. (Reverse the array if you render top-down.)
-- `before=<messageId>` returns messages created before that message.
-- `anchor=<messageId>` returns a window of `limit` messages centered on that id (used by "jump to message" from search).
-
-Response:
-
-```json
-{
-  "messages": [...],
-  "readPositions": [{ "userId", "name", "image", "lastReadMessageId" }, ...],
-  "nextCursor": "<messageId-of-last-item>"
-}
+```ts
+const r = await chatFetch<{
+  messages:   Message[];
+  nextCursor: string | null;
+}>(`/conversations/${convId}/messages?limit=50`);
 ```
 
-`readPositions` tells you who has read up to which message — use it to render read markers.
+Ordering: newest-first within the page. When loading older history (scrollback), keep passing the previous `nextCursor`.
+
+### 11.3 Tenant directory
+
+```ts
+const r = await chatFetch<{
+  users:      User[];
+  nextCursor: string | null;
+}>("/users/tenant?limit=30");
+```
+
+Ordering: `(name, id) ASC`.
 
 ---
 
-## 10. Idempotency & retries
+## 12. Idempotency & retries
 
-### Sending messages: `clientMessageId`
+### 12.1 Send-message idempotency: `clientMessageId`
 
-Generate a UUID on the client **before** sending. Pass it as `clientMessageId`. If the network hiccups and you retry with the same value, the server returns the same stored message instead of creating a duplicate.
+Generate a UUID on the client, send it on every retry. The server treats `(conversationId, clientMessageId)` as unique and returns the existing row on the second send instead of creating a duplicate.
 
 ```ts
 const clientMessageId = crypto.randomUUID();
 
-async function send(content, attempt = 1) {
-  try {
-    return await api.post(`/conversations/${convId}/messages`, {
-      content, clientMessageId,
-    });
-  } catch (e) {
-    if (attempt < 3 && isTransient(e)) {
-      await delay(250 * attempt);
-      return send(content, attempt + 1);
-    }
-    throw e;
-  }
-}
+await chatFetch(`/conversations/${convId}/messages`, {
+  method: "POST",
+  body: JSON.stringify({
+    content,
+    type: "text",
+    clientMessageId,    // ← same value across retries
+  }),
+});
 ```
 
-The server enforces this with a unique index on `(conversationId, clientMessageId)`.
+Recommended: even on first-time sends, always pass `clientMessageId`. Then a 5xx retry never doubles.
 
-### Webhooks
+### 12.2 Webhooks (your backend → chat)
 
-Both `users.updated` and `users.deleted` are idempotent by design:
+`POST /api/webhooks/users.updated` and `users.deleted` are idempotent on `externalId`. Safe to retry indefinitely.
 
-- `users.updated`: you send the full desired state; the server upserts.
-- `users.deleted`: `202` if the user existed, `404` if not. Treat `404` as success for the retry.
+### 12.3 Read receipts
 
-### Other operations
+`POST /api/conversations/:id/read` is idempotent on `(memberId, upToMessageId)` — the server uses a `WHERE seq >= currentLastRead` filter that ignores out-of-order or duplicate calls.
 
-| Endpoint | Retry-safe? | Why |
-|---|---|---|
-| `POST /conversations` direct | ✅ | Server dedups on existing direct pair. |
-| `POST /conversations` group | ❌ | Creates a new group per call. |
-| Add member | ✅ | Users already in the conversation are skipped. |
-| Rename | ✅ | Same name = no-op. |
-| Mark read | ✅ | Monotonic; idempotent. |
-| Mute | ✅ | Setting same value = no-op. |
-| Add reaction | ✅ | Unique on `(message, user, emoji)`. |
-| Remove reaction | ✅ | Removing a non-existent reaction = `404`, treat as success. |
-| Edit message | ✅ | Overwrites. |
-| Delete message | ✅ | Soft-delete is idempotent. |
+### 12.4 Reactions
+
+Add (`POST /reactions`) is idempotent on `(messageId, userId, emoji)`. Remove (`DELETE /reactions/:emoji`) returns 200 whether the reaction existed or not.
+
+### 12.5 Mute, typing
+
+Both fire-and-forget on the client; both safe to retry on transient errors.
 
 ---
 
-## 11. Message content format (Tiptap JSON)
+## 13. Message content format (Tiptap JSON)
 
-Content is stored as a **Tiptap JSON AST** (the server canonicalizes it; client-supplied HTML is rejected).
+The chat server stores message bodies as **[Tiptap](https://tiptap.dev/) AST JSON** (a subset of [ProseMirror](https://prosemirror.net/) document format). This avoids ever serializing HTML over the wire.
 
-### Minimal text message
+### 13.1 Minimal text message
 
 ```json
 {
@@ -652,708 +811,951 @@ Content is stored as a **Tiptap JSON AST** (the server canonicalizes it; client-
   "content": [
     {
       "type": "paragraph",
-      "content": [{ "type": "text", "text": "hello" }]
+      "content": [
+        { "type": "text", "text": "Hello world" }
+      ]
     }
   ]
 }
 ```
 
-### With marks (bold, italic, code)
+### 13.2 With formatting marks
 
 ```json
 {
   "type": "doc",
-  "content": [{
-    "type": "paragraph",
-    "content": [
-      { "type": "text", "text": "hello " },
-      { "type": "text", "text": "bold", "marks": [{ "type": "bold" }] }
-    ]
-  }]
+  "content": [
+    {
+      "type": "paragraph",
+      "content": [
+        { "type": "text", "text": "I'm " },
+        { "type": "text", "text": "bold", "marks": [{ "type": "bold" }] },
+        { "type": "text", "text": " and " },
+        { "type": "text", "text": "italic", "marks": [{ "type": "italic" }] }
+      ]
+    }
+  ]
 }
 ```
 
-### Mentions
+Supported marks: `bold`, `italic`, `code`, `link` (`{ type: "link", attrs: { href, target } }`).
+
+### 13.3 Mentions
 
 ```json
 {
   "type": "mention",
-  "attrs": { "id": "<internal-user-id>", "label": "Alice Chen" }
+  "attrs": {
+    "id":    "u_a3b1...",
+    "label": "Alice Chen"
+  }
 }
 ```
 
-- `id` must be an internal user id (UUID). If it doesn't resolve to a conversation member, the mention is stripped from `mentions[]` server-side (but stays in the rendered content).
-- `label` is rewritten server-side to the DB-canonical name — a client sending `label: "@alice"` pointing at Bob's id gets persisted as `"Bob"`.
+The server extracts mention ids when persisting the message and bypasses mute settings for mentioned users (they get push notifications even if they muted the conversation).
 
-### Links
+### 13.4 Limits
 
-```json
-{ "type": "text", "text": "https://example.com", "marks": [{ "type": "link", "attrs": { "href": "https://example.com" } }] }
-```
-
-### Attachments-only message
-
-```json
-{ "type": "doc", "content": [] }
-```
-
-With `attachmentIds: ["att_xyz"]` — the server requires either non-empty content OR at least one attachment.
-
-### Limits
-
-| Constraint | Value |
+| Limit | Value |
 |---|---|
-| `plainContent` max | 8000 characters |
-| Request body size | 512 KB (chat routes) |
-| Mention ids per message | unbounded, but unresolved ones dropped |
+| Max message JSON size | 32 KB |
+| Max plain-text length | 8000 chars |
+| Max mentions per message | 50 |
+
+Server validates against a Zod schema and returns 400 on violation.
 
 ---
 
-## 12. File attachments
+## 14. File attachments
 
-Two-step upload via presigned S3.
+The chat server never proxies bytes — uploads go **direct browser → object storage**. Server's job is to mint a short-lived presigned URL and record metadata.
+
+### 14.1 Upload flow
 
 ```ts
-// 1. Ask the chat server for a presigned PUT URL + create the orphan Attachment row
-const { attachmentId, uploadUrl, publicUrl, expiresIn } = await fetch(
-  "https://chat.technext.it/chat-api/attachments/upload-url",
-  {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${chatToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      filename: file.name,
-      contentType: file.type,
-      size: file.size,
-      width: img?.naturalWidth,   // optional, for images
-      height: img?.naturalHeight,
-    }),
-  },
-).then((r) => r.json());
-
-// 2. PUT the bytes directly to S3 within `expiresIn` seconds (default 300)
-await fetch(uploadUrl, {
-  method: "PUT",
-  headers: { "Content-Type": file.type },
-  body: file,
+// 1. Ask server for a presigned PUT URL
+const upload = await chatFetch<{
+  attachmentId: string;
+  uploadUrl:    string;
+  publicUrl:    string;
+  key:          string;
+  expiresIn:    number;
+}>("/attachments/upload-url", {
+  method: "POST",
+  body: JSON.stringify({
+    filename:    file.name,
+    contentType: file.type,
+    size:        file.size,
+    width:       null,       // optional, for images
+    height:      null,
+  }),
 });
 
-// 3. Send a message that references it
-await fetch(`https://chat.technext.it/chat-api/conversations/${convId}/messages`, {
+// 2. Browser PUTs the file straight to object storage
+await fetch(upload.uploadUrl, {
+  method:  "PUT",
+  body:    file,
+  headers: { "Content-Type": file.type },
+});
+
+// 3. Send a message referencing the attachment
+await chatFetch(`/conversations/${convId}/messages`, {
   method: "POST",
-  headers: {
-    Authorization: `Bearer ${chatToken}`,
-    "Content-Type": "application/json",
-  },
   body: JSON.stringify({
-    content: { type: "doc", content: [] },
-    attachmentIds: [attachmentId],
+    content: { type: "doc", content: [/* … */] },
+    type:    "text",
+    attachmentIds:   [upload.attachmentId],
+    clientMessageId: crypto.randomUUID(),
   }),
 });
 ```
 
-### Limits
+### 14.2 Limits
 
-| Constraint | Value | Notes |
-|---|---|---|
-| Per-file size | 50 MB | Presigned PUT signs `Content-Length`; larger → `403` from S3. |
-| Per-user quota | 5 GB | Sum of all your Attachments. Exceeding → `413 PAYLOAD_TOO_LARGE` at upload-url time. |
-| Presigned URL TTL | 5 min | `expiresIn` in the response. Upload within that window. |
-| Attachments per message | no hard cap | Server validates each one belongs to you and is unlinked. |
+| Limit | Default |
+|---|---|
+| Single file size | 25 MB |
+| User total quota | 5 GB |
+| Presigned URL TTL | 5 min for upload, 1 min for download |
+| Allowed `Content-Type`s | Any (no MIME validation server-side) |
 
-### Post-upload verification
+### 14.3 Orphan cleanup
 
-The chat server issues a HEAD request to S3 right after linking the attachment to a message. If the actual object size differs from what was presigned, the server deletes both the S3 object and the DB row. This defends against non-strict S3 backends that don't enforce `Content-Length`.
+If your user requests an upload URL but never sends the message, the attachment row stays with `messageId = null`. A periodic job sweeps `messageId IS NULL AND createdAt < now() - 1h` and deletes both the row and the object.
 
-### Orphan cleanup
+### 14.4 Downloads
 
-If you call `/upload-url` and never link the attachment to a message (user cancelled, tab closed, error), the orphan Attachment row + S3 object are GC'd by the server's background sweep after ~24 hours.
+The `publicUrl` returned at upload time works for inline rendering (`<img>`, `<video>`) — no auth required, the URL is content-addressable.
 
-### Downloads
+For force-download with the original filename:
 
-`GET /attachments/:id/download` returns a 302 to a short-lived signed URL with `Content-Disposition: attachment` — the browser downloads instead of inlining. Works for any content type. Authorization: you must be the uploader OR a member of the conversation the attachment was posted in.
+```ts
+window.location.href =
+  `${process.env.NEXT_PUBLIC_CHAT_API_URL}/attachments/${attachmentId}/download` +
+  `?_token=${encodeURIComponent(await getJwt())}`;
+```
+
+(The endpoint accepts `Authorization: Bearer …` OR `?_token=…` so the browser can use a plain `<a href>`.)
 
 ---
 
-## 13. Realtime (Centrifugo)
+## 15. Real-time delivery (Centrifugo)
 
-The chat server uses [Centrifugo v6](https://centrifugal.dev/) for WebSocket delivery. Your frontend connects once, is auto-subscribed to its own `user:{internalUserId}` channel, and receives every event through that channel.
+The chat server uses [Centrifugo v6](https://centrifugal.dev/) for WebSocket fan-out. Your frontend opens one connection on app startup and receives every chat event for the current user through it.
 
-### Connection URL
+### 15.1 Architecture
 
 ```
-wss://chat.technext.it/chat-api/centrifugo/connection/websocket
+your browser ⇄ wss://chat.technext.it/connection/websocket
+                              │
+                              │ (Traefik routes direct to centrifugo container)
+                              ▼
+                  centrifugo:8000 (private)
+                              │
+                              │ (PostgreSQL consumer reads server's outbox table)
+                              ▼
+                         server inserts events
 ```
 
-### Bootstrap
+You never talk to Centrifugo's container directly — the public WebSocket endpoint is what your browser connects to, and Traefik handles the path-based routing.
+
+### 15.2 Install the client
+
+```bash
+npm install centrifuge
+```
+
+### 15.3 Connect on app startup
 
 ```ts
-import { Centrifuge } from "centrifuge";
+// your-app/lib/chat-realtime.ts
+"use client";
+import { Centrifuge, type Subscription } from "centrifuge";
+import { chatFetch } from "./chat-fetch";
 
-async function fetchInit() {
-  return fetch("https://chat.technext.it/chat-api/init", {
-    headers: { Authorization: `Bearer ${chatToken}` },
-  }).then((r) => r.json());
+let cf: Centrifuge | null = null;
+
+export async function connectChat(opts: {
+  onEvent:     (channel: string, data: unknown) => void;
+  onConnected?: () => void;
+  onDisconnected?: () => void;
+}) {
+  // /init returns conversations + a Centrifugo connection token in one
+  // round-trip. Use that token to open the WS.
+  const init = await chatFetch<{
+    conversations:   any[];
+    centrifugoToken: string;
+  }>("/init");
+
+  cf = new Centrifuge(process.env.NEXT_PUBLIC_CHAT_WS_URL!, {
+    token: init.centrifugoToken,
+    // Centrifuge calls this when its token approaches expiry, OR after
+    // a 3500 disconnect (token expired). It's separate from your chat
+    // JWT — this one is minted by /api/centrifugo/connection-token.
+    getToken: async () => {
+      const r = await chatFetch<{ token: string }>(
+        "/centrifugo/connection-token",
+        { method: "POST" },
+      );
+      return r.token;
+    },
+  });
+
+  cf.on("connected",    () => opts.onConnected?.());
+  cf.on("disconnected", () => opts.onDisconnected?.());
+
+  // All events fan in here. The JWT's `subs` claim auto-subscribed
+  // the connection to `user:<myUserId>`, so every event arrives on
+  // that one channel.
+  cf.on("publication", (ctx) => opts.onEvent(ctx.channel, ctx.data));
+
+  cf.connect();
+  return { centrifuge: cf, initialConversations: init.conversations };
 }
 
-// 1. Get conversations + connection token in one call
-const { conversations, centrifugoToken } = await fetchInit();
-
-// 2. Connect
-const c = new Centrifuge(
-  "wss://chat.technext.it/chat-api/centrifugo/connection/websocket",
-  {
-    token: centrifugoToken,
-    // Called when the token is near expiry; refetch /init
-    getToken: async () => (await fetchInit()).centrifugoToken,
-  },
-);
-
-c.on("connected",    () => console.log("ws up"));
-c.on("disconnected", (ctx) => console.log("ws down:", ctx.reason));
-c.on("error",        (ctx) => console.error(ctx.error));
-
-// 3. Listen — user:{userId} is auto-subscribed via the connection token's subs claim
-c.on("publication", (ctx) => {
-  const event = ctx.data;
-  dispatchEvent(event);  // see §14 for types
-});
-
-c.connect();
+export function disconnectChat() {
+  cf?.disconnect();
+  cf = null;
+}
 ```
 
-### Presence (per-conversation)
+### 15.4 Channel structure
 
-Only needed when you care about join/leave of the currently-open conversation (typing indicators, active-users list). The user's own `user:{userId}` channel is auto-subscribed.
+| Channel | Subscription type | What it carries |
+|---|---|---|
+| `user:<myUserId>` | Auto-subscribed via connection token's `subs` claim | Every event for the current user across all conversations |
+| `presence:conv_<conversationId>` | Manual, per-conversation | Typing indicators, online presence for that conversation |
+
+The `user:` channel is the workhorse. Most apps only need to subscribe to it once and route events to UI state. The `presence:` channels are for typing dots / "who's looking at this conversation" — opt-in per-conversation.
+
+### 15.5 Subscribing to presence (optional)
 
 ```ts
-async function subscribePresence(conversationId: string) {
-  const { token } = await fetch(
-    "https://chat.technext.it/chat-api/centrifugo/subscription-token",
+async function subscribePresence(convId: string) {
+  if (!cf) throw new Error("not connected");
+
+  const { token } = await chatFetch<{ token: string }>(
+    "/centrifugo/subscription-token",
     {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${chatToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ channel: `presence:conv_${conversationId}` }),
+      body:   JSON.stringify({ channel: `presence:conv_${convId}` }),
     },
-  ).then((r) => r.json());
+  );
 
-  const sub = c.newSubscription(`presence:conv_${conversationId}`, { token });
-  sub.on("subscribed", async () => {
-    const { clients } = await sub.presence();
-    const activeUserIds = clients.map((c) => c.user);
-    // ...
+  const sub = cf.newSubscription(`presence:conv_${convId}`, { token });
+  sub.on("publication", (ctx) => {
+    // typing indicators arrive here
   });
-  sub.on("join",  (ctx) => onActive(ctx.info.user));
-  sub.on("leave", (ctx) => onInactive(ctx.info.user));
+  sub.on("join",  (ctx) => { /* user joined this presence */ });
+  sub.on("leave", (ctx) => { /* user left */ });
   sub.subscribe();
   return sub;
 }
 ```
 
-Unsubscribe when switching conversations or the tab becomes hidden.
-
-### Reconnection semantics
-
-- Centrifugo auto-reconnects with exponential backoff on network loss.
-- Per `user:{id}` channel, Centrifugo's history is configured for ~30s recovery — short WS drops replay missed events automatically.
-- For longer disconnects: on reconnect, refetch `/init` to reconcile state (conversation list + last-seq per conversation).
-
-### Idempotency
-
-Every publication carries an `idempotencyKey`. Centrifugo dedups within a short window, so a server retry of the same event is a no-op on the client. You **may still receive duplicates** across long disconnects — use `message.id` or `event.type + event.conversationId + event.messageId` as your dedup key.
+Unsubscribe when the user switches away from that conversation — leaving them all open wastes Centrifugo memory.
 
 ---
 
-## 14. Realtime event catalog
+## 16. Real-time event catalog
 
-All events arrive on `user:{internalUserId}`. Dispatch by `event.type`.
+Every event that lands on the `user:<id>` channel has a `type` field discriminating the shape:
 
-### `message_added`
+| `type` | Fired when | Payload |
+|---|---|---|
+| `message_created` | New message in any conversation you're in | `{ type, conversationId, message: Message }` |
+| `message_updated` | Edit | `{ type, conversationId, messageId, content, editedAt }` |
+| `message_deleted` | Delete | `{ type, conversationId, messageId, deletedAt }` |
+| `reaction_added` | Reaction added | `{ type, conversationId, messageId, reaction: Reaction }` |
+| `reaction_removed` | Reaction removed | `{ type, conversationId, messageId, userId, emoji }` |
+| `conversation_created` | You were added to a new conversation (DM or group) | `{ type, conversation: Conversation }` |
+| `conversation_updated` | Renamed / re-ordered | `{ type, conversation: Conversation }` |
+| `member_added` | Someone joined a conversation you're in | `{ type, conversationId, member: ConversationMember }` |
+| `member_removed` | Someone left | `{ type, conversationId, userId }` |
+| `read_receipt` | Someone marked messages read up to X | `{ type, conversationId, userId, lastReadMessageId, lastReadAt }` |
+| `user_updated` | A peer's profile changed | `{ type, user: Partial<User> }` |
+| `user_active` | A peer's `lastActiveAt` updated | `{ type, userId, lastActiveAt }` |
 
-New message posted (or a system message — user added, group renamed, etc).
-
-```ts
-{
-  type: "message_added",
-  conversationId: string,
-  message: {
-    id: string,
-    seq: number,
-    senderId: string,
-    senderName: string,
-    content: MessageContent,       // Tiptap JSON
-    plainContent: string,          // flat text
-    msgType: "text" | "system" | "image",
-    replyTo: { id, content, plainContent, senderId, sender } | null,
-    createdAt: string,
-    clientMessageId: string | null,
-    attachments?: Attachment[],
-    mentions?: string[],           // internal user ids, already validated as members
-  }
-}
-```
-
-### `message_edited`
+### Handling pattern
 
 ```ts
-{
-  type: "message_edited",
-  conversationId: string,
-  messageId: string,
-  content: MessageContent,
-  editedAt: string,
-}
+type UserChannelEvent =
+  | { type: "message_created"; conversationId: string; message: Message }
+  | { type: "message_updated"; conversationId: string; messageId: string; content: any; editedAt: string }
+  | { type: "message_deleted"; conversationId: string; messageId: string; deletedAt: string }
+  | { type: "conversation_created"; conversation: Conversation }
+  | { type: "read_receipt"; conversationId: string; userId: string; lastReadMessageId: string; lastReadAt: string }
+  // ... etc.
+  ;
+
+connectChat({
+  onEvent: (channel, data) => {
+    const event = data as UserChannelEvent;
+    switch (event.type) {
+      case "message_created":
+        if (event.conversationId === currentlyOpenConvId) {
+          appendMessage(event.message);
+        } else {
+          incrementUnread(event.conversationId);
+        }
+        break;
+      case "read_receipt":
+        if (event.userId === otherUserId) markMessagesAsSeen(event.lastReadMessageId);
+        break;
+      // ...
+    }
+  },
+});
 ```
 
-### `message_deleted`
+### Idempotency on receive
 
-Soft-delete. Client should gray the message or replace it with a tombstone.
-
-```ts
-{
-  type: "message_deleted",
-  conversationId: string,
-  messageId: string,
-}
-```
-
-### `read_receipt`
-
-Another member read up through `messageId`. Move their read marker.
-
-```ts
-{
-  type: "read_receipt",
-  conversationId: string,
-  userId: string,
-  userName: string,
-  messageId: string,
-}
-```
-
-### `reaction_added` / `reaction_removed`
-
-```ts
-{
-  type: "reaction_added",
-  conversationId: string,
-  messageId: string,
-  reaction: { id: string, emoji: string, userId: string, userName: string },
-}
-
-{
-  type: "reaction_removed",
-  conversationId: string,
-  messageId: string,
-  emoji: string,
-  userId: string,
-}
-```
-
-### `typing_started`
-
-Another member started typing. No `typing_stopped` event — the client should auto-hide the indicator after ~3 seconds. Debounced server-side to 1 per 2 seconds per user per conversation.
-
-```ts
-{
-  type: "typing_started",
-  conversationId: string,
-  userId: string,
-  userName: string,
-}
-```
-
-### `conversation_updated`
-
-Membership changed, name changed, version bumped. Replace your cached copy.
-
-```ts
-{
-  type: "conversation_updated",
-  conversation: {
-    id: string,
-    type: "direct" | "group",
-    name: string | null,
-    createdBy: string,
-    createdAt: string,
-    updatedAt: string,
-    version: number,
-    members: ConversationMember[],
-  }
-}
-```
-
-### `conversation_left`
-
-You (this user) were removed from, or left, a conversation. Drop it from the sidebar.
-
-```ts
-{
-  type: "conversation_left",
-  conversationId: string,
-}
-```
-
-### `conversation_mute_changed`
-
-Multi-tab sync — your own mute toggle from another tab/device.
-
-```ts
-{
-  type: "conversation_mute_changed",
-  conversationId: string,
-  muted: boolean,
-}
-```
-
-### `user_updated`
-
-A peer (someone you share a conversation with) changed their name or avatar. Bust cached references.
-
-```ts
-{
-  type: "user_updated",
-  user: { id: string, name: string, image: string | null },
-}
-```
+Each event carries an `idempotencyKey` field (server-side dedup), but **you should still dedupe on the client** — Centrifugo's at-least-once delivery means you may receive the same event twice across reconnects. Track `event.idempotencyKey` or `(event.type, event.messageId)` in a recent-events set.
 
 ---
 
-## 15. Web Push notifications
+## 17. Web Push notifications
 
-Web Push delivers notifications when the tab is closed or backgrounded.
+Web Push lets your app deliver OS-level notifications even when the browser tab is closed.
 
-### Setup (operator side)
+### 17.1 Server setup
 
-Operator generates a VAPID keypair once:
+The operator must set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` in their Dokploy env. Without these, push endpoints return 503.
 
-```bash
-npx web-push generate-vapid-keys
-```
-
-...and sets `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` env. If unset, push endpoints return `503 SERVICE_UNAVAILABLE` and the app degrades gracefully.
-
-### Client flow
+### 17.2 Browser flow
 
 ```ts
-// 1. Fetch the VAPID public key
-const { key } = await fetch("/chat-api/push/vapid-public-key", {
-  headers: { Authorization: `Bearer ${chatToken}` },
-}).then((r) => r.json());
+// 1. Register your service worker (must be at root scope)
+const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
 
-// 2. Register a service worker + subscribe
-const sw = await navigator.serviceWorker.register("/sw.js");
-const sub = await sw.pushManager.subscribe({
-  userVisibleOnly: true,
+// 2. Ask user for notification permission
+const perm = await Notification.requestPermission();
+if (perm !== "granted") return;
+
+// 3. Fetch the server's VAPID public key
+const { key } = await chatFetch<{ key: string }>("/push/vapid-public-key");
+
+// 4. Subscribe this browser to Web Push
+const sub = await reg.pushManager.subscribe({
+  userVisibleOnly:      true,
   applicationServerKey: urlBase64ToUint8Array(key),
 });
 
-// 3. Send the subscription to the chat server
-await fetch("/chat-api/push/subscribe", {
+// 5. Send the subscription to the chat server
+await chatFetch("/push/subscribe", {
   method: "POST",
-  headers: { Authorization: `Bearer ${chatToken}`, "Content-Type": "application/json" },
-  body: JSON.stringify({
-    endpoint: sub.endpoint,
-    keys: {
-      p256dh: arrayBufferToBase64(sub.getKey("p256dh")),
-      auth:   arrayBufferToBase64(sub.getKey("auth")),
-    },
-  }),
+  body:   JSON.stringify(sub.toJSON()),
+});
+
+function urlBase64ToUint8Array(base64: string): Uint8Array {
+  const pad = "=".repeat((4 - (base64.length % 4)) % 4);
+  const b64 = (base64 + pad).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(b64);
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+```
+
+### 17.3 Service worker
+
+Save as `public/sw.js`:
+
+```js
+// public/sw.js
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+
+self.addEventListener("push", (event) => {
+  const data = event.data ? event.data.json() : { title: "Message", body: "" };
+
+  event.waitUntil(
+    (async () => {
+      // Suppress OS notification when an app tab is already focused —
+      // the in-app toast covers it. Comment this out if you want both.
+      const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      if (clients.some((c) => c.visibilityState === "visible" && c.focused)) return;
+
+      await self.registration.showNotification(data.title || "New message", {
+        body: data.body || "",
+        tag:  data.tag,
+        // Without renotify, same-tag pushes silently update Notification
+        // Center instead of re-alerting. You want this true for chat.
+        renotify: true,
+        icon: data.icon,
+        data: { url: data.url || "/" },
+      });
+    })(),
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  event.waitUntil(self.clients.openWindow(event.notification.data?.url || "/"));
 });
 ```
 
-### Server behaviour
+### 17.4 Push payload schema
 
-On every new message, the server fans out to:
-
-- Every non-sender, non-muted member, OR
-- Any mentioned user (bypasses mute).
-
-Payload:
+The chat server emits this on every new message (for non-muted recipients):
 
 ```json
 {
   "title": "Alice Chen",
-  "body": "hey, about the deck…",
-  "tag": "conv:<conversationId>",
-  "url": "/"
+  "body":  "Hey, are you available?",
+  "tag":   "conv:c_a3b1f2...",
+  "url":   "/"
 }
 ```
 
-Your service worker decides how to render it. The reference `sw.js` in this repo suppresses the notification if any of the user's tabs are visible (so active users don't get double-pinged).
+`tag` groups notifications by conversation so a chatty conversation doesn't stack 50 banners. `renotify: true` in your SW makes each new message re-alert.
 
 ---
 
-## 16. Webhooks
+## 18. Webhooks (your backend → chat)
 
-When one of your users renames themselves or changes avatar, call the chat server so its cached copy and live peers update immediately. Without this, the chat server only picks up the change the next time that user authenticates.
+Use these to push profile updates and deletions from your auth system to the chat server immediately, instead of waiting for the lazy-create on next JWT.
 
-Authenticate with your `apiKey`:
+### 18.1 Endpoints
 
-```
-Authorization: Bearer <apiKey>
-```
+| Path | When to call |
+|---|---|
+| `POST /api/webhooks/users.updated` | User edits profile, changes avatar, etc. |
+| `POST /api/webhooks/users.deleted` | User deletes account / GDPR request. |
 
-### `POST /webhooks/users.updated`
+### 18.2 Auth
 
-Idempotent. Send the full desired state every time.
+Two layers, both optional individually, mandatory together for production:
 
-```bash
-curl -X POST https://chat.technext.it/chat-api/webhooks/users.updated \
-  -H "Authorization: Bearer $CHAT_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "externalId": "user_42",
-    "name": "Alice Chen",
-    "image": "https://cdn.acme.com/avatars/42.jpg",
-    "email": "alice@acme.com"
-  }'
-```
+1. **Bearer token** — `Authorization: Bearer <tenant.apiKey>` proves you're the tenant.
+2. **HMAC signature** — `X-Chat-Signature: sha256=<hex>`. Computed as `HMAC-SHA256(apiKey, rawBody)`. Set `WEBHOOK_SIGNATURE_REQUIRED=true` on the chat server in prod.
 
-Response: `202 Accepted`. Peers who share a conversation receive a `user_updated` Centrifugo event and their UI refreshes live.
-
-### `POST /webhooks/users.deleted`
-
-Cascade-deletes the user + every conversation membership, message, and reaction they own. S3 attachment objects are GC'd asynchronously.
-
-```bash
-curl -X POST https://chat.technext.it/chat-api/webhooks/users.deleted \
-  -H "Authorization: Bearer $CHAT_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"externalId": "user_42"}'
-```
-
-Response: `202` if the user existed, `404` if not. Both are safe to retry.
-
-### Request signing (recommended)
-
-Include an HMAC so a leaked key alone isn't enough to forge requests:
-
-```
-X-Chat-Signature: sha256=<hex>
-```
+### 18.3 Signing in Node
 
 ```ts
 import crypto from "node:crypto";
 
-const body = JSON.stringify({ externalId: "user_42", name: "Alice" });
-const signature = crypto
-  .createHmac("sha256", process.env.CHAT_API_KEY!)
-  .update(body)
-  .digest("hex");
+async function callChatWebhook(path: string, payload: object): Promise<void> {
+  const raw = JSON.stringify(payload);
+  const signature = crypto
+    .createHmac("sha256", process.env.CHAT_TENANT_API_KEY!)
+    .update(raw)
+    .digest("hex");
 
-await fetch("https://chat.technext.it/chat-api/webhooks/users.updated", {
-  method: "POST",
-  headers: {
-    Authorization: `Bearer ${process.env.CHAT_API_KEY}`,
-    "Content-Type": "application/json",
-    "X-Chat-Signature": `sha256=${signature}`,
-  },
-  body,
-});
+  const res = await fetch(`${process.env.CHAT_API_URL}${path}`, {
+    method:  "POST",
+    headers: {
+      "Content-Type":     "application/json",
+      "Authorization":    `Bearer ${process.env.CHAT_TENANT_API_KEY}`,
+      "X-Chat-Signature": `sha256=${signature}`,
+    },
+    body: raw,
+  });
+  if (!res.ok) throw new Error(`chat webhook ${path}: ${res.status} ${await res.text()}`);
+}
+
+export const upsertChatUser = (p: {
+  externalId: string;
+  name:       string;
+  email?:     string;
+  image?:     string;
+  scope?:     string | null;
+}) => callChatWebhook("/webhooks/users.updated", p);
+
+export const deleteChatUser = (externalId: string) =>
+  callChatWebhook("/webhooks/users.deleted", { externalId });
 ```
 
-Sign the **exact raw bytes** you send — not a pretty-printed version. If the operator sets `WEBHOOK_SIGNATURE_REQUIRED=true`, unsigned requests return `401`.
+### 18.4 Rate limits
+
+| Bucket | Limit |
+|---|---|
+| Per tenant | 100 requests/min |
+| Per `(tenant, externalId)` | 10 requests/min |
+
+Batch profile updates on your side and queue them, or accept that chat will re-materialize on next JWT mint anyway.
 
 ---
 
-## 17. Rate limits
+## 19. Rate limits
 
-All user-facing routes are per-user (keyed on internal user id + IP). Webhooks are per-tenant + per-`(tenant, externalId)`.
+Most endpoints are rate-limited per `(user, route)` to protect against runaway clients. Limits:
 
-| Endpoint | Limit | Window |
-|---|---|---|
-| `POST /conversations/:id/messages` | 30 | per minute |
-| `POST /conversations/:id/typing` | 20 | per **second** (server throttles 1/2s idempotency) |
-| `POST /attachments/upload-url` | 30 | per minute |
-| `GET /users/search`, `/search`, `/conversations/:id/search` | 10 | per second |
-| everything else authenticated | 300 | per minute |
-| `POST /webhooks/*` per tenant | 100 | per minute |
-| `POST /webhooks/*` per `(tenant, externalId)` | 10 | per minute |
+| Bucket | Limit |
+|---|---|
+| Default authenticated endpoints | 60 req/min per user |
+| `POST /conversations/:id/messages` | 60 messages/min per user |
+| `POST /attachments/upload-url` | 30/min per user |
+| `POST /conversations/:id/typing` | 60/min per conversation per user |
+| `POST /webhooks/*` | See §18.4 |
 
-On limit: `429 TOO_MANY_REQUESTS` with `Retry-After` header. Back off and retry.
+Responses on exceeded limit:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+{ "error": "rate_limited", "message": "Too many requests", "retryAfter": 30 }
+```
+
+Handle 429 with exponential backoff. The `Retry-After` value is seconds.
 
 ---
 
-## 18. Error responses
+## 20. Error responses
 
-Every error is a JSON envelope with an HTTP status and a stable `code`:
+### 20.1 Shape
 
 ```json
 {
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "body.memberIds: must not be empty",
-    "fields": [
-      { "path": ["body", "memberIds"], "message": "must not be empty" }
-    ]
-  }
+  "error":   "machine_readable_code",
+  "message": "human-readable explanation",
+  "details": { /* optional, varies per error */ }
 }
 ```
 
-### Codes
+### 20.2 Codes you'll see
 
-| Code | HTTP | When |
+| Status | `error` | Cause |
 |---|---|---|
-| `VALIDATION_ERROR` | 400 | Body/query didn't match the Zod schema. `fields[]` is populated. |
-| `BAD_REQUEST` | 400 | Logical pre-condition failed (e.g. direct chat with 3 members). |
-| `UNAUTHORIZED` | 401 | Missing / malformed / expired / wrong-tenant JWT. |
-| `FORBIDDEN` | 403 | Authenticated but not allowed (non-member, non-owner rename, admin IP denied). |
-| `NOT_FOUND` | 404 | Resource doesn't exist or isn't visible to you. |
-| `CONFLICT` | 409 | Unique constraint violation (e.g. duplicate `clientMessageId` concurrent insert). |
-| `PAYLOAD_TOO_LARGE` | 413 | Message body / attachment size / quota exceeded. |
-| `UNSUPPORTED_MEDIA_TYPE` | 415 | Wrong `Content-Type`. |
-| `TOO_MANY_REQUESTS` | 429 | Rate limit. Check `Retry-After`. |
-| `INTERNAL_ERROR` | 500 | Server bug. Safe to retry once. |
-| `SERVICE_UNAVAILABLE` | 503 | Dependency unhealthy (DB, Redis, S3, VAPID unset for push). |
+| 400 | `validation_failed` | Body or query failed schema validation. `details.issues` has Zod issue array. |
+| 401 | `unauthorized` | Missing/invalid/expired JWT. Re-mint and retry. |
+| 403 | `forbidden` | Auth OK but caller not allowed for this resource (wrong scope, not a member). |
+| 404 | `not_found` | Resource doesn't exist or not visible to caller (deliberately conflated to avoid information leakage). |
+| 409 | `conflict` | Optimistic concurrency violation (rare). Refetch and retry. |
+| 422 | `unprocessable` | Operation valid but business rule violated (e.g. 1000-member cap). |
+| 429 | `rate_limited` | See §19. |
+| 500 | `internal_error` | Server bug. Includes `details.requestId` — quote it to the operator. |
+| 503 | `service_unavailable` | Centrifugo / push not configured, or upstream degraded. Retryable. |
 
-### Retry policy
+### 20.3 Request IDs
 
-- **Transient** (`INTERNAL_ERROR`, `SERVICE_UNAVAILABLE`, `TOO_MANY_REQUESTS`, network-level): retry with backoff + jitter.
-- **Permanent** (`UNAUTHORIZED` except expired-token, `FORBIDDEN`, `VALIDATION_ERROR`, `NOT_FOUND`, `CONFLICT` on non-idempotent ops): don't retry.
-- **Expired token** (`UNAUTHORIZED` with message `Invalid user token`): refetch `/chat-token`, then retry once.
+Every response carries `X-Request-Id`. Log it on your side; if you need operator support, quote it — they can correlate to server logs.
 
 ---
 
-## 19. Security
+## 21. Security
 
-- **Never ship `apiKey` or `jwtSecret` to the browser.** Both belong in your backend's secret manager.
-- Keep user JWT TTL short (1h is a good default). Your backend re-mints on each session refresh.
-- The chat server pins `HS256`. Tokens signed with any other algorithm are rejected.
-- Clock skew: the server tolerates ±30s between your mint time and its verify time.
-- Rotate credentials whenever a staff member with access leaves or you suspect compromise:
-  ```bash
-  # Rotate API key (old key dies instantly)
-  curl -X POST https://chat.technext.it/chat-api/admin/tenants/$TENANT_ID/api-keys \
-    -H "Authorization: Bearer $MASTER_API_KEY"
+### 21.1 Things you must do
 
-  # Rotate JWT secret (every live user token dies instantly)
-  curl -X POST https://chat.technext.it/chat-api/admin/tenants/$TENANT_ID/jwt-secret/rotate \
-    -H "Authorization: Bearer $MASTER_API_KEY"
-  ```
-- **Tenant isolation**: enforced at every Prisma query. Foreign tenant ids in your input return `400` (invalid member) or `404` (not visible).
-- **Scope isolation**: enforced on user discovery within a tenant (§4).
-- **Conversation isolation**: non-members can't read, write, or even see a conversation's existence.
-- Web Push payloads include the conversation id (`tag: conv:<id>`) but not message content — the service worker fetches fresh state before showing the notification so permissions-revoked endpoints don't leak content.
+- Keep `CHAT_TENANT_JWT_SECRET` and `CHAT_TENANT_API_KEY` server-only. They must never appear in client bundles, in browser-accessible env vars, or in URLs.
+- Mint JWTs short-lived (1h max). Refresh on the fly.
+- Validate user identity in your own auth system before minting. The chat server trusts your JWT — anyone who can mint can impersonate.
+- Enable `WEBHOOK_SIGNATURE_REQUIRED=true` on the chat server in production (operator).
+- Use HTTPS only (chat server enforces this anyway).
 
----
+### 21.2 Things you don't need to worry about
 
-## 20. Troubleshooting
+- Cross-tenant data leakage — every query is scoped by `tenantId` at the ORM level. A bug in one tenant's app can't read another tenant's data.
+- WS authorization — Centrifugo verifies the connection token (signed by the chat server, not by you) and only delivers events for channels the user is allowed to see.
+- Message content sanitization — you ship Tiptap JSON, not HTML. The chat server never round-trips HTML, so XSS via message content is impossible end-to-end.
+- Push key leakage — VAPID keys aren't auth tokens. The worst case if leaked is an attacker can send push to users who already subscribed to your app, which they can also do by clicking your "Enable notifications" button.
 
-| Symptom | Likely cause |
-|---|---|
-| `401 Missing user token` | No `Authorization: Bearer` header. |
-| `401 Malformed user token` | Token isn't valid JWT or missing `iss`. |
-| `401 Unknown tenant` | `iss` claim doesn't match any tenant. Typo in `CHAT_TENANT_ID`? |
-| `401 Invalid user token` | Signature mismatch — wrong `jwtSecret`, wrong algorithm, or expired. |
-| `400 One or more memberIds are invalid` on create/add-member | You passed a userId from a different tenant, different scope, or one that doesn't exist. |
-| `400 One or more userIds are invalid` on add-member | Same as above. Scoped users can only add same-scope + tenant-wide. |
-| `403 Forbidden` on admin endpoint | Missing / wrong `MASTER_API_KEY`, or your IP isn't in the admin allowlist. Talk to the operator. |
-| `403 Not a member` on message send/read | You were removed from the conversation or never joined. |
-| `413 PAYLOAD_TOO_LARGE` on message send | `plainContent > 8000` chars or total body > 512 KB. |
-| `413 PAYLOAD_TOO_LARGE` on upload-url | 5 GB per-user quota exceeded. |
-| `429 Too Many Requests` on webhooks | Hit the 100/min per-tenant or 10/min per-user bucket. Debounce. |
-| `429 Too Many Requests` on messages | 30/min per user. |
-| `401 Missing X-Chat-Signature` on webhooks | Operator set `WEBHOOK_SIGNATURE_REQUIRED=true`. Sign with `HMAC-SHA256(apiKey, rawBody)`. |
-| `401 Invalid X-Chat-Signature` | Signed a pretty-printed version while sending compact JSON, or used the wrong key. |
-| `503 Push not configured` | Operator hasn't set VAPID env. Push endpoints will keep 503ing until they do. |
-| WebSocket drops every ~1 hour | Centrifugo connection token expired. Wire up `getToken` to refetch `/init`. |
-| Duplicate `message_added` events | Long disconnect + Centrifugo replay. Dedup by `message.id`. |
-| Mentions aren't notifying | The mentioned userId didn't resolve to a member of the conversation. Server drops unresolved ids from `mentions[]`. |
+### 21.3 Hardening recommendations
 
-Full API reference + interactive playground: **`/chat-api/docs`**.
+| Knob | Default | Recommended for prod |
+|---|---|---|
+| `CHAT_TENANT_API_KEY` rotation | manual | every 90 days |
+| `CHAT_TENANT_JWT_SECRET` rotation | manual | every 90 days (invalidates active JWTs — coordinate with cache TTL) |
+| User JWT TTL | – | 1 hour |
+| `WEBHOOK_SIGNATURE_REQUIRED` (server-side) | `false` | `true` |
+| CORS allowlist (server-side) | strict | one entry per integrating origin, no wildcards, no localhost in prod |
 
 ---
 
-## 21. Capability lifecycle at a glance
+## 22. Production checklist
 
-Every action a tenant can take with this server, in chronological order — from onboarding, through day-to-day use, to credential rotation. Treat it as both a TOC and a checklist.
+Before going live to real users:
 
-### One-time onboarding
+### 22.1 Backend (your server)
 
-1. Receive `tenantId` + `apiKey` + `jwtSecret` from the operator (out of band)
-2. Store all three in the tenant's secret manager
-3. Implement a `/chat-token` endpoint on the tenant backend that signs a user JWT with `jwtSecret`
-4. Implement webhook senders for profile updates + deletes on the tenant backend
+- [ ] `CHAT_TENANT_ID`, `CHAT_TENANT_API_KEY`, `CHAT_TENANT_JWT_SECRET` set as server-only env vars
+- [ ] JWT-minting endpoint (`/api/chat/token`) gated by your own auth
+- [ ] JWTs have 1-hour TTL and refresh on the fly
+- [ ] User webhook (`upsertChatUser`) called on signup + profile update
+- [ ] User webhook called on account deletion (GDPR)
+- [ ] Webhooks signed with HMAC-SHA256
 
-### Per-session (each user login)
+### 22.2 Frontend (your browser bundle)
 
-5. User logs into the tenant's app with the tenant's own auth
-6. Tenant's frontend fetches a fresh chat JWT from the tenant's backend
-7. Call `GET /me` to resolve the user's internal UUID
-8. Call `GET /init` to bootstrap the conversation list + Centrifugo connection token
-9. Open the Centrifugo WebSocket — auto-subscribed to `user:{id}`
-10. Subscribe to `presence:conv_{id}` for the active conversation
+- [ ] `NEXT_PUBLIC_CHAT_API_URL`, `NEXT_PUBLIC_CHAT_WS_URL`, `NEXT_PUBLIC_CHAT_STORAGE_URL` set
+- [ ] No secrets in any `NEXT_PUBLIC_*` env
+- [ ] `chatFetch` wraps every call (no raw `fetch("/api/...")`)
+- [ ] WS opens on app startup; reconnect handled by SDK
+- [ ] Token refresh on 401 path tested
+- [ ] Service worker registered + push subscription wired (if you want notifications)
+- [ ] Idempotency keys on every send-message
 
-### Discovery
+### 22.3 Operator (chat-app side)
 
-11. Search users — `POST /users/search?q=...` (scope-filtered)
-12. Batch-check online status — `POST /users/online`
+- [ ] Your production origin added to `CORS_ALLOWED_ORIGINS`
+- [ ] VAPID keys generated and set (if you want push)
+- [ ] `WEBHOOK_SIGNATURE_REQUIRED=true`
+- [ ] `DEV_MINT_ENABLED=false` (the `/api/dev/mint-token` endpoint is dev-only)
+- [ ] Database backed up regularly
 
-### Conversation lifecycle
+### 22.4 End-to-end smoke
 
-13. Create a direct or group conversation — `POST /conversations`
-14. Add members — `POST /conversations/:id/members`
-15. Rename a group — `PUT /conversations/:id`
-16. Remove a member / leave a group — `DELETE /conversations/:id/members/:userId`
-17. Paginate the conversation list — `GET /conversations?before=`
+- [ ] Two browsers, two users from your app, sign in
+- [ ] Open a DM, send messages — see them appear in real-time both sides
+- [ ] Send an attachment — verify it uploads and renders
+- [ ] Minimize one browser, send a message from the other — verify OS notification appears
+- [ ] Drop the WS (DevTools → Offline checkbox in Service Workers tab) and bring it back — verify reconnect succeeds and missed events arrive
 
-### Messaging
+---
 
-18. Send a message (text, rich content, or attachments) — `POST /conversations/:id/messages`
-19. Broadcast typing — `POST /conversations/:id/typing`
-20. Edit a message — `PUT /conversations/:id/messages/:messageId`
-21. Soft-delete a message — `DELETE /conversations/:id/messages/:messageId`
-22. Reply to a message (set `replyToId` on send)
-23. Mention users (Tiptap `mention` nodes)
-24. React — `POST /conversations/:id/messages/:messageId/reactions`
-25. Remove a reaction — `DELETE /conversations/:id/messages/:messageId/reactions/:emoji`
-26. Mark conversation as read — `POST /conversations/:id/read`
-27. Mute / unmute conversation — `POST /conversations/:id/mute`
-28. Paginate message history — `GET /conversations/:id/messages?before=`
-29. Jump to a specific message (window mode) — `GET /conversations/:id/messages?anchor=<id>`
+## 23. Troubleshooting
 
-### Search
+### 23.1 401 on every API call
 
-30. Search within one conversation — `GET /conversations/:id/search?q=...`
-31. Search globally across all accessible conversations — `GET /search?q=...`
+- Check `iss` in the JWT matches your `CHAT_TENANT_ID` exactly.
+- Check `exp` is in the future at the time of the call (server has 30s clock skew tolerance).
+- Verify you're signing with the *current* `jwtSecret` — if the operator rotated, your old secret won't validate.
+- Decode the JWT (paste into [jwt.io](https://jwt.io/)) and check the signature against `CHAT_TENANT_JWT_SECRET`.
 
-### Attachments
+### 23.2 WS connects then immediately disconnects
 
-32. Mint a presigned upload URL — `POST /attachments/upload-url`
-33. PUT file bytes directly to S3 with the presigned URL
-34. Attach uploaded file to a message (`attachmentIds` in send)
-35. Download an attachment — `GET /attachments/:id/download`
+- Check DevTools → Network → WS → Messages tab. The first frame from server reveals the close reason. Common codes:
+  - `109` — token expired (clock skew or TTL too short)
+  - `3500` — invalid token signature (your server is using a stale Centrifugo HMAC secret)
+- Confirm the connection token came from `POST /api/centrifugo/connection-token` (you've passed a valid chat JWT).
 
-### Push notifications
+### 23.3 CORS errors in the browser
 
-36. Fetch the VAPID public key — `GET /push/vapid-public-key`
-37. Register a Web Push subscription — `POST /push/subscribe`
-38. Unregister — `POST /push/unsubscribe`
+- Operator's `CORS_ALLOWED_ORIGINS` must contain your *exact* origin: scheme + host + port. No trailing slash. No path.
+- Verify with `curl -I -H "Origin: https://your-origin.com" https://chat.technext.it/api/health` — expect `Access-Control-Allow-Origin: https://your-origin.com` in the response.
 
-### Identity maintenance
+### 23.4 Presigned PUT returns 403
 
-39. Ping `lastActive` — `POST /me/active`
-40. Broadcast a profile change live (from the frontend) — `POST /me/broadcast-profile`
-41. Update a user's server-side profile (from the tenant backend) — `POST /api/webhooks/users.updated`
-42. Delete a user (GDPR, from the tenant backend) — `POST /api/webhooks/users.deleted`
-43. Soft-delete self (user-initiated GDPR, from the frontend) — `DELETE /me`
+- Almost always a SigV4 host-mismatch. Verify the operator's `S3_PUBLIC_URL_BASE` matches the URL your browser is actually PUTting to.
+- Don't add custom headers to the PUT beyond `Content-Type` — anything else breaks the signature.
 
-### Continuous operation
+### 23.5 Push received but no OS banner
 
-44. Refresh the user JWT before expiry (refetch `/chat-token` from the tenant backend)
-45. Refresh the Centrifugo token (refetch `/init`, swap on next reconnect)
+- macOS Focus mode / Do Not Disturb silently suppresses all notifications. Toggle off.
+- Browser-level: System Settings → Notifications → your browser → "Allow notifications" ON, "Alert style" not "None".
+- Without `renotify: true` in your service worker, only the *first* push per conversation triggers a banner. Subsequent same-tag pushes silently update Notification Center. See [§17.3](#173-service-worker).
 
-### Credential hygiene
+### 23.6 Events arrive but UI doesn't update
 
-46. Rotate `apiKey` (via operator — typical trigger: staff offboarding, suspected leak)
-47. Rotate `jwtSecret` (via operator — invalidates every live user JWT at once)
+- Verify your `centrifuge.on("publication", ...)` handler is being called — add a console log.
+- Check that you're updating React state via the proper hook — events arriving from a WS callback don't trigger re-renders unless you call `setState`.
+- Track `event.idempotencyKey` — if your dedup is too aggressive you'll silently drop legit events.
 
-### B2B2C partitioning
+---
 
-48. Partition users into **scopes** by including a `scope` claim in minted JWTs (project chats, support tickets, deal rooms, per-client CRM)
+## 24. End-to-end reference: a working Next.js integration
+
+A complete, copy-pasteable Next.js 14+ integrator app. Drop into a project, set the env vars, and it works.
+
+### 24.1 Project layout
+
+```
+your-app/
+├─ app/
+│  ├─ api/
+│  │  └─ chat/
+│  │     ├─ token/route.ts          ← mint JWT for current user
+│  │     └─ webhook/route.ts        ← (optional) profile-sync webhook
+│  └─ chat/
+│     └─ page.tsx                   ← the chat UI
+├─ lib/
+│  ├─ chat-token.ts                 ← server-side JWT minting
+│  ├─ chat-fetch.ts                 ← browser REST client
+│  ├─ chat-federation.ts            ← server-side webhook caller
+│  └─ chat-realtime.ts              ← browser WS client
+├─ public/
+│  └─ sw.js                         ← push service worker
+└─ .env.local
+```
+
+### 24.2 Environment
+
+```bash
+# .env.local — your-app local dev
+CHAT_API_URL=https://chat.technext.it
+CHAT_TENANT_ID=tnt_3f9b...
+CHAT_TENANT_API_KEY=ak_1c4f...
+CHAT_TENANT_JWT_SECRET=js_a72e...
+
+NEXT_PUBLIC_CHAT_API_URL=https://chat.technext.it/api
+NEXT_PUBLIC_CHAT_WS_URL=wss://chat.technext.it/connection/websocket
+NEXT_PUBLIC_CHAT_STORAGE_URL=https://chat.technext.it/chatapp
+```
+
+### 24.3 Server-side JWT mint
+
+```ts
+// app/api/chat/token/route.ts
+import { SignJWT } from "jose";
+import { auth } from "@/lib/auth";
+
+const secret = new TextEncoder().encode(process.env.CHAT_TENANT_JWT_SECRET!);
+
+export async function POST() {
+  const session = await auth();
+  if (!session?.user) return new Response("unauthorized", { status: 401 });
+
+  const ttlSeconds = 3600;
+  const token = await new SignJWT({
+    sub:   session.user.id,
+    name:  session.user.name,
+    email: session.user.email,
+    image: session.user.image,
+    iss:   process.env.CHAT_TENANT_ID,
+    scope: null,
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(`${ttlSeconds}s`)
+    .sign(secret);
+
+  return Response.json({ token, expiresIn: ttlSeconds });
+}
+```
+
+### 24.4 Browser REST client
+
+```ts
+// lib/chat-fetch.ts
+"use client";
+
+let cachedJwt: string | null = null;
+let expiresAt = 0;
+
+async function getJwt(force = false): Promise<string> {
+  if (!force && cachedJwt && Date.now() < expiresAt - 60_000) return cachedJwt;
+  const r = await fetch("/api/chat/token", { method: "POST" });
+  if (!r.ok) throw new Error("jwt mint failed");
+  const { token, expiresIn } = await r.json();
+  cachedJwt = token;
+  expiresAt = Date.now() + expiresIn * 1000;
+  return token;
+}
+
+export async function chatFetch<T>(
+  path: string,
+  init: RequestInit = {},
+): Promise<T> {
+  let jwt = await getJwt();
+  const url = `${process.env.NEXT_PUBLIC_CHAT_API_URL}${path}`;
+  const exec = (t: string) =>
+    fetch(url, {
+      ...init,
+      headers: {
+        ...init.headers,
+        Authorization:  `Bearer ${t}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+  let res = await exec(jwt);
+  if (res.status === 401) {
+    jwt = await getJwt(true);
+    res = await exec(jwt);
+  }
+  if (!res.ok) throw new Error(`chat ${path}: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+```
+
+### 24.5 Browser realtime client
+
+```ts
+// lib/chat-realtime.ts
+"use client";
+import { Centrifuge } from "centrifuge";
+import { chatFetch } from "./chat-fetch";
+
+let cf: Centrifuge | null = null;
+
+export async function connectChat(
+  onEvent: (event: any) => void,
+): Promise<{ initialConversations: any[] }> {
+  const init = await chatFetch<{
+    conversations:   any[];
+    centrifugoToken: string;
+  }>("/init");
+
+  cf = new Centrifuge(process.env.NEXT_PUBLIC_CHAT_WS_URL!, {
+    token: init.centrifugoToken,
+    getToken: async () => {
+      const r = await chatFetch<{ token: string }>(
+        "/centrifugo/connection-token",
+        { method: "POST" },
+      );
+      return r.token;
+    },
+  });
+
+  cf.on("publication", (ctx) => onEvent(ctx.data));
+  cf.connect();
+
+  return { initialConversations: init.conversations };
+}
+
+export function disconnectChat() {
+  cf?.disconnect();
+  cf = null;
+}
+```
+
+### 24.6 Server-side federation (call on signup / profile update)
+
+```ts
+// lib/chat-federation.ts  (server-only)
+import crypto from "node:crypto";
+
+async function signed(path: string, body: object): Promise<void> {
+  const raw = JSON.stringify(body);
+  const sig = crypto
+    .createHmac("sha256", process.env.CHAT_TENANT_API_KEY!)
+    .update(raw)
+    .digest("hex");
+
+  const r = await fetch(`${process.env.CHAT_API_URL}/api${path}`, {
+    method:  "POST",
+    headers: {
+      "Content-Type":     "application/json",
+      "Authorization":    `Bearer ${process.env.CHAT_TENANT_API_KEY}`,
+      "X-Chat-Signature": `sha256=${sig}`,
+    },
+    body: raw,
+  });
+  if (!r.ok) throw new Error(`chat webhook ${path}: ${r.status}`);
+}
+
+export const upsertChatUser = (u: {
+  externalId: string;
+  name:       string;
+  email?:     string;
+  image?:     string;
+}) => signed("/webhooks/users.updated", u);
+
+export const deleteChatUser = (externalId: string) =>
+  signed("/webhooks/users.deleted", { externalId });
+```
+
+### 24.7 Minimal UI
+
+```tsx
+// app/chat/page.tsx
+"use client";
+import { useEffect, useState } from "react";
+import { connectChat, disconnectChat } from "@/lib/chat-realtime";
+import { chatFetch } from "@/lib/chat-fetch";
+
+export default function ChatPage() {
+  const [conversations, setConversations] = useState<any[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<any[]>([]);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const { initialConversations } = await connectChat((event) => {
+        if (event.type === "message_created") {
+          if (event.conversationId === activeId) {
+            setMessages((m) => [...m, event.message]);
+          }
+        }
+        if (event.type === "conversation_created") {
+          setConversations((c) => [event.conversation, ...c]);
+        }
+      });
+      if (mounted) setConversations(initialConversations);
+    })();
+    return () => {
+      mounted = false;
+      disconnectChat();
+    };
+  }, [activeId]);
+
+  async function openConv(id: string) {
+    setActiveId(id);
+    const r = await chatFetch<{ messages: any[] }>(
+      `/conversations/${id}/messages?limit=50`,
+    );
+    setMessages(r.messages.reverse());
+  }
+
+  async function send(text: string) {
+    if (!activeId) return;
+    await chatFetch(`/conversations/${activeId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({
+        content: {
+          type: "doc",
+          content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+        },
+        type: "text",
+        clientMessageId: crypto.randomUUID(),
+      }),
+    });
+  }
+
+  return (
+    <div style={{ display: "flex", gap: 16 }}>
+      <aside style={{ width: 240, borderRight: "1px solid #333" }}>
+        {conversations.map((c) => (
+          <button key={c.id} onClick={() => openConv(c.id)}>
+            {c.name || c.members.map((m: any) => m.user.name).join(", ")}
+          </button>
+        ))}
+      </aside>
+      <main style={{ flex: 1 }}>
+        {messages.map((m) => (
+          <div key={m.id}>
+            <strong>{m.sender.name}:</strong> {m.plainContent}
+          </div>
+        ))}
+        {activeId && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const input = e.currentTarget.elements.namedItem(
+                "text",
+              ) as HTMLInputElement;
+              if (input.value.trim()) send(input.value);
+              input.value = "";
+            }}
+          >
+            <input name="text" autoFocus />
+          </form>
+        )}
+      </main>
+    </div>
+  );
+}
+```
+
+### 24.8 Deployment
+
+**Vercel (or any Next.js-compatible host):**
+
+1. Push to GitHub.
+2. Import in Vercel; set the env vars from §24.2.
+3. Deploy. Note your production origin (e.g. `https://chamate-app.vercel.app`).
+4. Email the chat operator: "Please add `https://chamate-app.vercel.app` to `CORS_ALLOWED_ORIGINS`."
+5. Once they redeploy, your production app can chat.
+
+**No reverse proxy, no WebSocket relay, no special server runtime required.** Vercel serves your Next.js bundle; the user's browser opens connections directly to `chat.technext.it`. Works the same on Netlify, Cloudflare Pages, your own VPS, anywhere.
+
+---
+
+## Appendix — capability lifecycle at a glance
+
+| Capability | Who triggers | Direction | Auth |
+|---|---|---|---|
+| Provision tenant | Operator | → chat | `MASTER_API_KEY` |
+| Rotate tenant secrets | Operator | → chat | `MASTER_API_KEY` |
+| Mint user JWT | Your backend | (in-process) | `CHAT_TENANT_JWT_SECRET` |
+| Sync user profile | Your backend → chat | webhook | `apiKey` + HMAC signature |
+| Delete user | Your backend → chat | webhook | `apiKey` + HMAC signature |
+| Chat API calls | Your frontend → chat | REST | user JWT |
+| Real-time events | Chat → your frontend | WebSocket | Centrifugo connection token |
+| File uploads | Your frontend → object storage | direct | presigned URL |
+| Push notifications | Chat → user's browser | Web Push | VAPID-signed |
+
+That's the whole integration surface. Everything else — chat features, search, attachments, presence — is built on top of these primitives.
+
+If something here doesn't match what you observe in production, quote the request ID from the response header (`X-Request-Id`) and contact the operator. Most issues are environment misconfiguration (CORS allowlist, expired JWT, stale Centrifugo secret) and resolve within a redeploy.
+
+Welcome to the chat.
