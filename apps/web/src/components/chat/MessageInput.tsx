@@ -31,6 +31,14 @@ import {
   IconCode,
   IconPaperclip,
   IconFile,
+  IconH1,
+  IconH2,
+  IconH3,
+  IconBlockquote,
+  IconList,
+  IconListNumbers,
+  IconCodePlus,
+  IconSeparatorHorizontal,
 } from "@tabler/icons-react";
 import { useChat } from "@/context/ChatContext";
 import { uploadFile } from "@/lib/upload";
@@ -142,7 +150,16 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
     name: "enterSubmit",
     addKeyboardShortcuts() {
       return {
-        Enter: () => {
+        Enter: ({ editor: e }) => {
+          // Inside multi-line blocks let Tiptap's default Enter handle the
+          // new line / next list item; submit only from inline contexts.
+          if (
+            e.isActive("codeBlock") ||
+            e.isActive("listItem") ||
+            e.isActive("blockquote")
+          ) {
+            return false;
+          }
           submitFromEditor(
             editorRef.current,
             sendMessage,
@@ -165,13 +182,7 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
     immediatelyRender: false,
     extensions: [
       StarterKit.configure({
-        heading: false,
-        blockquote: false,
-        bulletList: false,
-        orderedList: false,
-        listItem: false,
-        horizontalRule: false,
-        codeBlock: false,
+        link: false,
       }),
       Placeholder.configure({
         placeholder: "Type a message... (Shift+Enter for new line)",
@@ -342,6 +353,26 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
                 icon={() => <IconStrikethrough size={14} />}
               />
               <RichTextEditor.Code icon={() => <IconCode size={14} />} />
+            </RichTextEditor.ControlsGroup>
+            <RichTextEditor.ControlsGroup>
+              <RichTextEditor.H1 icon={() => <IconH1 size={14} />} />
+              <RichTextEditor.H2 icon={() => <IconH2 size={14} />} />
+              <RichTextEditor.H3 icon={() => <IconH3 size={14} />} />
+            </RichTextEditor.ControlsGroup>
+            <RichTextEditor.ControlsGroup>
+              <RichTextEditor.BulletList icon={() => <IconList size={14} />} />
+              <RichTextEditor.OrderedList
+                icon={() => <IconListNumbers size={14} />}
+              />
+              <RichTextEditor.Blockquote
+                icon={() => <IconBlockquote size={14} />}
+              />
+              <RichTextEditor.CodeBlock
+                icon={() => <IconCodePlus size={14} />}
+              />
+              <RichTextEditor.Hr
+                icon={() => <IconSeparatorHorizontal size={14} />}
+              />
             </RichTextEditor.ControlsGroup>
           </RichTextEditor.Toolbar>
           <RichTextEditor.Content />

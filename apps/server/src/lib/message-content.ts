@@ -10,15 +10,8 @@ import type { JSONContent } from "@tiptap/core";
  */
 const messageExtensions = [
   StarterKit.configure({
-    heading: false,
-    blockquote: false,
-    bulletList: false,
-    orderedList: false,
-    listItem: false,
-    horizontalRule: false,
-    codeBlock: false,
-    // `link` is intentionally off for now — adds another attack surface
-    // (href validation) and we don't have link previews yet.
+    // `link` is intentionally off — adds href-validation attack surface
+    // (javascript:, data:, open-redirect) and we don't have link previews.
     link: false,
   }),
   Mention.configure({
@@ -56,9 +49,18 @@ export function renderToHtml(json: MessageContentJson): string {
   return generateHTML(json, messageExtensions);
 }
 
+const BLOCK_BOUNDARY_TYPES = new Set([
+  "paragraph",
+  "heading",
+  "blockquote",
+  "codeBlock",
+  "listItem",
+  "horizontalRule",
+]);
+
 /**
  * Collapse the AST to plain text for trigram search + sidebar previews.
- * Mentions expand as "@label"; paragraphs separate with newlines.
+ * Mentions expand as "@label"; block-level nodes separate with newlines.
  */
 export function extractPlainText(json: MessageContentJson): string {
   const parts: string[] = [];
@@ -74,10 +76,8 @@ export function extractPlainText(json: MessageContentJson): string {
     if (n.type === "mention" && n.attrs?.label) {
       parts.push(`@${n.attrs.label}`);
     }
-    if (Array.isArray(n.content)) {
-      n.content.forEach(walk);
-      if (n.type === "paragraph") parts.push("\n");
-    }
+    if (Array.isArray(n.content)) n.content.forEach(walk);
+    if (n.type && BLOCK_BOUNDARY_TYPES.has(n.type)) parts.push("\n");
   };
   walk(json);
   return parts.join("").replace(/\n+$/, "").trim();

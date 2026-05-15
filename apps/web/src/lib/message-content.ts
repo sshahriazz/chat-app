@@ -15,13 +15,6 @@ import type { MessageContent } from "./types";
  */
 export const messageExtensions: Extensions = [
   StarterKit.configure({
-    heading: false,
-    blockquote: false,
-    bulletList: false,
-    orderedList: false,
-    listItem: false,
-    horizontalRule: false,
-    codeBlock: false,
     link: false,
   }),
   Mention.configure({
@@ -57,6 +50,15 @@ export function isEmptyContent(content: MessageContent | undefined | null): bool
   return !walk(content);
 }
 
+const BLOCK_BOUNDARY_TYPES = new Set([
+  "paragraph",
+  "heading",
+  "blockquote",
+  "codeBlock",
+  "listItem",
+  "horizontalRule",
+]);
+
 /** Fallback plaintext extractor used when a payload lacks `plainContent`. */
 export function extractPlainTextFromContent(
   content: MessageContent | undefined | null,
@@ -75,10 +77,8 @@ export function extractPlainTextFromContent(
     if (node.type === "mention" && node.attrs?.label) {
       parts.push(`@${node.attrs.label}`);
     }
-    if (Array.isArray(node.content)) {
-      node.content.forEach(walk);
-      if (node.type === "paragraph") parts.push("\n");
-    }
+    if (Array.isArray(node.content)) node.content.forEach(walk);
+    if (node.type && BLOCK_BOUNDARY_TYPES.has(node.type)) parts.push("\n");
   };
   walk(content);
   return parts.join("").replace(/\n+$/, "").trim();

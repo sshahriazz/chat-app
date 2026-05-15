@@ -157,7 +157,7 @@ export const TenantUserListQuerySchema = z
 
 // ─── Attachments ─────────────────────────────────────────────
 
-const MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024;
+const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
 
 const ALLOWED_CONTENT_TYPES = [
   "image/png",

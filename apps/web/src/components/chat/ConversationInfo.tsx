@@ -59,31 +59,19 @@ export function ConversationInfo({ opened, onClose }: ConversationInfoProps) {
   // Group name typed while converting a direct → group. Ignored for groups.
   const [promotionName, setPromotionName] = useState("");
 
-  if (!conversation) return null;
-
-  const isGroup = conversation.type === "group";
-  const myMembership = conversation.members.find(
-    (m) => m.userId === user?.id,
-  );
-  const isAdmin =
-    myMembership?.role === "owner" || myMembership?.role === "admin";
-
-  const handleRename = async () => {
-    if (nameValue.trim()) {
-      await renameGroup(nameValue.trim());
-    }
-    setEditingName(false);
-  };
-
   // Run the search when the debounced query or panel visibility changes.
   // Calling fetch during render (as was done before) fires on every render,
   // can't be cancelled, and swallows errors at the wrong boundary.
+  //
+  // Lives above the `if (!conversation) return null` guard so the hook
+  // call order stays stable across renders (react-hooks/rules-of-hooks).
+  // The effect body bails when the conversation isn't loaded or the query
+  // is too short — the visible-results derivation below handles those
+  // cases by ignoring stale state during render, so we don't need to
+  // synchronously setSearchResults([]) here (react-hooks/set-state-in-effect).
   useEffect(() => {
-    if (!addingMembers) return;
-    if (debouncedSearch.length < 2) {
-      setSearchResults([]);
-      return;
-    }
+    if (!conversation || !addingMembers) return;
+    if (debouncedSearch.length < 2) return;
 
     const controller = new AbortController();
     (async () => {
@@ -101,7 +89,28 @@ export function ConversationInfo({ opened, onClose }: ConversationInfoProps) {
     })();
 
     return () => controller.abort();
-  }, [debouncedSearch, addingMembers, conversation.members]);
+  }, [debouncedSearch, addingMembers, conversation]);
+
+  if (!conversation) return null;
+
+  const isGroup = conversation.type === "group";
+  const myMembership = conversation.members.find(
+    (m) => m.userId === user?.id,
+  );
+  const isAdmin =
+    myMembership?.role === "owner" || myMembership?.role === "admin";
+
+  const handleRename = async () => {
+    if (nameValue.trim()) {
+      await renameGroup(nameValue.trim());
+    }
+    setEditingName(false);
+  };
+
+  // Derived during render — when the query is too short, stale results
+  // from a previous longer query are hidden without needing to write
+  // []` into searchResults state from the effect.
+  const visibleResults = debouncedSearch.length < 2 ? [] : searchResults;
 
   return (
     <Drawer
@@ -198,7 +207,7 @@ export function ConversationInfo({ opened, onClose }: ConversationInfoProps) {
               onChange={(e) => setMemberSearch(e.currentTarget.value)}
               size="xs"
             />
-            {searchResults.map((u) => (
+            {visibleResults.map((u) => (
               <Group key={u.id} justify="space-between" px="xs">
                 <Group gap="xs">
                   <UserAvatar name={u.name} size="sm" online={u.online} />

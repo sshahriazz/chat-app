@@ -7,6 +7,20 @@ import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import Mention from "@tiptap/extension-mention";
 import { Extension, type JSONContent } from "@tiptap/core";
+import {
+  IconBold,
+  IconItalic,
+  IconStrikethrough,
+  IconCode,
+  IconH1,
+  IconH2,
+  IconH3,
+  IconBlockquote,
+  IconList,
+  IconListNumbers,
+  IconCodePlus,
+  IconSeparatorHorizontal,
+} from "@tabler/icons-react";
 import { useAuth } from "@/context/AuthContext";
 import { useChat } from "@/context/ChatContext";
 import {
@@ -48,13 +62,7 @@ export function MessageEditor({
     immediatelyRender: false,
     extensions: [
       StarterKit.configure({
-        heading: false,
-        blockquote: false,
-        bulletList: false,
-        orderedList: false,
-        listItem: false,
-        horizontalRule: false,
-        codeBlock: false,
+        link: false,
       }),
       Placeholder.configure({ placeholder: "Edit message…" }),
       Mention.configure({
@@ -68,6 +76,15 @@ export function MessageEditor({
         addKeyboardShortcuts() {
           return {
             Enter: ({ editor: e }) => {
+              // Inside multi-line blocks, let Tiptap's default Enter handle
+              // line breaks / next list item instead of committing the edit.
+              if (
+                e.isActive("codeBlock") ||
+                e.isActive("listItem") ||
+                e.isActive("blockquote")
+              ) {
+                return false;
+              }
               const json = e.getJSON() as unknown as MessageContent;
               if (isEmptyContent(json)) {
                 onCancel();
@@ -107,8 +124,41 @@ export function MessageEditor({
             overflowY: "auto",
             fontSize: "var(--mantine-font-size-sm)",
           },
+          toolbar: {
+            borderBottom: "1px solid var(--mantine-color-default-border)",
+            padding: 4,
+            gap: 2,
+          },
         }}
       >
+        <RichTextEditor.Toolbar>
+          <RichTextEditor.ControlsGroup>
+            <RichTextEditor.Bold icon={() => <IconBold size={14} />} />
+            <RichTextEditor.Italic icon={() => <IconItalic size={14} />} />
+            <RichTextEditor.Strikethrough
+              icon={() => <IconStrikethrough size={14} />}
+            />
+            <RichTextEditor.Code icon={() => <IconCode size={14} />} />
+          </RichTextEditor.ControlsGroup>
+          <RichTextEditor.ControlsGroup>
+            <RichTextEditor.H1 icon={() => <IconH1 size={14} />} />
+            <RichTextEditor.H2 icon={() => <IconH2 size={14} />} />
+            <RichTextEditor.H3 icon={() => <IconH3 size={14} />} />
+          </RichTextEditor.ControlsGroup>
+          <RichTextEditor.ControlsGroup>
+            <RichTextEditor.BulletList icon={() => <IconList size={14} />} />
+            <RichTextEditor.OrderedList
+              icon={() => <IconListNumbers size={14} />}
+            />
+            <RichTextEditor.Blockquote
+              icon={() => <IconBlockquote size={14} />}
+            />
+            <RichTextEditor.CodeBlock icon={() => <IconCodePlus size={14} />} />
+            <RichTextEditor.Hr
+              icon={() => <IconSeparatorHorizontal size={14} />}
+            />
+          </RichTextEditor.ControlsGroup>
+        </RichTextEditor.Toolbar>
         <RichTextEditor.Content />
       </RichTextEditor>
       <Text size="xs" c="dimmed">
