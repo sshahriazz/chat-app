@@ -29,12 +29,16 @@ services:
   postgres:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatapp}
+    # All dev port bindings are pinned to 127.0.0.1 so backing services
+    # (Postgres, Redis, MinIO, Centrifugo admin) are reachable only from
+    # the developer's machine — never from the LAN / public Wi-Fi the
+    # laptop happens to be on.
     ports:
-      - "${POSTGRES_HOST_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
 
   redis:
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
 
   centrifugo:
     environment:
@@ -43,18 +47,18 @@ services:
       CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:-admin}
       CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:-dev-admin-secret}
     ports:
-      - "${CENTRIFUGO_HOST_PORT:-8000}:8000"
+      - "127.0.0.1:${CENTRIFUGO_HOST_PORT:-8000}:8000"
 
   minio:
     environment:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-chatapp-dev-only}
     ports:
-      - "${MINIO_HOST_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+      - "127.0.0.1:${MINIO_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
 
   server:
     ports:
-      - "${SERVER_HOST_PORT:-3001}:3001"
+      - "127.0.0.1:${SERVER_HOST_PORT:-3001}:3001"
     environment:
       # Fallbacks for the vars `docker-compose.yml` now marks
       # `${VAR:?required}`. Without these, `make dev` would refuse to

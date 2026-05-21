@@ -20,8 +20,10 @@ import type { ApiKeyAuthenticatedRequest } from "./require-api-key";
  *       * `WEBHOOK_SIGNATURE_REQUIRED=true` → reject with 401
  *       * otherwise → allow (backwards-compat)
  *
- * Depends on `requireApiKey` running first (it stashes `req.apiKey`)
- * and on `express.json({ verify })` having captured the raw bytes.
+ * Depends on `requireApiKey` running first (it stashes the precomputed
+ * `req.webhookBodyHmac` = HMAC(apiKey, rawBody)) and on
+ * `express.json({ verify })` having captured the raw bytes. The raw API
+ * key is never exposed on the request — only the digest is.
  */
 
 export function requireWebhookSignature(
@@ -46,20 +48,15 @@ export function requireWebhookSignature(
       throw new UnauthorizedError("Malformed X-Chat-Signature");
     }
 
-    const r = req as ApiKeyAuthenticatedRequest & { rawBody?: Buffer };
-    if (!r.apiKey || !r.rawBody) {
+    const r = req as ApiKeyAuthenticatedRequest;
+    if (!r.webhookBodyHmac) {
       // Either the route is mounted without the raw-body parser, or
       // requireApiKey didn't run first. Fail closed.
       throw new UnauthorizedError("Signature verification unavailable");
     }
 
-    const expected = crypto
-      .createHmac("sha256", r.apiKey)
-      .update(r.rawBody)
-      .digest("hex");
-
     const a = Buffer.from(match[1], "hex");
-    const b = Buffer.from(expected, "hex");
+    const b = Buffer.from(r.webhookBodyHmac, "hex");
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       throw new UnauthorizedError("Invalid X-Chat-Signature");
     }

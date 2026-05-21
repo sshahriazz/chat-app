@@ -1110,3 +1110,25 @@ export function getOpenApiDocument() {
   if (!cached) cached = buildOpenApiDocument();
   return cached;
 }
+
+let cachedPublic: ReturnType<typeof buildOpenApiDocument> | null = null;
+
+/**
+ * Public-facing OpenAPI doc with operator-only surfaces removed. The
+ * full doc maps every admin / dev route + their request shapes, which
+ * is unnecessary recon to hand an unauthenticated visitor. We strip any
+ * path under `/admin` or `/dev` (the server's own routes mount them at
+ * `/api/admin` and `/api/dev`; the doc paths omit the `/api` prefix).
+ */
+export function getPublicOpenApiDocument() {
+  if (cachedPublic) return cachedPublic;
+  const full = getOpenApiDocument();
+  const paths = full.paths ?? {};
+  const filtered: Record<string, unknown> = {};
+  for (const [p, def] of Object.entries(paths)) {
+    if (p.startsWith("/admin") || p.startsWith("/dev")) continue;
+    filtered[p] = def;
+  }
+  cachedPublic = { ...full, paths: filtered } as typeof full;
+  return cachedPublic;
+}

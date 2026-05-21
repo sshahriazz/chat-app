@@ -5,6 +5,7 @@
 import { config as loadEnv } from "dotenv";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import crypto from "node:crypto";
 loadEnv({
   path: path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -31,7 +32,7 @@ import webhookRoutes from "./routes/webhooks";
 import adminRoutes from "./routes/admin";
 import devRoutes from "./routes/dev";
 import { apiReference } from "@scalar/express-api-reference";
-import { getOpenApiDocument } from "./http/openapi";
+import { getPublicOpenApiDocument } from "./http/openapi";
 import { httpMetrics } from "./middleware/metrics";
 import { outboxDepth, outboxOldestAgeSeconds, registry as metricsRegistry } from "./infra/metrics";
 
@@ -75,9 +76,20 @@ logger.info(
 
 // Don't leak framework identity in the Server header.
 app.disable("x-powered-by");
-// Trust the first reverse-proxy hop's X-Forwarded-* headers so req.ip
-// reflects the real client rather than the LB.
-app.set("trust proxy", env.TRUST_PROXY);
+// Trust proxy. Prefer an explicit CIDR/IP allowlist (TRUST_PROXY_CIDRS,
+// comma-separated) so X-Forwarded-* is only honored from the known
+// reverse proxy — a numeric hop count (the TRUST_PROXY fallback) trusts
+// "the Nth from the right" and is easy to mis-count, letting a client
+// spoof X-Forwarded-For (→ rate-limit / IP-allowlist bypass). Document
+// the deployed proxy CIDR in .env.example.
+if (env.TRUST_PROXY_CIDRS) {
+  const cidrs = env.TRUST_PROXY_CIDRS.split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  app.set("trust proxy", cidrs);
+} else {
+  app.set("trust proxy", env.TRUST_PROXY);
+}
 
 // --- Observability ----------------------------------------------------------
 
@@ -111,7 +123,10 @@ app.use(
     serializers: {
       req: (req) => ({
         method: req.method,
-        url: req.url,
+        // Log the path only — strip the query string so search terms
+        // (`?q=...`), cursors, and any other potentially sensitive
+        // query params never land in logs.
+        url: typeof req.url === "string" ? req.url.split("?")[0] : req.url,
       }),
       res: (res) => ({ statusCode: res.statusCode }),
     },
@@ -123,15 +138,47 @@ app.use(
 app.use(
   helmet({
     // The Next.js app loads our API from a different origin; allow the
-    // relevant CORP/COEP defaults but keep the rest of helmet's hardening.
+    // relevant CORP default but keep the rest of helmet's hardening.
     crossOriginResourcePolicy: { policy: "cross-origin" },
+    // 2-year HSTS + preload eligibility. The stack always terminates TLS
+    // at the edge proxy in prod.
+    strictTransportSecurity: {
+      maxAge: 63072000,
+      includeSubDomains: true,
+      preload: true,
+    },
+    // Pure JSON API: nothing should ever be loaded from a server
+    // response. `default-src 'none'` is the tightest sane policy; the
+    // /docs route overrides this with a Scalar-specific policy below.
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        "default-src": ["'none'"],
+        "frame-ancestors": ["'none'"],
+        "base-uri": ["'none'"],
+        "form-action": ["'none'"],
+      },
+    },
   }),
 );
+
+// Permissions-Policy: deny powerful features the API/docs never use.
+// helmet doesn't set this header, so add it explicitly.
+app.use((_req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=(), browsing-topics=()",
+  );
+  next();
+});
 
 app.use(
   cors({
     origin: allowedOrigins,
-    credentials: true,
+    // No cookies are used (bearer-token auth only), so credentialed CORS
+    // is unnecessary. Dropping it avoids the footgun where a future
+    // cookie + a permissive origin would expose authenticated requests.
+    credentials: false,
   }),
 );
 
@@ -142,11 +189,23 @@ app.use(
 app.use(healthRoutes);
 app.use("/api", healthRoutes);
 
-// Prometheus scrape target. Unauthenticated on purpose (standard
-// convention); protect by binding to an internal network, firewall, or
-// service-mesh mTLS in production. Kept next to health probes so it's
-// available without auth or body parsing running first.
-app.get("/metrics", async (_req, res) => {
+// Prometheus scrape target. When METRICS_TOKEN is set, require it as a
+// bearer — the registry leaks per-tenant outbox depth / per-route
+// latencies that are useful recon. When unset, the endpoint is open and
+// MUST be firewalled to an internal network (documented in .env.example).
+app.get("/metrics", async (req, res) => {
+  if (env.METRICS_TOKEN) {
+    const header = req.headers.authorization;
+    const match =
+      typeof header === "string" ? header.match(/^Bearer\s+(.+)$/) : null;
+    const provided = match ? match[1] : "";
+    const a = crypto.createHash("sha256").update(provided).digest();
+    const b = crypto.createHash("sha256").update(env.METRICS_TOKEN).digest();
+    if (!crypto.timingSafeEqual(a, b)) {
+      res.status(404).end(); // opaque: don't advertise the endpoint
+      return;
+    }
+  }
   res.set("Content-Type", metricsRegistry.contentType);
   res.end(await metricsRegistry.metrics());
 });
@@ -158,23 +217,32 @@ app.get("/metrics", async (_req, res) => {
 // the server's HTTP surface is not a secret and having the docs 401 breaks
 // the ergonomic case of cURLing a route by clicking "Try it".
 const openapiHandler = (_req: express.Request, res: express.Response) => {
-  res.json(getOpenApiDocument());
+  // Public doc: admin/dev routes are stripped so an unauthenticated
+  // visitor can't enumerate operator-only endpoints + their shapes.
+  res.json(getPublicOpenApiDocument());
 };
 app.get("/openapi.json", openapiHandler);
 app.get("/api/openapi.json", openapiHandler);
 
 // Scalar's shell pulls its bundle from jsdelivr, uses eval internally,
-// fetches source maps, and (by default) talks to api.scalar.com for a
-// curated registry. The app-wide strict CSP blocks all of that. Disable
-// CSP on `/docs` alone — every real API route keeps the hardened default,
-// and the docs page is a third-party renderer whose attack surface is
-// already a function of trusting Scalar's CDN.
+// and (by default) talks to api.scalar.com. Rather than removing CSP
+// entirely (which would let ANY origin's script run if the page were
+// ever injected), apply a TIGHT policy that whitelists exactly the
+// Scalar CDN + registry. Every real API route keeps `default-src
+// 'none'` from the global helmet config.
+const docsCsp =
+  "default-src 'self'; " +
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; " +
+  "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; " +
+  "img-src 'self' data: https://cdn.jsdelivr.net; " +
+  "font-src 'self' data: https://cdn.jsdelivr.net; " +
+  "connect-src 'self' https://cdn.jsdelivr.net https://api.scalar.com; " +
+  "worker-src 'self' blob:; " +
+  "frame-ancestors 'none'; base-uri 'self'";
 const stripCsp: express.RequestHandler = (_req, res, next) => {
-  // The global helmet() above already stamped CSP; per-route helmet
-  // can't un-set a header an upstream middleware added. Strip it here
-  // so Scalar's CDN bundle + inline bootstrap + eval-based runtime
-  // + api.scalar.com fetches all work.
-  res.removeHeader("Content-Security-Policy");
+  // Replace the global `default-src 'none'` with the Scalar-scoped
+  // policy for the docs renderer only.
+  res.setHeader("Content-Security-Policy", docsCsp);
   next();
 };
 // Relative `./openapi.json` resolves from whichever mount the browser

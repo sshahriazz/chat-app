@@ -29,9 +29,22 @@ networks:
   dokploy-network:
     external: true
 
+# Shared container hardening, merged into each service via `<<: *hardened`.
+# - no-new-privileges blocks setuid/setgid privilege escalation.
+# - cap_drop ALL removes every Linux capability; services that genuinely
+#   need one (postgres' initdb) add it back with cap_add.
+x-hardened: &hardened
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
 services:
   # ─── Postgres (INTERNAL) ─────────────────────────────────────
   postgres:
+    <<: *hardened
+    # initdb / the entrypoint's privilege-drop need these back.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     image: postgres:17-alpine
     restart: unless-stopped
     networks: [dokploy-network]
@@ -53,6 +66,7 @@ services:
 
   # ─── Redis (INTERNAL) ────────────────────────────────────────
   redis:
+    <<: *hardened
     image: redis:8-alpine
     restart: unless-stopped
     networks: [dokploy-network]
@@ -73,6 +87,7 @@ services:
 
   # ─── Centrifugo (INTERNAL — browser reaches via /connection/websocket on web) ─
   centrifugo:
+    <<: *hardened
     image: centrifugo/centrifugo:v6
     restart: unless-stopped
     networks: [dokploy-network]
@@ -95,7 +110,12 @@ services:
       - -c
       - |
         if [ -n "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" ]; then
-          ORIGINS_JSON=$$(echo "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" | awk -F, '{printf "["; for(i=1;i<=NF;i++) {gsub(/^ +| +$$/, "", $$i); printf "%s%c%s%c", (i>1?",":""), 34, $$i, 34} printf "]"}')
+          # Build a JSON array of origins. Each element is stripped of
+          # leading/trailing whitespace AND of any " or \ chars, so a
+          # stray quote in the env value can't produce malformed JSON
+          # that crashes Centrifugo at boot (origins are scheme://host
+          # and never legitimately contain those characters).
+          ORIGINS_JSON=$$(echo "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" | awk -F, '{printf "["; for(i=1;i<=NF;i++) {gsub(/^ +| +$$/, "", $$i); gsub(/["\\]/, "", $$i); printf "%s%c%s%c", (i>1?",":""), 34, $$i, 34} printf "]"}')
           sed "s|\"allowed_origins\":[[:space:]]*\[[^]]*\]|\"allowed_origins\": $$ORIGINS_JSON|" /centrifugo/config.json > /tmp/centrifugo.json
         else
           cp /centrifugo/config.json /tmp/centrifugo.json
@@ -143,7 +163,11 @@ services:
 
   # ─── MinIO (INTERNAL — browser reaches via /chatapp/* on web) ─
   minio:
-    image: minio/minio:latest
+    <<: *hardened
+    # Pinned to an immutable digest (not `:latest`) for reproducible
+    # builds + supply-chain safety. Re-pin deliberately when upgrading:
+    #   docker pull minio/minio:RELEASE.<date> && docker image inspect ... --format '{{index .RepoDigests 0}}'
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
     networks: [dokploy-network]
     environment:
@@ -168,7 +192,8 @@ services:
       retries: 5
 
   minio-init:
-    image: minio/mc:latest
+    <<: *hardened
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     networks: [dokploy-network]
     depends_on:
       minio:
@@ -184,6 +209,7 @@ services:
 
   # ─── Prisma migrations (one-shot, INTERNAL) ──────────────────
   migrate:
+    <<: *hardened
     build:
       context: .
       dockerfile: apps/server/Dockerfile
@@ -198,6 +224,7 @@ services:
 
   # ─── Server / Express (INTERNAL) ─────────────────────────────
   server:
+    <<: *hardened
     build:
       context: .
       dockerfile: apps/server/Dockerfile
@@ -288,6 +315,7 @@ services:
 
   # ─── Web / Next.js (UI only — pure presentation layer) ───────
   web:
+    <<: *hardened
     build:
       context: .
       dockerfile: apps/web/Dockerfile
@@ -307,8 +335,13 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3000
       HOSTNAME: 0.0.0.0
-    ports:
-      - "${WEB_PORT:-3000}:3000"
+    # No host port binding in the deployed stack: Dokploy's Traefik
+    # routes the domain to this container over `dokploy-network` and
+    # terminates TLS. A host bind would expose the app on a plaintext
+    # port that bypasses Traefik (no TLS, no edge rate limiting). For a
+    # bare-metal `docker compose up` (no Traefik), add the binding via an
+    # override file — compose.dev.yml already binds host ports for local
+    # use.
 
 volumes:
   postgres_data:

@@ -50,7 +50,17 @@ const EnvSchema = z.object({
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .optional(),
+  // Optional bearer token gating GET /metrics. When set, scrapers must
+  // send `Authorization: Bearer <token>`. Leave unset only when the
+  // endpoint is already firewalled to an internal network.
+  METRICS_TOKEN: z.string().min(16).optional(),
+  // Numeric hop count (legacy fallback). Prefer TRUST_PROXY_CIDRS.
   TRUST_PROXY: z.coerce.number().int().nonnegative().default(1),
+  // Comma-separated list of trusted proxy IPs/CIDRs. When set, Express
+  // only honors X-Forwarded-* from these sources — closes the
+  // X-Forwarded-For spoofing window that a mis-counted hop count opens
+  // (rate-limit + admin IP-allowlist bypass). e.g. "10.0.0.0/8,172.18.0.1".
+  TRUST_PROXY_CIDRS: z.string().optional(),
 
   // Tenancy (PR 1 onward).
   //
@@ -257,6 +267,29 @@ if (isProduction) {
   if (origins.length === 0) {
     console.error(
       "[env] CORS_ALLOWED_ORIGINS is required in production (comma-separated list of origins).",
+    );
+    process.exit(1);
+  }
+  // Reject dev-shaped origins that an operator may have copy-pasted from
+  // .env.example: any non-https origin, or a localhost/loopback host, in
+  // a CORS allowlist would let an attacker-controlled local dev server
+  // make authenticated cross-origin requests against prod.
+  const bad = origins.filter((o) => {
+    try {
+      const u = new URL(o);
+      const isLoopback =
+        u.hostname === "localhost" ||
+        u.hostname === "127.0.0.1" ||
+        u.hostname === "::1" ||
+        u.hostname.endsWith(".localhost");
+      return u.protocol !== "https:" || isLoopback;
+    } catch {
+      return true; // unparseable origin
+    }
+  });
+  if (bad.length > 0) {
+    console.error(
+      `[env] CORS_ALLOWED_ORIGINS contains non-https / localhost / invalid origins in production: ${bad.join(", ")}`,
     );
     process.exit(1);
   }

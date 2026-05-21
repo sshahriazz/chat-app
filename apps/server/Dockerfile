@@ -46,6 +46,12 @@ EXPOSE 3001
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
   CMD wget -q --spider http://localhost:3001/livez || exit 1
 
+# Run as the unprivileged built-in `node` user (uid 1000) rather than
+# root. The app only reads its bundle + writes to /tmp (world-writable),
+# so no chown is needed; root-owned files are world-readable. Mirrors
+# apps/web/Dockerfile, which already drops to a non-root user.
+USER node
+
 WORKDIR /app/apps/server
 
 # Migrations run as a ONE-SHOT step before rolling deploys, not on every

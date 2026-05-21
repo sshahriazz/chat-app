@@ -1,4 +1,4 @@
-# Breaking Changes — Security Hardening (Phases 1–4)
+# Breaking Changes — Security Hardening (Phases 1–6)
 
 This release hardens the chat server (`apps/server`) following a security
 review. Several changes alter the API/deploy contract. Read this before
@@ -210,6 +210,38 @@ were synthesizing cursors yourself (don't).
   sender→recipient pair (silent; no error).
 
 ---
+
+## 3a. 🛠 Operator — headers, infra & transport (Phase 6)
+
+- **Strict CSP**: API responses now send `Content-Security-Policy:
+  default-src 'none'`. `/docs` gets a Scalar-scoped policy (jsdelivr +
+  api.scalar.com) instead of having CSP stripped. HSTS bumped to 2y +
+  `includeSubDomains; preload`; `Permissions-Policy` denies
+  camera/mic/geolocation. If you embed the API in an iframe or load
+  cross-origin assets, review these.
+- **CORS**: `credentials` is now `false` (no cookies are used). In
+  production, boot **fails** if `CORS_ALLOWED_ORIGINS` contains a
+  non-https or localhost/loopback origin — clean dev values out of the
+  prod allowlist.
+- **trust proxy**: prefer the new `TRUST_PROXY_CIDRS` (comma-separated
+  proxy IPs/CIDRs) over the numeric `TRUST_PROXY` hop count — it stops
+  X-Forwarded-For spoofing (rate-limit / admin-IP-allowlist bypass).
+- **`/metrics`**: set `METRICS_TOKEN` to require `Authorization: Bearer
+  <token>` on the Prometheus endpoint (returns 404 otherwise). Update
+  your scraper config. If unset, keep it firewalled to an internal net.
+- **Health probes**: `/livez` now returns `{ status: "ok" }` only and
+  `/readyz` returns `{ status }` only (no per-dependency `db`/`redis`
+  fields). Monitors parsing those fields should read the HTTP status
+  code (readyz) or `/metrics` instead.
+- **OpenAPI**: the public `/openapi.json` + `/docs` omit `/admin` and
+  `/dev` routes.
+- **Containers**: `docker-compose.yml` now drops all Linux capabilities
+  (`cap_drop: ALL`, postgres re-adds initdb caps) + `no-new-privileges`,
+  pins MinIO/mc to image digests, and removes the `web` host port
+  binding (Traefik handles ingress). The server image runs as the
+  non-root `node` user. Dev overlay ports bind to `127.0.0.1` only.
+- New env vars: `TRUST_PROXY_CIDRS` (optional), `METRICS_TOKEN`
+  (optional).
 
 ## 4. Upgrade checklist
 
