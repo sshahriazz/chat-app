@@ -181,9 +181,45 @@ const ALLOWED_CONTENT_TYPES = [
   "audio/webm",
 ] as const;
 
+/**
+ * Sanitize a user-supplied filename before we store or display it.
+ *
+ * Drops:
+ *   - C0 control chars (U+0000-U+001F) and DEL (U+007F) - including the
+ *     null byte, which has historically truncated filenames on the OS
+ *     side and confused content-disposition parsers.
+ *   - Bidi / direction overrides (U+202A-U+202E, U+2066-U+2069). RLO
+ *     (U+202E) displays "evil<RLO>gpj.exe" as "evilexe.jpg" in clients.
+ *   - Path separators / parent traversals.
+ * Normalizes Unicode -> NFC and truncates to 100 chars (extension is
+ * derived from the declared MIME, not from this label).
+ *
+ * The strip range uses \u escapes only, so the source stays ASCII.
+ */
+const FILENAME_STRIP =
+  /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g;
+
+function sanitizeFilename(raw: string): string {
+  let s = raw.normalize("NFC");
+  // Drop control + bidi-override codepoints.
+  s = s.replace(FILENAME_STRIP, "");
+  // Disallow path separators outright; treat the basename as the label.
+  s = s.replace(/[\\/]+/g, "_");
+  // Collapse dot-runs that look like traversal.
+  s = s.replace(/\.{2,}/g, ".");
+  // Trim leading/trailing dots + whitespace (Windows quirks + UX noise).
+  s = s.replace(/^[\s.]+|[\s.]+$/g, "");
+  return s.slice(0, 100);
+}
+
 export const UploadUrlBodySchema = z
   .object({
-    filename: z.string().min(1).max(255),
+    filename: z
+      .string()
+      .min(1)
+      .max(255)
+      .transform(sanitizeFilename)
+      .refine((s) => s.length > 0, "Filename is empty after sanitization"),
     contentType: z.enum(ALLOWED_CONTENT_TYPES),
     size: z.number().int().positive().max(MAX_ATTACHMENT_SIZE),
     width: z.number().int().positive().max(16384).optional(),
@@ -199,9 +235,39 @@ export const SubscriptionTokenBodySchema = z
 
 // ─── Push ────────────────────────────────────────────────────
 
+// Allowlist of hostnames the server will ever POST a Web Push to. A
+// bare `z.string().url()` accepts `http://169.254.169.254/...`,
+// `http://localhost:6379/`, internal admin endpoints, etc. — turning
+// the push fan-out into an SSRF primitive (the server POSTs to whatever
+// endpoint a user registered whenever they get a message). Browsers
+// only ever hand out push endpoints on these provider domains.
+const PUSH_ENDPOINT_HOST_ALLOWLIST: RegExp[] = [
+  /^fcm\.googleapis\.com$/,
+  /^updates\.push\.services\.mozilla\.com$/,
+  /(^|\.)notify\.windows\.com$/,
+  /(^|\.)push\.apple\.com$/,
+];
+
+function isAllowedPushEndpoint(u: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(u);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  return PUSH_ENDPOINT_HOST_ALLOWLIST.some((re) => re.test(parsed.hostname));
+}
+
+const pushEndpoint = z
+  .string()
+  .url()
+  .max(1024)
+  .refine(isAllowedPushEndpoint, "Unsupported push endpoint host");
+
 export const PushSubscribeBodySchema = z
   .object({
-    endpoint: z.string().url().max(1024),
+    endpoint: pushEndpoint,
     keys: z.object({
       p256dh: z.string().min(1).max(200),
       auth: z.string().min(1).max(200),
@@ -210,7 +276,7 @@ export const PushSubscribeBodySchema = z
   .meta({ id: "PushSubscribeBody" });
 
 export const PushUnsubscribeBodySchema = z
-  .object({ endpoint: z.string().url().max(1024) })
+  .object({ endpoint: pushEndpoint })
   .meta({ id: "PushUnsubscribeBody" });
 
 // ─── Webhooks (tenant → us) ──────────────────────────────────

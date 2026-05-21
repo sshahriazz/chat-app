@@ -1,4 +1,6 @@
+import crypto from "node:crypto";
 import { Router } from "express";
+import { env } from "../env";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/auth";
 import { requireTenantWide } from "../middleware/require-tenant-wide";
 import { generalLimiter, searchLimiter } from "../middleware/rate-limit";
@@ -11,6 +13,7 @@ import {
 } from "../http/schemas";
 import { deleteObject, keyFromPublicUrl } from "../lib/s3";
 import { invalidateUserProfile } from "../lib/user-cache";
+import { invalidateFederatedUser } from "../lib/user-federation";
 import { userScopeFilter } from "../lib/scope-filter";
 import { logger } from "../lib/logger";
 
@@ -40,17 +43,47 @@ interface UserListCursor {
   id: string;
 }
 
+// Cursor signing key. Derived from a required server secret with a
+// fixed domain-separation label so it's stable across restarts without
+// introducing a new env var. Signing prevents a client from forging /
+// tampering a cursor to seek into arbitrary positions of the sorted set
+// (defense-in-depth: the endpoint is already requireTenantWide, but a
+// future scoped reuse would otherwise leak past the scope filter).
+const CURSOR_KEY = crypto
+  .createHash("sha256")
+  .update("user-list-cursor-hmac:v1:" + env.CENTRIFUGO_TOKEN_SECRET)
+  .digest();
+
+function signCursor(payload: string): string {
+  return crypto
+    .createHmac("sha256", CURSOR_KEY)
+    .update(payload)
+    .digest("base64url")
+    .slice(0, 24); // 144-bit tag is plenty for tamper-detection
+}
+
 function encodeUserListCursor(cursor: UserListCursor): string {
-  return Buffer.from(
+  const payload = Buffer.from(
     JSON.stringify({ n: cursor.name, i: cursor.id }),
     "utf8",
   ).toString("base64url");
+  return `${payload}.${signCursor(payload)}`;
 }
 
 function decodeUserListCursor(raw: string | undefined): UserListCursor | null {
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+    const dot = raw.lastIndexOf(".");
+    if (dot <= 0) return null;
+    const payload = raw.slice(0, dot);
+    const sig = raw.slice(dot + 1);
+    const expected = signCursor(payload);
+    // Constant-time compare; reject any tampered / unsigned cursor.
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
     if (
       parsed &&
       typeof parsed.n === "string" &&
@@ -297,6 +330,30 @@ router.post(
 // A structured audit log is emitted so compliance can trace the
 // deletion without needing DB forensics.
 
+// POST /api/users/me/revoke
+// "Log out everywhere" primitive. Bumps the user's `tokensValidAfter`
+// to NOW(), causing every existing JWT (across every device, browser
+// tab, mobile app) to be rejected on the next request — even if the
+// tenant keeps minting fresh ones with old `iat` values. The next
+// legitimate login (`iat` ≥ now) re-enables access. Use cases: lost
+// device, suspected token leak, mandatory re-auth after sensitive
+// change.
+router.post("/me/revoke", requireAuth, generalLimiter, async (req, res) => {
+  const { user, tenantId } = req as AuthenticatedRequest;
+  const updated = await prisma.user.update({
+    where: { id: user.id },
+    data: { tokensValidAfter: new Date() },
+    select: { externalId: true },
+  });
+  // Invalidate BOTH caches so the next request re-reads the new
+  // `tokensValidAfter` from DB. Without this, the fed-user cache hit
+  // returns a stale row for up to its TTL and revocation silently
+  // doesn't take effect.
+  await invalidateUserProfile(user.id);
+  await invalidateFederatedUser(tenantId, updated.externalId);
+  res.json({ ok: true });
+});
+
 router.delete("/me", requireAuth, generalLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
 
@@ -313,12 +370,39 @@ router.delete("/me", requireAuth, generalLimiter, async (req, res) => {
     if (k) s3Keys.push(k);
   }
 
-  // 2. Delete the user row. Cascade handles every other table per the
+  // 2. Fetch the externalId so we can write a tombstone before the
+  //    User row disappears. Without this, the next authenticated
+  //    request from the tenant's still-valid JWT would silently
+  //    re-materialize this user via `upsertFederatedUser` — defeating
+  //    GDPR's right-to-be-forgotten. The tombstone makes deletion
+  //    sticky for 30 days; after that, the same externalId is free to
+  //    re-register (e.g. user signs up again with the same tenant).
+  const me = await prisma.user.findUnique({
+    where: { id: user.id },
+    select: { externalId: true },
+  });
+
+  // 3. Delete the user row. Cascade handles every other table per the
   //    schema; if this throws, nothing has been mutated yet. `deleteMany`
   //    + tenantId lets us defend against a hypothetical userId collision
   //    across tenants (UUIDs make that astronomically unlikely, but the
   //    check costs nothing).
   await prisma.user.deleteMany({ where: { id: user.id, tenantId } });
+
+  if (me?.externalId) {
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    await prisma.deletedExternalId.upsert({
+      where: {
+        tenantId_externalId: { tenantId, externalId: me.externalId },
+      },
+      create: { tenantId, externalId: me.externalId, deletedAt: now, expiresAt },
+      update: { deletedAt: now, expiresAt },
+    });
+    // Drop the fed-user cache entry so an in-flight request after the
+    // delete doesn't hit the cache and skip the tombstone check.
+    await invalidateFederatedUser(tenantId, me.externalId);
+  }
 
   // 3. Invalidate caches: profile, session (the in-flight request
   //    already has a valid session but it's about to be gone).

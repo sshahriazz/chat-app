@@ -20,6 +20,7 @@ import { logger } from "./infra/logger";
 import { prisma } from "./infra/prisma";
 import { redis } from "./infra/redis";
 import { requestId } from "./middleware/request-id";
+import { preAuthIpLimiter } from "./middleware/rate-limit";
 import healthRoutes from "./routes/health";
 import centrifugoRoutes from "./routes/centrifugo";
 import chatRoutes from "./routes/chat";
@@ -197,7 +198,14 @@ app.use("/api/docs", stripCsp, docsHandler);
 // rate limiter ever fails open. Only the chat catch-all gets a 512 KB
 // ceiling because rich Tiptap JSON for a long message can legitimately
 // serialize above the global default.
-app.use("/api/centrifugo", express.json({ limit: "4kb" }), centrifugoRoutes);
+// `preAuthIpLimiter` (60 req/min/IP) runs BEFORE any router whose
+// first gate is an expensive crypto verify — Argon2 for tenant API
+// keys, HMAC + AES-GCM unwrap for JWTs, SHA-256 master-key compare.
+// Without this, an attacker can spray random bearer tokens and force
+// the server to run those verifies on every request, pegging CPU
+// regardless of credential validity. The cap is generous for legit
+// callers (webhooks are tenant-backend → us, not user-driven).
+app.use("/api/centrifugo", preAuthIpLimiter, express.json({ limit: "4kb" }), centrifugoRoutes);
 app.use("/api/users", express.json({ limit: "32kb" }), userRoutes);
 app.use("/api/attachments", express.json({ limit: "8kb" }), attachmentRoutes);
 app.use("/api/push", express.json({ limit: "4kb" }), pushRoutes);
@@ -207,6 +215,7 @@ app.use("/api/push", express.json({ limit: "4kb" }), pushRoutes);
 // unmodified payload with the tenant's apiKey.
 app.use(
   "/api/webhooks",
+  preAuthIpLimiter,
   express.json({
     limit: "8kb",
     verify: (req, _res, buf) => {
@@ -215,10 +224,11 @@ app.use(
   }),
   webhookRoutes,
 );
-app.use("/api/admin", express.json({ limit: "4kb" }), adminRoutes);
-// Dev-only mint-token endpoint. Middleware inside returns 404 in prod
-// unless DEV_MINT_ENABLED=true + ALLOW_DEV_MINT_TENANTS is set.
-app.use("/api/dev", express.json({ limit: "4kb" }), devRoutes);
+app.use("/api/admin", preAuthIpLimiter, express.json({ limit: "4kb" }), adminRoutes);
+// Dev-only mint-token endpoint. Router-level middleware returns 404
+// in prod unconditionally; pre-auth limit applies in non-prod to
+// keep abuse manageable on shared staging environments.
+app.use("/api/dev", preAuthIpLimiter, express.json({ limit: "4kb" }), devRoutes);
 // Chat catch-all registered last so more specific prefixes above match
 // first. 512 KB covers the worst-case serialized Tiptap doc (50K plain
 // chars × ~3× markup overhead) plus request-shape overhead.
@@ -312,6 +322,15 @@ app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(env.PORT, () => {
   logger.info({ port: env.PORT }, "server listening");
+  // Best-effort audit: warn loudly if any tenant rows still have
+  // NULL apiKeyPrefix, since those widen the Argon2 cost on every
+  // unauthenticated webhook probe. Fire-and-forget — failure here
+  // must not block the listener.
+  import("./lib/tenant")
+    .then(({ auditLegacyApiKeyPrefixes }) => auditLegacyApiKeyPrefixes())
+    .catch((err) =>
+      logger.warn({ err: (err as Error).message }, "tenant audit failed"),
+    );
 });
 
 let shuttingDown = false;

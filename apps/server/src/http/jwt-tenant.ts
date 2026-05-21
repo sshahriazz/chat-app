@@ -1,6 +1,16 @@
 import jwt from "jsonwebtoken";
 import { env } from "../env";
 
+/** Single-purpose audience claim — tokens minted with this value are
+ *  scoped to chat-app and cannot be replayed against unrelated
+ *  services that happen to share a tenant's HMAC secret. */
+export const TENANT_JWT_AUDIENCE = "chat-app";
+
+/** Upper bound on tenant-minted token lifetime enforced at verify
+ *  time. A tenant minting a 30-day token would otherwise widen the
+ *  blast radius of any token leak. */
+export const MAX_TENANT_TOKEN_TTL_SEC = 60 * 60; // 1 hour
+
 /**
  * Tenant-issued user JWTs.
  *
@@ -67,6 +77,7 @@ export function mintUserToken(
     jwtSecret,
     {
       issuer: tenantId,
+      audience: TENANT_JWT_AUDIENCE,
       expiresIn: ttl,
       algorithm: "HS256",
     },
@@ -75,25 +86,52 @@ export function mintUserToken(
 
 /**
  * Verify a tenant-issued user token. Throws on signature / expiry /
- * format failure (caller should catch and respond 401).
+ * format / issuer / audience failure (caller should catch and respond
+ * 401).
  *
  * Returns the decoded claims; the `iss` field is the tenant id — the
  * caller uses it to pick the right `jwtSecret` out of the Tenant cache
  * BEFORE calling this function. That means verification is:
  *   1. decode un-verified to read `iss`
  *   2. look up tenant.jwtSecret
- *   3. verify with that secret
+ *   3. verify with that secret + assert `iss` matches the tenant we
+ *      looked up + assert `aud === "chat-app"`
+ *
+ * The explicit `expectedIssuer` argument closes a defense-in-depth
+ * gap: prior to this, the un-verified `iss` *selected* the secret,
+ * but the post-verify path never re-confirmed the verified `iss`
+ * equaled the tenant id we'd routed against. A future refactor that
+ * cached secrets under a different key would have silently
+ * mis-attributed users.
  */
 export function verifyUserToken(
   token: string,
   jwtSecret: string,
+  expectedIssuer: string,
 ): TenantUserClaims {
   const decoded = jwt.verify(token, jwtSecret, {
     algorithms: ["HS256"],
+    issuer: expectedIssuer,
+    audience: TENANT_JWT_AUDIENCE,
     clockTolerance: env.TENANT_JWT_CLOCK_SKEW_SEC,
   });
   if (typeof decoded === "string" || !decoded || !decoded.sub || !decoded.iss) {
     throw new Error("Invalid user token payload");
+  }
+  if (decoded.iss !== expectedIssuer) {
+    // Belt-and-braces: jwt.verify already enforces this via the
+    // `issuer` option, but reassert here so the contract is explicit
+    // and the code is robust to library upgrades.
+    throw new Error("Token issuer mismatch");
+  }
+  // Bound tenant-minted token lifetime server-side. A tenant minting
+  // a 24h+ token would otherwise widen the blast radius of any leak.
+  if (
+    typeof decoded.iat === "number" &&
+    typeof decoded.exp === "number" &&
+    decoded.exp - decoded.iat > MAX_TENANT_TOKEN_TTL_SEC
+  ) {
+    throw new Error("Token TTL exceeds server-enforced maximum");
   }
   return decoded as TenantUserClaims;
 }

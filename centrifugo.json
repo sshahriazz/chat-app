@@ -3,7 +3,7 @@
     "allowed_origins": ["http://localhost:3000"]
   },
   "admin": {
-    "enabled": true
+    "enabled": false
   },
   "engine": {
     "type": "redis",
@@ -17,14 +17,17 @@
         "name": "user",
         "history_size": 300,
         "history_ttl": "600s",
-        "force_recovery": true
+        "force_recovery": true,
+        "allow_subscribe_for_client": false,
+        "allow_subscribe_for_anonymous": false
       },
       {
         "name": "presence",
         "presence": true,
         "join_leave": true,
         "force_push_join_leave": true,
-        "allow_presence_for_subscriber": true
+        "allow_presence_for_subscriber": true,
+        "allow_subscribe_for_anonymous": false
       }
     ]
   }

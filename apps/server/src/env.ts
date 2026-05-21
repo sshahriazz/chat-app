@@ -57,7 +57,23 @@ const EnvSchema = z.object({
   // MASTER_API_KEY gates `POST /api/admin/tenants` and the key/secret
   // rotation endpoints. In production this MUST be set; the optional()
   // below is only for dev / tests where admin endpoints aren't mounted.
-  MASTER_API_KEY: z.string().min(32).optional(),
+  //
+  // Length requirement: ≥ 43 chars (≈ 32 bytes of base64url entropy).
+  // Charset restricted to base64url / hex so a hand-rolled `min(32)`
+  // string of repeated `a`s fails fast. Reject obvious low-entropy
+  // patterns (all-same-char, fewer than 16 unique characters).
+  MASTER_API_KEY: z
+    .string()
+    .min(43, "MASTER_API_KEY must be at least 43 chars (32B of base64url entropy)")
+    .regex(
+      /^[A-Za-z0-9_\-+/=]+$/,
+      "MASTER_API_KEY must be base64url / hex chars only",
+    )
+    .refine(
+      (s) => new Set(s).size >= 16,
+      "MASTER_API_KEY is too low-entropy (need ≥16 unique chars)",
+    )
+    .optional(),
   // Optional comma-separated allowlist for `/api/admin/*` sources.
   // Each entry is an IPv4/IPv6 address. Requests from outside this
   // list are rejected with 403 regardless of master-key validity.
@@ -66,12 +82,33 @@ const EnvSchema = z.object({
   // Optional base64-encoded 32-byte key. When set, Tenant.jwtSecret
   // is AES-256-GCM wrapped at rest. The server still needs plaintext
   // in memory to verify HMAC JWTs — this is a DB-leak defense only.
-  JWT_SECRET_ENCRYPTION_KEY: z.string().optional(),
+  //
+  // Validated at boot: if the value is set but doesn't decode to
+  // exactly 32 bytes, env parsing throws — refusing to boot instead
+  // of silently storing future secrets in plaintext (the prior
+  // behavior was to log an error and continue, downgrading silently).
+  JWT_SECRET_ENCRYPTION_KEY: z
+    .string()
+    .optional()
+    .refine(
+      (s) => {
+        if (s === undefined || s === "") return true;
+        try {
+          return Buffer.from(s, "base64").length === 32;
+        } catch {
+          return false;
+        }
+      },
+      "JWT_SECRET_ENCRYPTION_KEY must decode to exactly 32 bytes (base64)",
+    ),
   // When "true", every `POST /api/webhooks/*` request must carry a
   // valid `X-Chat-Signature` header (HMAC-SHA256 of the raw request
-  // body signed with the tenant's apiKey). Off by default; opt in
-  // once your tenants have shipped the signer.
-  WEBHOOK_SIGNATURE_REQUIRED: z.coerce.boolean().default(false),
+  // body signed with the tenant's apiKey). Defaults to ON: a leaked
+  // bearer API key would otherwise be sufficient to forge any webhook
+  // payload (e.g. `users.deleted`, `users.updated`). Tenants must
+  // ship the signer; explicitly set this to `false` only during a
+  // migration window.
+  WEBHOOK_SIGNATURE_REQUIRED: z.coerce.boolean().default(true),
   // Auth dispatch mode. `both` accepts either the legacy cookie
   // session or a tenant-issued Bearer JWT (preferred during the
   // dual-auth cutover window). `jwt` rejects cookie requests outright
@@ -92,9 +129,16 @@ const EnvSchema = z.object({
   // becoming a tenant-impersonation backdoor.
   ALLOW_DEV_MINT_TENANTS: z.string().optional(),
   // Seconds of clock skew tolerated when verifying tenant-signed user
-  // JWTs. Defaults to a conservative 30s; raise if tenants run on
-  // systems with unsynced clocks.
-  TENANT_JWT_CLOCK_SKEW_SEC: z.coerce.number().int().nonnegative().default(30),
+  // JWTs. Defaults to 5s — every additional second is also extra
+  // post-expiry validity for a leaked token. Capped at 60s to prevent
+  // accidental "raise it until it works" misconfig from widening the
+  // replay window further.
+  TENANT_JWT_CLOCK_SKEW_SEC: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .max(60)
+    .default(5),
   SHUTDOWN_TIMEOUT_MS: z.coerce
     .number()
     .int()

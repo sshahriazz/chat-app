@@ -18,9 +18,12 @@ const router: Router = Router();
 router.post("/connection-token", requireAuth, (req, res) => {
   const { user } = req as AuthenticatedRequest;
 
+  // Centrifugo broadcasts `info` to other subscribers via presence
+  // join/leave events. We deliberately do NOT include `email` here —
+  // it would leak across conversation peers who would otherwise only
+  // see display name + avatar.
   const token = generateConnectionToken(user.id, {
     name: user.name,
-    email: user.email,
   });
 
   

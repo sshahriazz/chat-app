@@ -5,6 +5,8 @@ import {
   extractMentions,
   extractPlainText,
   isEmptyContent,
+  MAX_MENTIONS_PER_MESSAGE,
+  MessageContentError,
 } from "./message-content";
 
 /**
@@ -37,6 +39,36 @@ describe("canonicalizeFromJson", () => {
     expect(() => canonicalizeFromJson("bare string" as unknown)).toThrow();
     expect(() => canonicalizeFromJson(42 as unknown)).toThrow();
     expect(() => canonicalizeFromJson(null as unknown)).toThrow();
+  });
+
+  it("rejects a doc exceeding the mention cap", () => {
+    const mentions = Array.from(
+      { length: MAX_MENTIONS_PER_MESSAGE + 1 },
+      (_, i) => ({
+        type: "mention",
+        attrs: { id: `u${i}`, label: `User ${i}` },
+      }),
+    );
+    const doc = {
+      type: "doc",
+      content: [{ type: "paragraph", content: mentions }],
+    };
+    expect(() => canonicalizeFromJson(doc)).toThrow(MessageContentError);
+  });
+
+  it("accepts a doc at exactly the mention cap", () => {
+    const mentions = Array.from(
+      { length: MAX_MENTIONS_PER_MESSAGE },
+      (_, i) => ({
+        type: "mention",
+        attrs: { id: `u${i}`, label: `User ${i}` },
+      }),
+    );
+    const doc = {
+      type: "doc",
+      content: [{ type: "paragraph", content: mentions }],
+    };
+    expect(() => canonicalizeFromJson(doc)).not.toThrow();
   });
 
   it("normalizes a non-doc root type into a doc", () => {

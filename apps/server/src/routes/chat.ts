@@ -6,6 +6,7 @@ import { withRealtime } from "../lib/realtime";
 import {
   getConversationMemberIds,
   invalidateConversation,
+  invalidateConversationStrict,
 } from "../lib/member-cache";
 import { invalidateConversationMeta } from "../lib/conversation-cache";
 import { invalidateUserProfile } from "../lib/user-cache";
@@ -13,8 +14,15 @@ import { userScopeFilter } from "../lib/scope-filter";
 import { acquireDmLock } from "../lib/dm-lock";
 import { requireTenantWide } from "../middleware/require-tenant-wide";
 import { pushToUsers } from "../lib/push";
+import { redis } from "../infra/redis";
 import { logger } from "../lib/logger";
-import { headObjectSize, deleteObject, keyFromPublicUrl } from "../lib/s3";
+import {
+  headObjectSize,
+  deleteObject,
+  keyFromPublicUrl,
+  getObjectHead,
+} from "../lib/s3";
+import { bytesMatchContentType } from "../lib/file-signature";
 import {
   canonicalizeFromJson,
   canonicalizeMentionLabels,
@@ -22,6 +30,7 @@ import {
   extractPlainText,
   isEmptyContent,
   MAX_MESSAGE_PLAIN_CHARS,
+  MessageContentError,
   type MessageContentJson,
 } from "../lib/message-content";
 import {
@@ -29,6 +38,8 @@ import {
   typingLimiter,
   searchLimiter,
   generalLimiter,
+  reactionLimiter,
+  broadcastProfileLimiter,
 } from "../middleware/rate-limit";
 import { validate } from "../http/validate";
 import {
@@ -150,9 +161,10 @@ router.get("/init", requireAuth, async (req, res) => {
   const [page, token] = await Promise.all([
     getConversationsWithUnread(user.id, tenantId, { limit }),
     Promise.resolve(
+      // Do not include `email` — `info` is broadcast via Centrifugo
+      // presence join/leave events to other channel subscribers.
       centrifugo.generateConnectionToken(user.id, {
         name: user.name,
-        email: user.email,
       }),
     ),
   ]);
@@ -738,10 +750,24 @@ router.delete("/conversations/:id/members/:userId", requireAuth, async (req, res
     );
   });
 
-  await Promise.all([
-    invalidateConversation(id),
-    invalidateConversationMeta(id),
-  ]);
+  // Fail-closed on the removal path: a stale member list would keep
+  // delivering conversation events to the removed user. Idempotent
+  // handler → a 5xx here is safe for the client to retry.
+  await invalidateConversationStrict(id);
+  await invalidateConversationMeta(id);
+
+  // Force the removed user off the conversation's presence channel
+  // immediately rather than waiting for their subscription token to
+  // expire. Best-effort — the short token TTL is the backstop.
+  centrifugo
+    .unsubscribe(targetUserId, `presence:conv_${id}`)
+    .catch((err) =>
+      logger.warn("force-unsubscribe failed", {
+        userId: targetUserId,
+        conversationId: id,
+        err: err as Error,
+      }),
+    );
 
   res.json({ ok: true });
 });
@@ -762,6 +788,7 @@ const MESSAGE_INCLUDE = {
     select: {
       id: true,
       url: true,
+      objectKey: true,
       contentType: true,
       filename: true,
       size: true,
@@ -792,8 +819,12 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
     try {
       canonJson = canonicalizeFromJson(content);
       plainText = extractPlainText(canonJson);
-    } catch {
-      throw new BadRequestError("content must be a Tiptap JSON document");
+    } catch (err) {
+      throw new BadRequestError(
+        err instanceof MessageContentError
+          ? err.message
+          : "content must be a Tiptap JSON document",
+      );
     }
   }
 
@@ -985,18 +1016,42 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
   const mentionsInMessage = extractMentions(
     message.content as MessageContentJson,
   );
-  const recipients = await prisma.conversationMember.findMany({
+  const mentionSet = new Set(mentionsInMessage);
+  const candidates = await prisma.conversationMember.findMany({
     where: {
       conversationId: id,
       userId: { not: user.id },
       OR: [{ muted: false }, { userId: { in: mentionsInMessage } }],
     },
-    select: { userId: true },
+    select: { userId: true, muted: true },
   });
-  if (recipients.length > 0) {
+
+  // Per-recipient mention-push throttle. A muted user is only being
+  // notified because they were @-mentioned (mute-bypass). Without a cap,
+  // an abuser can re-mention the same victim every message to flood
+  // their device. Non-muted recipients are unaffected. 5/min/(sender→
+  // recipient). Best-effort — Redis errors fail open (still notify).
+  const recipientIds: string[] = [];
+  for (const c of candidates) {
+    const viaMentionBypass = c.muted && mentionSet.has(c.userId);
+    if (!viaMentionBypass) {
+      recipientIds.push(c.userId);
+      continue;
+    }
+    try {
+      const k = `pushmention:${user.id}:${c.userId}`;
+      const n = await redis.incr(k);
+      if (n === 1) await redis.expire(k, 60);
+      if (n <= 5) recipientIds.push(c.userId);
+    } catch {
+      recipientIds.push(c.userId); // fail open
+    }
+  }
+
+  if (recipientIds.length > 0) {
     const preview = message.plainContent.slice(0, 140) || "📎 Attachment";
     pushToUsers(
-      recipients.map((r) => r.userId),
+      recipientIds,
       {
         title: user.name,
         body: preview,
@@ -1011,22 +1066,37 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
     );
   }
 
-  // Post-commit attachment size verification. Fire-and-forget — doesn't
-  // block the response. S3 signs ContentLength in the presigned PUT so
-  // compliant backends reject mismatched uploads, but we verify anyway
-  // as defense-in-depth against non-strict backends (older MinIO, etc).
-  // If a mismatch is detected we delete both the S3 object and the DB
-  // row so a cheating client can't retain a too-large file.
+  // Post-commit attachment verification. Fire-and-forget — doesn't
+  // block the response. Two independent checks:
+  //   1. Size: S3 signs ContentLength in the presigned PUT so compliant
+  //      backends reject mismatched uploads, but we verify anyway as
+  //      defense-in-depth against non-strict backends (older MinIO).
+  //   2. Magic bytes: the declared Content-Type is baked into the
+  //      presigned PUT, but the bytes are never checked by S3. A
+  //      polyglot (HTML/JS payload labeled image/png) would otherwise
+  //      be stored and could be served. We sniff the first 64 bytes and
+  //      delete on mismatch.
+  // On any failure we delete both the S3 object and the DB row so a
+  // cheating client can't retain a bad file.
   if (message.attachments && message.attachments.length > 0) {
     const linked = message.attachments.map((a) => ({
       id: a.id,
-      url: a.url,
+      key: a.objectKey ?? keyFromPublicUrl(a.url),
       expectedSize: a.size,
+      contentType: a.contentType,
     }));
     (async () => {
       for (const a of linked) {
-        const key = keyFromPublicUrl(a.url);
+        const key = a.key;
         if (!key) continue;
+        const drop = async (reason: string, extra: Record<string, unknown>) => {
+          logger.warn(`attachment rejected: ${reason}`, {
+            attachmentId: a.id,
+            ...extra,
+          });
+          await deleteObject(key).catch(() => {});
+          await prisma.attachment.delete({ where: { id: a.id } }).catch(() => {});
+        };
         try {
           const actual = await headObjectSize(key);
           if (actual === null) {
@@ -1037,13 +1107,18 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
             continue;
           }
           if (actual !== a.expectedSize) {
-            logger.warn("attachment size mismatch after upload", {
-              attachmentId: a.id,
+            await drop("size mismatch", {
               expectedSize: a.expectedSize,
               actualSize: actual,
             });
-            await deleteObject(key).catch(() => {});
-            await prisma.attachment.delete({ where: { id: a.id } }).catch(() => {});
+            continue;
+          }
+          const head = await getObjectHead(key, 64);
+          if (head && !bytesMatchContentType(head, a.contentType)) {
+            await drop("content-type / magic-byte mismatch", {
+              declaredContentType: a.contentType,
+            });
+            continue;
           }
         } catch (err) {
           logger.warn("attachment verification failed", {
@@ -1238,15 +1313,25 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
     cursorDate = cursorMsg?.createdAt;
   }
 
+  // History fence: a member only sees messages created at/after they
+  // (last) joined. Prevents a user who left and was re-added — or was
+  // added to an existing group — from using `anchor`/`before` to read
+  // history from a period they weren't a member of. `member.joinedAt`
+  // is fresh on every (re)join because removal deletes the row.
+  const joinedAtFence = member.joinedAt;
+  const createdAtFilter: { gte: Date; lt?: Date } = { gte: joinedAtFence };
+  if (seqMin === null && cursorDate) {
+    createdAtFilter.lt = cursorDate;
+  }
+
   const messages = await prisma.message.findMany({
     where: {
       conversationId: id,
       tenantId,
+      createdAt: createdAtFilter,
       ...(seqMin !== null && seqMax !== null
         ? { seq: { gte: seqMin, lte: seqMax } }
-        : cursorDate
-          ? { createdAt: { lt: cursorDate } }
-          : {}),
+        : {}),
     },
     orderBy: { createdAt: "desc" },
     take,
@@ -1284,9 +1369,15 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
     },
   });
 
-  // Get read-by info: which members have read up to which message
+  // Get read-by info: which members have read up to which message.
+  // tenantId filter is defense-in-depth against any cross-tenant
+  // ConversationMember row drift.
   const members = await prisma.conversationMember.findMany({
-    where: { conversationId: id, lastReadMessageId: { not: null } },
+    where: {
+      conversationId: id,
+      tenantId,
+      lastReadMessageId: { not: null },
+    },
     select: {
       userId: true,
       lastReadMessageId: true,
@@ -1319,8 +1410,12 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ bod
   try {
     canonJson = canonicalizeFromJson(content);
     plainText = extractPlainText(canonJson);
-  } catch {
-    throw new BadRequestError("content must be a Tiptap JSON document");
+  } catch (err) {
+    throw new BadRequestError(
+      err instanceof MessageContentError
+        ? err.message
+        : "content must be a Tiptap JSON document",
+    );
   }
 
   if (plainText.length > MAX_MESSAGE_PLAIN_CHARS) {
@@ -1404,6 +1499,9 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
       senderId: user.id,
       deletedAt: null,
     },
+    include: {
+      attachments: { select: { id: true, objectKey: true, url: true } },
+    },
   });
 
   if (!message) {
@@ -1421,6 +1519,15 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
         plainContent: "",
       },
     });
+    // Drop the attachment rows in the same tx — the content is gone, so
+    // the binaries must go too. (Without this, soft-deleted messages
+    // would leave their attachments referenceable + the S3 objects
+    // resident forever.)
+    if (message.attachments.length > 0) {
+      await rt.tx.attachment.deleteMany({
+        where: { messageId, tenantId },
+      });
+    }
     await rt.enqueueToConversation(
       id,
       {
@@ -1431,6 +1538,17 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
       `message_deleted_${messageId}`,
     );
   });
+
+  // Fire-and-forget S3 cleanup for the now-orphaned objects. Failures
+  // are swept by the orphan-attachment GC cron, so we don't block.
+  if (message.attachments.length > 0) {
+    (async () => {
+      for (const a of message.attachments) {
+        const key = a.objectKey ?? keyFromPublicUrl(a.url);
+        if (key) await deleteObject(key).catch(() => {});
+      }
+    })();
+  }
 
   res.json({ ok: true });
 });
@@ -1588,12 +1706,16 @@ router.post("/conversations/:id/mute", requireAuth, validate({ body: MuteBodySch
 
 // ─── Add reaction ─────────────────────────────────────────────
 
-router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, validate({ body: ReactionBodySchema }), async (req, res) => {
+router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, reactionLimiter, validate({ body: ReactionBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
   const { emoji } = req.body as { emoji?: string };
-  const trimmedEmoji = emoji?.trim() ?? "";
+  // NFC-normalize so visually-identical glyphs with different code-point
+  // sequences (base + variation selector, composed vs decomposed) map to
+  // a single canonical key — otherwise the (messageId,userId,emoji)
+  // unique index treats them as distinct and a user can "react twice".
+  const trimmedEmoji = (emoji?.normalize("NFC").trim()) ?? "";
 
   if (!trimmedEmoji) {
     throw new BadRequestError("emoji is required");
@@ -1655,11 +1777,17 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, val
 
 // ─── Remove reaction ──────────────────────────────────────────
 
-router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", requireAuth, async (req, res) => {
+router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", requireAuth, reactionLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
   const id = param(req.params.id);
   const messageId = param(req.params.messageId);
-  const emoji = decodeURIComponent(param(req.params.emoji));
+  let emoji: string;
+  try {
+    // NFC-normalize to match the canonical form stored on add.
+    emoji = decodeURIComponent(param(req.params.emoji)).normalize("NFC");
+  } catch {
+    throw new BadRequestError("malformed emoji");
+  }
 
   if (emoji.length > 16 || emoji.length === 0) {
     throw new BadRequestError("emoji must be 1-16 chars");
@@ -1795,7 +1923,7 @@ router.post("/me/active", requireAuth, generalLimiter, async (req, res) => {
 // `user_updated` event to every user who shares a conversation with me so
 // their sidebar / header / message avatars refresh in real time.
 
-router.post("/me/broadcast-profile", requireAuth, generalLimiter, async (req, res) => {
+router.post("/me/broadcast-profile", requireAuth, broadcastProfileLimiter, async (req, res) => {
   const { user } = req as AuthenticatedRequest;
 
   // Bust the cache first so the next read downstream gets fresh data.

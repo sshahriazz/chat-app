@@ -109,6 +109,34 @@ export const generalLimiter = rateLimit({
     json413(res, options.windowMs),
 });
 
+/** Reactions add/remove. Without a cap, a user can emoji-bomb a message
+ *  (add/remove loops, many emojis) each fanning out a realtime event to
+ *  every member. 30/min/user is generous for human reacting. */
+export const reactionLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  keyGenerator: userKey,
+  store: makeStore("react"),
+  handler: (req, res, _next, options) =>
+    json413(res, options.windowMs),
+});
+
+/** Profile-broadcast: a user-driven fan-out to every peer across every
+ *  conversation. Tight 5/min/user cap — it should fire on actual
+ *  profile changes, not in a loop. */
+export const broadcastProfileLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 5,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  keyGenerator: userKey,
+  store: makeStore("bcastprofile"),
+  handler: (req, res, _next, options) =>
+    json413(res, options.windowMs),
+});
+
 /**
  * Brute-force protection for the unauthenticated auth endpoints. Keyed by
  * IP (no user yet) via `ipKeyGenerator` so IPv6 callers can't rotate
@@ -119,6 +147,29 @@ export const generalLimiter = rateLimit({
  * endpoints becomes a concern, add a dedicated tenant-keyed limiter
  * there — the webhook routes already have that (webhooks.ts).
  */
+
+/**
+ * Pre-auth IP-keyed limiter mounted IN FRONT of any router whose first
+ * gate is an expensive crypto verify (Argon2 for API keys, RSA/HMAC for
+ * JWTs, AES-GCM for tenant secrets). Without it, an unauthenticated
+ * attacker can spray bogus bearer tokens and force the server to run
+ * Argon2 or HMAC verifies on every request — pinning CPU regardless of
+ * whether the credential is valid.
+ *
+ * Keyed strictly by IP (post `trust proxy` normalization). 60 requests
+ * per minute per IP is enough headroom for any legitimate burst while
+ * making single-IP brute force impractical.
+ */
+export const preAuthIpLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 60,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  keyGenerator: (req: Request) => ipKeyGenerator(req.ip ?? ""),
+  store: makeStore("preauth"),
+  handler: (req, res, _next, options) =>
+    json413(res, options.windowMs),
+});
 
 /** Re-export so routes can apply it only when a user is authenticated. */
 export type Limiter = (req: Request, res: Response, next: NextFunction) => void;

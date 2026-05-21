@@ -65,7 +65,11 @@ export async function pushToUsers(
         keys: { p256dh: s.p256dh, auth: s.auth },
       };
       try {
-        await webpush.sendNotification(subscription, body);
+        // 5s timeout so a hung/slow (or internal, if an old unfiltered
+        // endpoint slipped through) target can't tie up the dispatch.
+        await webpush.sendNotification(subscription, body, {
+          timeout: 5000,
+        });
       } catch (err: unknown) {
         const status = (err as { statusCode?: number }).statusCode;
         if (status === 404 || status === 410) {
@@ -74,10 +78,17 @@ export async function pushToUsers(
             .delete({ where: { id: s.id } })
             .catch(() => {});
         } else {
+          // Log only the status CLASS (2xx/4xx/5xx/none), never the bare
+          // status or the error object — a precise status would let an
+          // attacker who registered an internal endpoint differentiate
+          // how internal services reacted (see push-endpoint allowlist).
+          const statusClass =
+            typeof status === "number"
+              ? `${Math.floor(status / 100)}xx`
+              : "none";
           logger.error("push send failed", {
             subscriptionId: s.id,
-            statusCode: status,
-            err: err as Error,
+            statusClass,
           });
         }
       }

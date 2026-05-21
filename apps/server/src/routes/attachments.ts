@@ -1,28 +1,81 @@
 import { Router } from "express";
 import crypto from "node:crypto";
-import path from "node:path";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/auth";
 import { prisma } from "../db";
 import {
   createUploadUrl,
   createDownloadUrl,
+  createViewUrl,
   keyFromPublicUrl,
 } from "../lib/s3";
-import { uploadUrlLimiter } from "../middleware/rate-limit";
+import { extForContentType, isInlineSafeContentType } from "../lib/file-signature";
+import { generalLimiter, uploadUrlLimiter } from "../middleware/rate-limit";
 import { validate } from "../http/validate";
 import { UploadUrlBodySchema } from "../http/schemas";
-import {
-  ForbiddenError,
-  NotFoundError,
-  PayloadTooLargeError,
-} from "../http/errors";
+import { BadRequestError, NotFoundError, PayloadTooLargeError } from "../http/errors";
 
 const router: Router = Router();
 
 // Per-user aggregate storage cap. Prevents a single account from filling
-// the bucket via repeated uploads under the per-file 50MB ceiling.
+// the bucket via repeated uploads under the per-file ceiling.
 // Bump in production if you need per-plan quotas; make it an env var.
 const PER_USER_QUOTA_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
+
+/** Resolve the storage key for an attachment row. Prefer the persisted
+ *  `objectKey`; fall back to deriving it from the URL for legacy rows.
+ *  Returns null when neither yields a usable key (caller → 404). */
+function resolveKey(att: { objectKey: string | null; url: string }): string | null {
+  if (att.objectKey) return att.objectKey;
+  return keyFromPublicUrl(att.url);
+}
+
+/**
+ * Shared authorization for a single attachment by id.
+ *
+ * Returns the attachment row when the caller may access it, else throws
+ * NotFoundError — deliberately the SAME error for "doesn't exist",
+ * "wrong tenant", and "not a member", so the endpoint is not an
+ * existence oracle (an attacker can't distinguish a real-but-forbidden
+ * id from a non-existent one).
+ */
+async function authorizeAttachment(
+  attachmentId: string,
+  user: { id: string },
+  tenantId: string,
+) {
+  const attachment = await prisma.attachment.findFirst({
+    where: { id: attachmentId, tenantId },
+    include: { message: { select: { conversationId: true } } },
+  });
+  if (!attachment) throw new NotFoundError("Attachment not found");
+
+  // Linked attachments require conversation membership; orphan uploads
+  // (messageId null) are only accessible to the uploader.
+  if (attachment.messageId && attachment.message) {
+    const member = await prisma.conversationMember.findFirst({
+      where: {
+        conversationId: attachment.message.conversationId,
+        userId: user.id,
+        conversation: { tenantId },
+      },
+      select: { id: true },
+    });
+    if (!member) throw new NotFoundError("Attachment not found");
+  } else if (attachment.uploaderId !== user.id) {
+    throw new NotFoundError("Attachment not found");
+  }
+
+  return attachment;
+}
+
+function paramId(req: { params: Record<string, unknown> }): string {
+  const raw = req.params.id;
+  const id = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof id !== "string" || id.length === 0 || id.length > 64) {
+    throw new BadRequestError("Invalid attachment id");
+  }
+  return id;
+}
 
 // POST /api/attachments/upload-url
 // Client sends file metadata; server mints a signed PUT URL, creates the
@@ -42,8 +95,8 @@ router.post(
       height?: number;
     };
 
-    // Schema enforces size / content-type / dimension bounds — this
-    // handler just carries out the side effects.
+    // Schema enforces size / content-type / dimension bounds + filename
+    // sanitization — this handler just carries out the side effects.
     const attWidth = width ?? null;
     const attHeight = height ?? null;
 
@@ -63,28 +116,25 @@ router.post(
       );
     }
 
-    const ext = path.extname(filename).slice(0, 10); // cap ext length
+    // Derive the extension from the DECLARED MIME, never from the user's
+    // filename — the filename can carry double extensions / RTL overrides
+    // that a naive `path.extname` would propagate into the key.
+    const ext = extForContentType(contentType);
     const key = `${user.id}/${crypto.randomUUID()}${ext}`;
 
-    let signed;
-    try {
-      signed = await createUploadUrl({
-        userId: user.id,
-        key,
-        contentType,
-        contentLength: size,
-      });
-    } catch (err) {
-      // Re-throw so the central error handler renders a 500. S3 errors
-      // should never leak their raw message to clients.
-      throw err;
-    }
+    const signed = await createUploadUrl({
+      userId: user.id,
+      key,
+      contentType,
+      contentLength: size,
+    });
 
     const attachment = await prisma.attachment.create({
       data: {
         tenantId,
         uploaderId: user.id,
         url: signed.publicUrl,
+        objectKey: key,
         contentType,
         filename,
         size,
@@ -102,46 +152,58 @@ router.post(
   },
 );
 
-// GET /api/attachments/:id/download — issues a short-lived signed URL with
-// Content-Disposition: attachment, then 302-redirects the browser to it.
-// Works for any content-type so images, PDFs and arbitrary binaries all
-// prompt a download instead of rendering inline.
-router.get("/:id/download", requireAuth, async (req, res) => {
+// GET /api/attachments/:id/view — short-lived signed URL for INLINE
+// rendering (<img>/<video>/<audio>). Membership-checked. Only inline-safe
+// content types (image/video/audio) are served this way; anything else
+// (PDF, zip, text) is redirected to /download (forced attachment) so it
+// can never execute script in the bucket origin.
+router.get("/:id/view", requireAuth, generalLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const id = paramId(req);
+  const attachment = await authorizeAttachment(id, user, tenantId);
 
-  const attachment = await prisma.attachment.findFirst({
-    where: { id, tenantId },
-    include: {
-      message: { select: { conversationId: true } },
-    },
-  });
+  const key = resolveKey(attachment);
+  if (!key) throw new NotFoundError("Attachment not found");
 
-  if (!attachment) throw new NotFoundError("Attachment not found");
-
-  // Authorization: linked attachments require conversation membership;
-  // orphan uploads (messageId null) are only accessible to the uploader.
-  if (attachment.messageId && attachment.message) {
-    const member = await prisma.conversationMember.findFirst({
-      where: {
-        conversationId: attachment.message.conversationId,
-        userId: user.id,
-        conversation: { tenantId },
-      },
-      select: { id: true },
+  if (!isInlineSafeContentType(attachment.contentType)) {
+    // Not safe to render inline — fall through to the download path.
+    const { url } = await createDownloadUrl({
+      key,
+      filename: attachment.filename,
+      contentType: attachment.contentType,
     });
-    if (!member) throw new ForbiddenError();
-  } else if (attachment.uploaderId !== user.id) {
-    throw new ForbiddenError();
+    res.setHeader("Cache-Control", "no-store");
+    res.redirect(url);
+    return;
   }
 
-  const key = keyFromPublicUrl(attachment.url);
-  if (!key) throw new Error("Attachment URL has unknown origin");
+  const { url } = await createViewUrl({
+    key,
+    filename: attachment.filename,
+    contentType: attachment.contentType,
+  });
+  res.setHeader("Cache-Control", "no-store");
+  res.redirect(url);
+});
+
+// GET /api/attachments/:id/download — short-lived signed URL with
+// Content-Disposition: attachment + pinned Content-Type + nosniff, then
+// 302-redirects the browser to it. Works for any content-type so images,
+// PDFs and arbitrary binaries all prompt a download instead of rendering.
+router.get("/:id/download", requireAuth, generalLimiter, async (req, res) => {
+  const { user, tenantId } = req as AuthenticatedRequest;
+  const id = paramId(req);
+  const attachment = await authorizeAttachment(id, user, tenantId);
+
+  const key = resolveKey(attachment);
+  if (!key) throw new NotFoundError("Attachment not found");
 
   const { url } = await createDownloadUrl({
     key,
     filename: attachment.filename,
+    contentType: attachment.contentType,
   });
+  res.setHeader("Cache-Control", "no-store");
   res.redirect(url);
 });
 

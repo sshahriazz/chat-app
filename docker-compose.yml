@@ -56,11 +56,17 @@ services:
     image: redis:8-alpine
     restart: unless-stopped
     networks: [dokploy-network]
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    # `--requirepass` mandatory in prod. Defense-in-depth against
+    # lateral-movement: every container in dokploy-network can reach
+    # redis:6379, and Redis caches unwrapped tenant secrets — a
+    # compromised sidecar would otherwise dump signing material.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --appendfsync everysec --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -106,6 +112,10 @@ services:
       # interpolation produces an empty string and Centrifugo refuses to
       # boot. That's the intended behavior: a misconfigured deploy fails
       # loudly instead of silently authenticating against a dev secret.
+      # Override the Redis engine address with credentialed URL. The
+      # committed centrifugo.json holds the non-secret structure; the
+      # password is injected via env so it never lands in git.
+      CENTRIFUGO_ENGINE_REDIS_ADDRESS: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379/0
       CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_SECRET:?CENTRIFUGO_TOKEN_SECRET is required}
       CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:?CENTRIFUGO_API_KEY is required}
       CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:?CENTRIFUGO_ADMIN_PASSWORD is required}
@@ -122,7 +132,9 @@ services:
       # Centrifugo 6 treats CENTRIFUGO_CONSUMERS as a JSON-encoded
       # override of the top-level `consumers` array — this wins over any
       # definition in centrifugo.json.
-      CENTRIFUGO_CONSUMERS: '[{"name":"postgresql","type":"postgresql","enabled":true,"postgresql":{"dsn":"postgres://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}?sslmode=disable","outbox_table_name":"chat_outbox","num_partitions":1,"partition_select_limit":100,"partition_poll_interval":"300ms","partition_notification_channel":"centrifugo_partition_change"}}]'
+      # No `:-fallback` on the password — a missing env var must fail
+      # loudly rather than embed the well-known dev default `chatapp`.
+      CENTRIFUGO_CONSUMERS: '[{"name":"postgresql","type":"postgresql","enabled":true,"postgresql":{"dsn":"postgres://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}?sslmode=disable","outbox_table_name":"chat_outbox","num_partitions":1,"partition_select_limit":100,"partition_poll_interval":"300ms","partition_notification_channel":"centrifugo_partition_change"}}]'
     depends_on:
       postgres:
         condition: service_healthy
@@ -141,6 +153,11 @@ services:
       # via compose.dev.yml but would be catastrophic in prod.
       # Must be ≥ 8 chars.
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      # Restrict browser CORS to the app origin(s). MinIO defaults to
+      # `*`, which would let any website the user visits issue
+      # presigned PUT/GET against the bucket if a signed URL ever leaks
+      # to that origin. Mirror CORS_ALLOWED_ORIGINS.
+      MINIO_API_CORS_ALLOW_ORIGIN: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS is required}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -160,8 +177,8 @@ services:
       /bin/sh -c "
       mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-chatapp} ${MINIO_ROOT_PASSWORD:-chatapp-dev-only} &&
       mc mb --ignore-existing local/${MINIO_BUCKET:-chatapp} &&
-      mc anonymous set download local/${MINIO_BUCKET:-chatapp} &&
-      echo '[minio-init] bucket ready'
+      mc anonymous set none local/${MINIO_BUCKET:-chatapp} &&
+      echo '[minio-init] bucket ready (private; reads go through signed GETs)'
       "
     restart: "no"
 
@@ -177,7 +194,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}
 
   # ─── Server / Express (INTERNAL) ─────────────────────────────
   server:
@@ -197,8 +214,8 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
       TZ: UTC
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
-      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
       # The server's public base URL (used for OpenAPI server listing +
       # absolute-URL links). Required — wrong value breaks OpenAPI's
       # "Try it" + any feature that emits absolute links.
@@ -247,7 +264,7 @@ services:
       # valid X-Chat-Signature header (HMAC-SHA256 of the raw body
       # signed with the tenant's apiKey). Off by default so existing
       # tenants don't break; flip on once your tenants ship the signer.
-      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-false}
+      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-true}
       # S3 split clients (see apps/server/src/lib/s3.ts):
       #   S3_ENDPOINT        — internal, used for HEAD/DELETE/etc.
       #   S3_PUBLIC_URL_BASE — public, used to mint presigned PUT/GET

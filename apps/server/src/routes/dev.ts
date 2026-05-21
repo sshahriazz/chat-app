@@ -1,12 +1,12 @@
 import crypto from "node:crypto";
-import { Router } from "express";
+import { Router, type Request, type Response, type NextFunction } from "express";
 import argon2 from "argon2";
 import { z } from "zod";
 import "zod-openapi";
 import { validate } from "../http/validate";
 import { env } from "../env";
-import { ForbiddenError, NotFoundError } from "../http/errors";
-import { mintUserToken } from "../http/jwt-tenant";
+import { NotFoundError, UnauthorizedError } from "../http/errors";
+import { mintUserToken, MAX_TENANT_TOKEN_TTL_SEC } from "../http/jwt-tenant";
 import { getTenantById, wrapSecret } from "../lib/tenant";
 import { prisma } from "../db";
 import { DEMO_TENANTS } from "../lib/demo-personas";
@@ -16,23 +16,53 @@ import { DEMO_TENANTS } from "../lib/demo-personas";
  * tenant's stored jwtSecret so the reference client (apps/web) can
  * simulate what a real tenant's backend would do in production.
  *
- * Gated on `NODE_ENV !== "production"` OR explicit `DEV_MINT_ENABLED=true`.
- * Real customer deployments never enable this — their tenant's own
- * backend owns JWT minting.
+ * Gate model (defense-in-depth):
+ *   1. Hard kill-switch — if NODE_ENV === "production" the entire
+ *      router returns 404 unconditionally. The previous
+ *      `DEV_MINT_ENABLED` prod opt-in is gone: there is no toggle
+ *      that exposes these routes in a production build.
+ *   2. If `MASTER_API_KEY` is set, every request must carry it as
+ *      `Authorization: Bearer …`. This protects non-prod environments
+ *      that happen to be reachable from the internet (staging, etc.)
+ *      from anonymous abuse. Local dev with no MASTER_API_KEY remains
+ *      unauthenticated for the reference web client's persona picker.
  */
 
 const router: Router = Router();
 
-// Hard kill switch — returns 404 if the env doesn't opt in.
 router.use((_req, _res, next) => {
-  const enabled =
-    env.NODE_ENV !== "production" || env.DEV_MINT_ENABLED === true;
-  if (!enabled) {
+  if (env.NODE_ENV === "production") {
     next(new NotFoundError("Dev mint disabled"));
     return;
   }
   next();
 });
+
+// Constant-time bearer compare against MASTER_API_KEY when configured.
+// Mirrors `require-master-key.ts` so an operator who sets a master key
+// gets the same protection on dev routes as on admin routes.
+function requireDevAuth(req: Request, _res: Response, next: NextFunction) {
+  const expected = env.MASTER_API_KEY;
+  if (!expected) {
+    next();
+    return;
+  }
+  const header = req.headers.authorization;
+  const match = typeof header === "string" ? header.match(/^Bearer\s+(.+)$/) : null;
+  const provided = match ? match[1] : null;
+  if (!provided) {
+    next(new UnauthorizedError("Missing master key"));
+    return;
+  }
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    next(new UnauthorizedError("Invalid master key"));
+    return;
+  }
+  next();
+}
+router.use(requireDevAuth);
 
 const MintTokenBodySchema = z
   .object({
@@ -45,7 +75,15 @@ const MintTokenBodySchema = z
     // restricts user discovery + add-member to same-scope + tenant-wide
     // peers. Null/absent = tenant-wide (admin-style).
     scope: z.string().min(1).max(128).nullable().optional(),
-    ttlSeconds: z.number().int().positive().max(24 * 60 * 60).optional(),
+    // Cap matches the server-enforced verify ceiling — minting a token
+    // longer than MAX_TENANT_TOKEN_TTL_SEC would just be rejected on the
+    // next request.
+    ttlSeconds: z
+      .number()
+      .int()
+      .positive()
+      .max(MAX_TENANT_TOKEN_TTL_SEC)
+      .optional(),
   })
   .meta({ id: "DevMintTokenBody" });
 
@@ -63,21 +101,6 @@ router.post(
       scope?: string | null;
       ttlSeconds?: number;
     };
-
-    // Extra guard in prod: even if DEV_MINT_ENABLED=true accidentally
-    // leaks out, require an ALLOW_DEV_MINT_TENANTS env allowlist so
-    // operators have to opt-in per tenant.
-    if (env.NODE_ENV === "production") {
-      const allowed = (env.ALLOW_DEV_MINT_TENANTS ?? "")
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      if (!allowed.includes(body.tenantId)) {
-        throw new ForbiddenError(
-          "Dev mint not allowed for this tenant in production",
-        );
-      }
-    }
 
     // `getTenantById` handles AES-GCM unwrap when JWT_SECRET_ENCRYPTION_KEY
     // is set. Reading the `jwt_secret` column directly would hand us the

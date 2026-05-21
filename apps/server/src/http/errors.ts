@@ -85,6 +85,17 @@ export class ConflictError extends DomainError {
   }
 }
 
+// 410 Gone — used by the GDPR-delete tombstone path. Distinct from
+// 404 so the client can present a meaningful "this account was
+// deleted" UI instead of a generic auth failure.
+export class GoneError extends DomainError {
+  readonly code = ERROR_CODES.GONE;
+  readonly httpStatus = 410;
+  constructor(message = "Gone") {
+    super(message);
+  }
+}
+
 export class PayloadTooLargeError extends DomainError {
   readonly code = ERROR_CODES.PAYLOAD_TOO_LARGE;
   readonly httpStatus = 413;

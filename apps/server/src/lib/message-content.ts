@@ -21,18 +21,46 @@ const messageExtensions = [
 
 export type MessageContentJson = JSONContent;
 
+/** Hard cap on mention nodes per message. A single message mentioning
+ *  hundreds of users is a notification-flood / push-amplification
+ *  vector (each mention bypasses mute). 50 is far above any legitimate
+ *  use. */
+export const MAX_MENTIONS_PER_MESSAGE = 50;
+
+/** Thrown when content exceeds a structural limit (mentions, etc.).
+ *  Callers map this to a 400. */
+export class MessageContentError extends Error {}
+
+function countMentions(json: MessageContentJson): number {
+  let count = 0;
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const n = node as { type?: string; content?: unknown[] };
+    if (n.type === "mention") count++;
+    if (Array.isArray(n.content)) n.content.forEach(walk);
+  };
+  walk(json);
+  return count;
+}
+
 /**
  * Defense in depth: normalize a client-supplied Tiptap JSON tree by
  * round-tripping it through the extension schema. Unknown node types,
  * forbidden marks, stray attributes all disappear. Throws on input that
- * isn't even structurally JSON.
+ * isn't even structurally JSON, or that exceeds the mention cap.
  */
 export function canonicalizeFromJson(raw: unknown): MessageContentJson {
   if (!raw || typeof raw !== "object") {
     throw new Error("content must be a Tiptap JSON document");
   }
   const html = generateHTML(raw as JSONContent, messageExtensions);
-  return generateJSON(html, messageExtensions) as MessageContentJson;
+  const json = generateJSON(html, messageExtensions) as MessageContentJson;
+  if (countMentions(json) > MAX_MENTIONS_PER_MESSAGE) {
+    throw new MessageContentError(
+      `too many mentions (max ${MAX_MENTIONS_PER_MESSAGE})`,
+    );
+  }
+  return json;
 }
 
 /**
