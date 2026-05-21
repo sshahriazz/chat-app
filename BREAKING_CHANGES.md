@@ -123,6 +123,16 @@ the call) is issued.
 a per-IP limiter (60 req/min/IP) that runs *before* credential
 verification. Distribute webhook traffic accordingly.
 
+### 2.7 `image` URLs must be http(s)  ⚠️ breaking
+The `image` field on `POST /api/webhooks/users.updated` (and the dev
+mint-token route) is now validated to be an `http(s)` URL. Non-web
+schemes (`javascript:`, `data:`, `file:`, …) are rejected with `400`.
+Send a normal hosted avatar URL.
+
+> Note: the avatar URL carried in the **JWT `image` claim** is length-
+> capped but not scheme-validated server-side — still send only http(s)
+> there, since clients render it as an image source.
+
 ---
 
 ## 3. 💻 Client — frontend contract
@@ -204,14 +214,23 @@ were synthesizing cursors yourself (don't).
 
 ### 3.5 Other limits that can surface as 4xx
 - Max **50 mentions** per message → `400`.
+- Message content (Tiptap JSON) is bounded: nesting depth ≤ **32** and
+  ≤ **5000** total nodes → `400`. Normal messages are far under this; it
+  exists to stop a deeply-nested CPU-DoS payload.
+- `clientMessageId`, if sent, must now be **url-safe** (`[A-Za-z0-9_-]+`,
+  1–256 chars) → `400` otherwise. Previously any string ≤256 was
+  accepted. UUIDs/nanoids already satisfy this; stop sending values with
+  `:`, `/`, spaces, etc.
 - Reaction add/remove and `POST /me/broadcast-profile` are rate-limited
   (429 on abuse). Reactions: 30/min/user. Broadcast-profile: 5/min/user.
 - Mention notifications to a muted user are throttled to 5/min per
   sender→recipient pair (silent; no error).
+- Search query `q` has its LIKE wildcards (`%`, `_`) escaped server-side
+  — they now match literally instead of acting as wildcards.
 
 ---
 
-## 3a. 🛠 Operator — headers, infra & transport (Phase 6)
+## 4. 🛠 Operator — headers, transport & infra (Phase 6)
 
 - **Strict CSP**: API responses now send `Content-Security-Policy:
   default-src 'none'`. `/docs` gets a Scalar-scoped policy (jsdelivr +
@@ -243,14 +262,20 @@ were synthesizing cursors yourself (don't).
 - New env vars: `TRUST_PROXY_CIDRS` (optional), `METRICS_TOKEN`
   (optional).
 
-## 4. Upgrade checklist
+## 5. Upgrade checklist
 
 - [ ] Set `REDIS_PASSWORD`, confirm `POSTGRES_PASSWORD` + `CORS_ALLOWED_ORIGINS`.
+- [ ] Remove any `localhost`/non-https origin from the prod `CORS_ALLOWED_ORIGINS` (boot now rejects them).
 - [ ] Rotate any secret that matched the old `.env.example`.
 - [ ] Run DB migrations (`prisma migrate deploy`).
 - [ ] Make the bucket private; confirm `Attachment.objectKey` backfill plan.
-- [ ] Tenants: add `aud: "chat-app"`, keep token TTL ≤ 1h, ship the webhook
-      HMAC signer (or set `WEBHOOK_SIGNATURE_REQUIRED=false` temporarily).
+- [ ] Tenants: add `aud: "chat-app"`, keep token TTL ≤ 1h, send http(s)
+      `image` URLs, ship the webhook HMAC signer (or set
+      `WEBHOOK_SIGNATURE_REQUIRED=false` temporarily).
 - [ ] Clients: switch attachment rendering/downloads to the `/view` and
-      `/download` JSON endpoints.
+      `/download` JSON endpoints; ensure `clientMessageId` is url-safe.
 - [ ] Verify Centrifugo admin is disabled / internal-only.
+- [ ] Set `METRICS_TOKEN` (or firewall `/metrics`); prefer `TRUST_PROXY_CIDRS`
+      over the numeric hop count.
+- [ ] Update Prometheus scrape config + any monitor parsing `/livez`,
+      `/readyz` dependency fields (now `{ status }` only).
