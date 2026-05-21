@@ -14,6 +14,30 @@ import "zod-openapi";
 
 // ─── Shared primitives ───────────────────────────────────────
 
+/**
+ * An http(s) URL. `z.string().url()` alone accepts `javascript:`,
+ * `data:`, `vbscript:`, `file:` etc. — which become stored-XSS / open
+ * surface when a stored URL is later used as an href/src. Restrict to
+ * http(s) so only fetchable web URLs pass.
+ */
+export const httpUrl = (max = 2048) =>
+  z
+    .string()
+    .url()
+    .max(max)
+    .refine((u) => /^https?:\/\//i.test(u), "URL must be http(s)");
+
+/**
+ * A resource id path-param shape: non-empty, length-bounded, and
+ * restricted to the id charset we actually issue (uuid/cuid-style).
+ * Caps DoS via giant ids and rejects junk before it reaches Prisma.
+ */
+const idString = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9_-]+$/, "invalid id");
+
 export const IdParamSchema = z
   .object({ id: z.string().min(1) })
   .meta({ id: "IdParam" });
@@ -92,7 +116,12 @@ export const SendMessageBodySchema = z
   .object({
     content: TiptapDocSchema.optional(),
     replyToId: z.string().min(1).optional(),
-    clientMessageId: z.string().max(256).optional(),
+    clientMessageId: z
+      .string()
+      .min(1)
+      .max(256)
+      .regex(/^[A-Za-z0-9_-]+$/, "clientMessageId must be url-safe chars")
+      .optional(),
     attachmentIds: z.array(z.string().min(1)).max(10).optional(),
   })
   .meta({ id: "SendMessageBody" });
@@ -285,7 +314,7 @@ export const UsersUpdatedWebhookBodySchema = z
   .object({
     externalId: z.string().min(1).max(256),
     name: z.string().min(1).max(128),
-    image: z.string().url().max(2048).nullable().optional(),
+    image: httpUrl(2048).nullable().optional(),
     email: z.string().email().max(254).nullable().optional(),
   })
   .meta({ id: "UsersUpdatedWebhookBody" });

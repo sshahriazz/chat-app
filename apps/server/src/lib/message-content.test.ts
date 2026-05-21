@@ -6,6 +6,8 @@ import {
   extractPlainText,
   isEmptyContent,
   MAX_MENTIONS_PER_MESSAGE,
+  MAX_CONTENT_DEPTH,
+  MAX_CONTENT_NODES,
   MessageContentError,
 } from "./message-content";
 
@@ -69,6 +71,25 @@ describe("canonicalizeFromJson", () => {
       content: [{ type: "paragraph", content: mentions }],
     };
     expect(() => canonicalizeFromJson(doc)).not.toThrow();
+  });
+
+  it("rejects a tree deeper than MAX_CONTENT_DEPTH before HTML round-trip", () => {
+    // Build a paragraph nested far past the depth cap.
+    let inner: Record<string, unknown> = { type: "text", text: "x" };
+    for (let i = 0; i < MAX_CONTENT_DEPTH + 5; i++) {
+      inner = { type: "paragraph", content: [inner] };
+    }
+    const doc = { type: "doc", content: [inner] };
+    expect(() => canonicalizeFromJson(doc)).toThrow(MessageContentError);
+  });
+
+  it("rejects a tree with more than MAX_CONTENT_NODES nodes", () => {
+    const many = Array.from({ length: MAX_CONTENT_NODES + 10 }, () => ({
+      type: "paragraph",
+      content: [{ type: "text", text: "x" }],
+    }));
+    const doc = { type: "doc", content: many };
+    expect(() => canonicalizeFromJson(doc)).toThrow(MessageContentError);
   });
 
   it("normalizes a non-doc root type into a doc", () => {

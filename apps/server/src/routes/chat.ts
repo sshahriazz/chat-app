@@ -11,6 +11,7 @@ import {
 import { invalidateConversationMeta } from "../lib/conversation-cache";
 import { invalidateUserProfile } from "../lib/user-cache";
 import { userScopeFilter } from "../lib/scope-filter";
+import { escapeLike } from "../lib/like-escape";
 import { acquireDmLock } from "../lib/dm-lock";
 import { requireTenantWide } from "../middleware/require-tenant-wide";
 import { pushToUsers } from "../lib/push";
@@ -30,6 +31,7 @@ import {
   extractPlainText,
   isEmptyContent,
   MAX_MESSAGE_PLAIN_CHARS,
+  MAX_MENTIONS_PER_MESSAGE,
   MessageContentError,
   type MessageContentJson,
 } from "../lib/message-content";
@@ -64,9 +66,32 @@ import {
 
 const router: Router = Router();
 
-/** Extract a single string param (Express 5 params can be string | string[]) */
-function param(value: string | string[]): string {
-  return Array.isArray(value) ? value[0] : value;
+/**
+ * Extract a single string param (Express 5 params can be string |
+ * string[]). Fails closed: an absent/empty value throws rather than
+ * becoming `undefined`, which Prisma would treat as "omit predicate"
+ * (matching every row). Also length-caps to keep a giant id from
+ * reaching the logger / DB parser.
+ */
+function param(value: string | string[] | undefined): string {
+  const v = Array.isArray(value) ? value[0] : value;
+  if (typeof v !== "string" || v.length === 0 || v.length > 256) {
+    throw new BadRequestError("invalid path parameter");
+  }
+  return v;
+}
+
+/**
+ * Like `param`, but for resource ids: restricts to the uuid/cuid
+ * charset we actually issue. Use for `:id` / `:messageId` / `:userId`
+ * (NOT for `:emoji`, which is unicode + has its own validation).
+ */
+function idParam(value: string | string[] | undefined): string {
+  const v = param(value);
+  if (v.length > 64 || !/^[A-Za-z0-9_-]+$/.test(v)) {
+    throw new BadRequestError("invalid id");
+  }
+  return v;
 }
 
 /**
@@ -451,7 +476,7 @@ router.get("/conversations", requireAuth, validate({ query: ListConversationsQue
 
 router.get("/conversations/:id", requireAuth, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
 
   const conversation = await prisma.conversation.findFirst({
     where: {
@@ -479,7 +504,7 @@ router.get("/conversations/:id", requireAuth, async (req, res) => {
 
 router.put("/conversations/:id", requireAuth, validate({ body: RenameConversationBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
   const { name } = req.body as { name: string };
 
   // `findFirst` with the tenantId filter guarantees we can't hop
@@ -537,7 +562,7 @@ router.put("/conversations/:id", requireAuth, validate({ body: RenameConversatio
 
 router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembersBodySchema }), async (req, res) => {
   const { user, tenantId, scope } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
   const { userIds, name } = req.body as { userIds: string[]; name?: string };
 
   if (!userIds?.length) {
@@ -682,8 +707,8 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
 
 router.delete("/conversations/:id/members/:userId", requireAuth, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
-  const targetUserId = param(req.params.userId);
+  const id = idParam(req.params.id);
+  const targetUserId = idParam(req.params.userId);
   const isSelf = user.id === targetUserId;
 
   const member = await prisma.conversationMember.findFirst({
@@ -800,7 +825,7 @@ const MESSAGE_INCLUDE = {
 
 router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, validate({ body: SendMessageBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
   const { content, replyToId, clientMessageId, attachmentIds } = req.body as {
     content?: unknown;
     replyToId?: string;
@@ -918,7 +943,10 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
     // below so they never trigger notifications or mute-bypass.
     let validatedMentions: string[] = [];
     if (canonJson) {
-      const rawIds = extractMentions(canonJson);
+      // Cap defensively: canonicalizeFromJson already rejects >50
+      // mention nodes, and extractMentions dedupes, but slicing keeps
+      // the IN-clause bound explicit at the query site.
+      const rawIds = extractMentions(canonJson).slice(0, MAX_MENTIONS_PER_MESSAGE);
       if (rawIds.length > 0) {
         const rows = await rt.tx.conversationMember.findMany({
           where: { conversationId: id, userId: { in: rawIds } },
@@ -1177,7 +1205,7 @@ function shapeSearchResults(rows: SearchRow[]) {
 
 router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ query: SearchQuerySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
   const q = ((req.query.q as string) || "").trim();
 
   if (q.length < 2 || q.length > 128) {
@@ -1196,7 +1224,8 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
     throw new ForbiddenError("Not a member of this conversation");
   }
 
-  const likePattern = `%${q}%`;
+  // Escape LIKE wildcards in q so `%`/`_` are literal (no full-scan abuse).
+  const likePattern = `%${escapeLike(q)}%`;
   const rows = await prisma.$queryRaw<SearchRow[]>`
     SELECT m.id,
            m.content,
@@ -1233,7 +1262,8 @@ router.get("/search", requireAuth, searchLimiter, validate({ query: SearchQueryS
     throw new BadRequestError("q must be 2-128 characters");
   }
 
-  const likePattern = `%${q}%`;
+  // Escape LIKE wildcards in q so `%`/`_` are literal (no full-scan abuse).
+  const likePattern = `%${escapeLike(q)}%`;
   const rows = await prisma.$queryRaw<SearchRow[]>`
     SELECT m.id,
            m.content,
@@ -1268,7 +1298,7 @@ router.get("/search", requireAuth, searchLimiter, validate({ query: SearchQueryS
 
 router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate({ query: ListMessagesQuerySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
   const before = req.query.before as string | undefined;
   const anchor = req.query.anchor as string | undefined;
   const limit = req.query.limit as string | undefined;
@@ -1401,8 +1431,8 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
 
 router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ body: EditMessageBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
-  const messageId = param(req.params.messageId);
+  const id = idParam(req.params.id);
+  const messageId = idParam(req.params.messageId);
   const { content } = req.body as { content?: unknown };
 
   let canonJson: MessageContentJson;
@@ -1448,7 +1478,7 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ bod
     // Same canonicalization as the send path: rewrite mention labels to
     // the DB canonical name. Bob can't get "@alice" reflected on the
     // edited message.
-    const rawIds = extractMentions(canonJson);
+    const rawIds = extractMentions(canonJson).slice(0, MAX_MENTIONS_PER_MESSAGE);
     if (rawIds.length > 0) {
       const rows = await rt.tx.conversationMember.findMany({
         where: { conversationId: id, userId: { in: rawIds } },
@@ -1488,8 +1518,8 @@ router.put("/conversations/:id/messages/:messageId", requireAuth, validate({ bod
 
 router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
-  const messageId = param(req.params.messageId);
+  const id = idParam(req.params.id);
+  const messageId = idParam(req.params.messageId);
 
   const message = await prisma.message.findFirst({
     where: {
@@ -1557,7 +1587,7 @@ router.delete("/conversations/:id/messages/:messageId", requireAuth, async (req,
 
 router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
   const { messageId } = req.body as { messageId: string };
 
   if (!messageId) {
@@ -1665,7 +1695,7 @@ router.post("/conversations/:id/read", requireAuth, validate({ body: MarkReadBod
 
 router.post("/conversations/:id/mute", requireAuth, validate({ body: MuteBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
   const { muted } = req.body as { muted: boolean };
 
   if (typeof muted !== "boolean") {
@@ -1708,8 +1738,8 @@ router.post("/conversations/:id/mute", requireAuth, validate({ body: MuteBodySch
 
 router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, reactionLimiter, validate({ body: ReactionBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
-  const messageId = param(req.params.messageId);
+  const id = idParam(req.params.id);
+  const messageId = idParam(req.params.messageId);
   const { emoji } = req.body as { emoji?: string };
   // NFC-normalize so visually-identical glyphs with different code-point
   // sequences (base + variation selector, composed vs decomposed) map to
@@ -1779,8 +1809,8 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, rea
 
 router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", requireAuth, reactionLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
-  const messageId = param(req.params.messageId);
+  const id = idParam(req.params.id);
+  const messageId = idParam(req.params.messageId);
   let emoji: string;
   try {
     // NFC-normalize to match the canonical form stored on add.
@@ -1862,7 +1892,7 @@ router.delete("/conversations/:id/messages/:messageId/reactions/:emoji", require
 
 router.post("/conversations/:id/typing", requireAuth, typingLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
-  const id = param(req.params.id);
+  const id = idParam(req.params.id);
 
   const member = await prisma.conversationMember.findFirst({
     where: {

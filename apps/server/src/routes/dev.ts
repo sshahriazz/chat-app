@@ -4,6 +4,7 @@ import argon2 from "argon2";
 import { z } from "zod";
 import "zod-openapi";
 import { validate } from "../http/validate";
+import { httpUrl } from "../http/schemas";
 import { env } from "../env";
 import { NotFoundError, UnauthorizedError } from "../http/errors";
 import { mintUserToken, MAX_TENANT_TOKEN_TTL_SEC } from "../http/jwt-tenant";
@@ -69,7 +70,7 @@ const MintTokenBodySchema = z
     tenantId: z.string().min(1).default("default"),
     externalId: z.string().min(1).max(256),
     name: z.string().min(1).max(128),
-    image: z.string().url().max(2048).nullable().optional(),
+    image: httpUrl(2048).nullable().optional(),
     email: z.string().email().max(254).nullable().optional(),
     // Optional second-level partition inside the tenant. Non-null
     // restricts user discovery + add-member to same-scope + tenant-wide

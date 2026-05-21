@@ -15,6 +15,7 @@ import { deleteObject, keyFromPublicUrl } from "../lib/s3";
 import { invalidateUserProfile } from "../lib/user-cache";
 import { invalidateFederatedUser } from "../lib/user-federation";
 import { userScopeFilter } from "../lib/scope-filter";
+import { escapeLike } from "../lib/like-escape";
 import { logger } from "../lib/logger";
 
 const router: Router = Router();
@@ -117,8 +118,8 @@ router.get(
         // unscoped requesters so this is effectively a no-op for them.
         AND: [userScopeFilter(scope)],
         OR: [
-          { name: { contains: q, mode: "insensitive" } },
-          { email: { contains: q, mode: "insensitive" } },
+          { name: { contains: escapeLike(q), mode: "insensitive" } },
+          { email: { contains: escapeLike(q), mode: "insensitive" } },
         ],
       },
       select: {
@@ -169,8 +170,8 @@ router.get(
         tenantId,
         id: { not: user.id },
         OR: [
-          { name: { contains: q, mode: "insensitive" } },
-          { email: { contains: q, mode: "insensitive" } },
+          { name: { contains: escapeLike(q), mode: "insensitive" } },
+          { email: { contains: escapeLike(q), mode: "insensitive" } },
         ],
       },
       select: {
