@@ -152,11 +152,19 @@ router.post(
   },
 );
 
-// GET /api/attachments/:id/view — short-lived signed URL for INLINE
-// rendering (<img>/<video>/<audio>). Membership-checked. Only inline-safe
-// content types (image/video/audio) are served this way; anything else
-// (PDF, zip, text) is redirected to /download (forced attachment) so it
-// can never execute script in the bucket origin.
+// GET /api/attachments/:id/view — returns a short-lived signed URL for
+// INLINE rendering (<img>/<video>/<audio>) as JSON `{ url, expiresIn }`.
+//
+// Returns JSON rather than a 302 because the bucket is private and the
+// server is bearer-auth only: an `<img src>` / `<a href>` can't carry
+// the Authorization header, so the client must fetch this through the
+// authenticated API client and then point the element at the returned
+// signed URL (which needs no auth of its own).
+//
+// Membership-checked. Only inline-safe content types (image/video/
+// audio) get an inline-disposition URL; anything else (PDF, zip, text)
+// is signed as a forced download so it can never execute script in the
+// bucket origin.
 router.get("/:id/view", requireAuth, generalLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
   const id = paramId(req);
@@ -165,31 +173,27 @@ router.get("/:id/view", requireAuth, generalLimiter, async (req, res) => {
   const key = resolveKey(attachment);
   if (!key) throw new NotFoundError("Attachment not found");
 
-  if (!isInlineSafeContentType(attachment.contentType)) {
-    // Not safe to render inline — fall through to the download path.
-    const { url } = await createDownloadUrl({
-      key,
-      filename: attachment.filename,
-      contentType: attachment.contentType,
-    });
-    res.setHeader("Cache-Control", "no-store");
-    res.redirect(url);
-    return;
-  }
+  const signed = isInlineSafeContentType(attachment.contentType)
+    ? await createViewUrl({
+        key,
+        filename: attachment.filename,
+        contentType: attachment.contentType,
+      })
+    : await createDownloadUrl({
+        key,
+        filename: attachment.filename,
+        contentType: attachment.contentType,
+      });
 
-  const { url } = await createViewUrl({
-    key,
-    filename: attachment.filename,
-    contentType: attachment.contentType,
-  });
   res.setHeader("Cache-Control", "no-store");
-  res.redirect(url);
+  res.json({ url: signed.url, expiresIn: signed.expiresIn });
 });
 
-// GET /api/attachments/:id/download — short-lived signed URL with
-// Content-Disposition: attachment + pinned Content-Type + nosniff, then
-// 302-redirects the browser to it. Works for any content-type so images,
-// PDFs and arbitrary binaries all prompt a download instead of rendering.
+// GET /api/attachments/:id/download — returns a short-lived signed URL
+// (Content-Disposition: attachment + pinned Content-Type + nosniff) as
+// JSON `{ url, expiresIn }`. JSON (not 302) for the same bearer-auth
+// reason as /view. The client fetches this, then navigates / triggers
+// the download against the returned URL.
 router.get("/:id/download", requireAuth, generalLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
   const id = paramId(req);
@@ -198,13 +202,13 @@ router.get("/:id/download", requireAuth, generalLimiter, async (req, res) => {
   const key = resolveKey(attachment);
   if (!key) throw new NotFoundError("Attachment not found");
 
-  const { url } = await createDownloadUrl({
+  const signed = await createDownloadUrl({
     key,
     filename: attachment.filename,
     contentType: attachment.contentType,
   });
   res.setHeader("Cache-Control", "no-store");
-  res.redirect(url);
+  res.json({ url: signed.url, expiresIn: signed.expiresIn });
 });
 
 export default router;

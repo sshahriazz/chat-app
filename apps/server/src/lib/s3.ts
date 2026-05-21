@@ -159,7 +159,10 @@ export async function createDownloadUrl(params: {
   expiresIn?: number;
 }): Promise<{ url: string; expiresIn: number }> {
   const cfg = requireS3Config();
-  const expiresIn = params.expiresIn ?? 30;
+  // 120s: the client fetches this JSON, then navigates to the URL to
+  // download. Generous enough for click-to-fetch latency, short enough
+  // to bound leakage if the URL escapes (Referer, history, logs).
+  const expiresIn = params.expiresIn ?? 120;
 
   // RFC 5987 encoding so non-ASCII filenames survive.
   const encoded = encodeURIComponent(params.filename);
@@ -185,7 +188,12 @@ export async function createDownloadUrl(params: {
  * SAFETY: callers must only ever pass this through for content types
  * that are safe to render inline (image/video/audio). HTML / SVG /
  * XML must NOT reach this path — the route enforces that, and the
- * upload allowlist already excludes them. Short 30s TTL bounds leakage.
+ * upload allowlist already excludes them.
+ *
+ * 300s TTL: the client fetches this JSON then sets it as an <img>/
+ * <video> src; the URL only needs to stay valid long enough for the
+ * browser to load the bytes (which it then caches). Generous for slow
+ * mobile connections / large media; still bounded for leak exposure.
  */
 export async function createViewUrl(params: {
   key: string;
@@ -194,7 +202,7 @@ export async function createViewUrl(params: {
   expiresIn?: number;
 }): Promise<{ url: string; expiresIn: number }> {
   const cfg = requireS3Config();
-  const expiresIn = params.expiresIn ?? 30;
+  const expiresIn = params.expiresIn ?? 300;
 
   const encoded = encodeURIComponent(params.filename);
   const disposition = `inline; filename*=UTF-8''${encoded}`;

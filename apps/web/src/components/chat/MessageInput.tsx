@@ -88,6 +88,13 @@ function formatBytes(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
+// Mirror of server enforcement in apps/server/src/http/schemas.ts —
+// keep these in sync with MAX_ATTACHMENT_SIZE and the `.max(10)` on
+// attachmentIds. Client-side guard is purely UX (fail fast before
+// uploading bytes the server will reject anyway).
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
 export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps) {
   const { sendMessage, sendTyping, conversations, activeConversationId } =
     useChat();
@@ -107,17 +114,56 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploadingCount, setUploadingCount] = useState(0);
 
-  const clearAttachments = () => setAttachments([]);
+  const clearAttachments = () =>
+    setAttachments((prev) => {
+      // Release any blob: preview URLs we created in handleFiles.
+      for (const a of prev) {
+        if (a.url.startsWith("blob:")) URL.revokeObjectURL(a.url);
+      }
+      return [];
+    });
 
   const handleFiles = async (files: File[]) => {
     if (files.length === 0) return;
-    setUploadingCount((n) => n + files.length);
 
+    const oversized = files.filter((f) => f.size > MAX_ATTACHMENT_BYTES);
+    const sized = files.filter((f) => f.size <= MAX_ATTACHMENT_BYTES);
+    if (oversized.length > 0) {
+      notifications.show({
+        title: oversized.length === 1 ? "File too large" : "Some files too large",
+        message: `${oversized.map((f) => f.name).join(", ")} — max ${formatBytes(MAX_ATTACHMENT_BYTES)} each`,
+        color: "red",
+        autoClose: 5000,
+      });
+    }
+
+    const remaining =
+      MAX_ATTACHMENTS_PER_MESSAGE - attachments.length - uploadingCount;
+    const accepted = sized.slice(0, Math.max(0, remaining));
+    const dropped = sized.slice(accepted.length);
+    if (dropped.length > 0) {
+      notifications.show({
+        title: "Attachment limit reached",
+        message: `Max ${MAX_ATTACHMENTS_PER_MESSAGE} files per message — dropped ${dropped.length}`,
+        color: "red",
+        autoClose: 5000,
+      });
+    }
+    if (accepted.length === 0) return;
+
+    setUploadingCount((n) => n + accepted.length);
     await Promise.all(
-      files.map(async (f) => {
+      accepted.map(async (f) => {
         try {
           const att = await uploadFile(f);
-          setAttachments((prev) => [...prev, att]);
+          // The bucket is private, so `att.url` (the public URL) won't
+          // load in the compose preview. Only `attachmentIds` are sent
+          // on submit, so the `url` field here is preview-only — use a
+          // local blob URL for an instant, network-free thumbnail.
+          const previewUrl = f.type.startsWith("image/")
+            ? URL.createObjectURL(f)
+            : att.url;
+          setAttachments((prev) => [...prev, { ...att, url: previewUrl }]);
         } catch (err) {
           notifications.show({
             title: "Upload failed",
@@ -286,7 +332,10 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
                 <CloseButton
                   size="xs"
                   onClick={() =>
-                    setAttachments((prev) => prev.filter((x) => x.id !== a.id))
+                    setAttachments((prev) => {
+                      if (a.url.startsWith("blob:")) URL.revokeObjectURL(a.url);
+                      return prev.filter((x) => x.id !== a.id);
+                    })
                   }
                 />
               </Group>

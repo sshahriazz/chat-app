@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Text,
@@ -28,11 +28,15 @@ import { useAuth } from "@/context/AuthContext";
 import { useChatActions } from "@/context/ChatContext";
 import { UserAvatar } from "@/components/common/UserAvatar";
 import { ReactionPicker } from "./ReactionPicker";
-import { API_BASE_URL } from "@/lib/api";
 import {
   isEmptyContent,
   renderMessageToHtml,
 } from "@/lib/message-content";
+import {
+  getAttachmentViewUrl,
+  invalidateAttachmentViewUrl,
+  downloadAttachment,
+} from "@/lib/attachment-url";
 import type { Attachment, Message, MessageContent } from "@/lib/types";
 
 function MessageStatusIcon({
@@ -87,45 +91,110 @@ function formatBytes(n: number): string {
 }
 
 
+// Loads a private attachment's signed inline URL on demand. The bucket
+// is no longer public, so we can't put `attachment.url` straight in an
+// <img src>; we fetch a short-lived signed URL via the authenticated
+// API and render that, refetching once if a load fails (expiry race).
+function AttachmentImage({ attachment }: { attachment: Attachment }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const triedRefresh = useRef(false);
+
+  // This component is keyed by attachment.id at the call site
+  // (AttachmentPreview), so it remounts when the attachment changes —
+  // no need to reset state synchronously here (which would also trip
+  // react-hooks/set-state-in-effect). The effect only kicks off the
+  // async fetch and sets state from its callbacks.
+  useEffect(() => {
+    let cancelled = false;
+    getAttachmentViewUrl(attachment.id)
+      .then((url) => {
+        if (!cancelled) setSrc(url);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachment.id]);
+
+  const onImgError = () => {
+    // One retry: drop the cached URL (may have expired) and refetch.
+    if (triedRefresh.current) {
+      setFailed(true);
+      return;
+    }
+    triedRefresh.current = true;
+    invalidateAttachmentViewUrl(attachment.id);
+    getAttachmentViewUrl(attachment.id)
+      .then(setSrc)
+      .catch(() => setFailed(true));
+  };
+
+  if (failed) {
+    return (
+      <Paper p="xs" radius="sm" withBorder style={{ maxWidth: 280 }}>
+        <Group gap="xs" wrap="nowrap">
+          <IconAlertCircle size={14} />
+          <Text size="xs" c="dimmed" truncate>
+            {attachment.filename}
+          </Text>
+        </Group>
+      </Paper>
+    );
+  }
+
+  if (!src) {
+    // Reserve intrinsic space while the signed URL resolves.
+    return (
+      <Box
+        style={{
+          width: Math.min(attachment.width ?? 280, 280),
+          height: Math.min(attachment.height ?? 180, 280),
+          maxWidth: 280,
+          maxHeight: 280,
+          borderRadius: 8,
+          background: "var(--mantine-color-default-hover)",
+        }}
+      />
+    );
+  }
+
+  return (
+    <img
+      src={src}
+      alt={attachment.filename}
+      width={attachment.width ?? undefined}
+      height={attachment.height ?? undefined}
+      loading="lazy"
+      decoding="async"
+      onError={onImgError}
+      style={{
+        maxWidth: 280,
+        maxHeight: 280,
+        borderRadius: 8,
+        display: "block",
+        height: "auto",
+        width: "auto",
+      }}
+    />
+  );
+}
+
 function AttachmentPreview({ attachment }: { attachment: Attachment }) {
   const isImage = attachment.contentType.startsWith("image/");
-  // Anchor to our own origin; server redirects to a signed S3 URL with
-  // Content-Disposition: attachment so the browser actually downloads.
-  const downloadHref = `${API_BASE_URL}/api/attachments/${attachment.id}/download`;
+  const onDownload = () => {
+    void downloadAttachment(attachment.id, attachment.filename);
+  };
 
   if (isImage) {
     return (
       <Box style={{ position: "relative", display: "inline-block" }}>
-        <a
-          href={attachment.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          style={{ display: "inline-block" }}
-        >
-          <img
-            src={attachment.url}
-            alt={attachment.filename}
-            // Intrinsic size when we know it — prevents layout shift as
-            // thumbnails stream in during scroll. Legacy rows without
-            // dimensions fall back to auto.
-            width={attachment.width ?? undefined}
-            height={attachment.height ?? undefined}
-            loading="lazy"
-            decoding="async"
-            style={{
-              maxWidth: 280,
-              maxHeight: 280,
-              borderRadius: 8,
-              display: "block",
-              height: "auto",
-              width: "auto",
-            }}
-          />
-        </a>
+        <AttachmentImage attachment={attachment} />
         <Tooltip label="Download">
           <ActionIcon
-            component="a"
-            href={downloadHref}
+            onClick={onDownload}
             variant="filled"
             color="dark"
             size="sm"
@@ -162,12 +231,7 @@ function AttachmentPreview({ attachment }: { attachment: Attachment }) {
           </Text>
         </Box>
         <Tooltip label="Download">
-          <ActionIcon
-            component="a"
-            href={downloadHref}
-            variant="subtle"
-            size="sm"
-          >
+          <ActionIcon onClick={onDownload} variant="subtle" size="sm">
             <IconDownload size={14} />
           </ActionIcon>
         </Tooltip>

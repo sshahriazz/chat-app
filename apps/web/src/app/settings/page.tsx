@@ -27,6 +27,12 @@ export default function SettingsPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [name, setName] = useState("");
   const [image, setImage] = useState<string | null>(null);
+  // Local blob preview of a freshly-picked avatar. The storage bucket
+  // is private, so the uploaded `image` URL won't render directly — we
+  // show this blob for immediate feedback. NOTE: avatars are a demo
+  // convenience; in production the avatar comes from the tenant JWT
+  // `image` claim (an externally-hosted URL). See BREAKING_CHANGES.md.
+  const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -66,6 +72,11 @@ export default function SettingsPage() {
       return;
     }
     setUploading(true);
+    // Revoke any prior preview blob before creating a new one.
+    setPreviewSrc((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return URL.createObjectURL(file);
+    });
     try {
       const att = await uploadFile(file);
       setImage(att.url);
@@ -132,7 +143,7 @@ export default function SettingsPage() {
           <Group align="center">
             <div style={{ position: "relative" }}>
               <Avatar
-                src={image}
+                src={previewSrc ?? image}
                 name={name}
                 size={96}
                 radius={96}
@@ -165,7 +176,13 @@ export default function SettingsPage() {
                   color="red"
                   size="xs"
                   leftSection={<IconTrash size={14} />}
-                  onClick={() => setImage(null)}
+                  onClick={() => {
+                    setPreviewSrc((prev) => {
+                      if (prev) URL.revokeObjectURL(prev);
+                      return null;
+                    });
+                    setImage(null);
+                  }}
                   disabled={uploading}
                 >
                   Remove photo
@@ -198,6 +215,10 @@ export default function SettingsPage() {
               variant="subtle"
               onClick={() => {
                 setName(user.name);
+                setPreviewSrc((prev) => {
+                  if (prev) URL.revokeObjectURL(prev);
+                  return null;
+                });
                 setImage(user.image);
               }}
               disabled={!dirty || saving}
