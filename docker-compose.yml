@@ -67,6 +67,11 @@ services:
   # ─── Redis (INTERNAL) ────────────────────────────────────────
   redis:
     <<: *hardened
+    # Same caps as postgres: the entrypoint chowns /data and re-execs
+    # as the unprivileged `redis` user, which needs CHOWN + SETUID +
+    # SETGID + DAC_OVERRIDE + FOWNER. With cap_drop:[ALL] alone, the
+    # container fails to write its AOF dir (`appendonlydir`).
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     image: redis:8-alpine
     restart: unless-stopped
     networks: [dokploy-network]
@@ -195,6 +200,11 @@ services:
     <<: *hardened
     image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     networks: [dokploy-network]
+    # mc stores its alias config in $HOME/.mc. With cap_drop:[ALL] the
+    # container can't create /root/.mc; redirect HOME into the world-
+    # writable /tmp so the bucket-policy apply succeeds.
+    environment:
+      HOME: /tmp
     depends_on:
       minio:
         condition: service_healthy
@@ -220,6 +230,10 @@ services:
     build:
       context: .
       dockerfile: apps/server/Dockerfile
+    # One-shot pre-deploy task. Runs as root to write Prisma's engine
+    # cache; the long-running server still runs as the unprivileged
+    # `node` user. cap_drop + no-new-privileges still apply.
+    user: root
     command: ["pnpm", "exec", "prisma", "migrate", "deploy"]
     restart: "no"
     networks: [dokploy-network]
@@ -283,11 +297,10 @@ services:
       ADMIN_IP_ALLOWLIST: ${ADMIN_IP_ALLOWLIST:-}
       TENANT_JWT_CLOCK_SKEW_SEC: ${TENANT_JWT_CLOCK_SKEW_SEC:-30}
       AUTH_MODE: ${AUTH_MODE:-jwt}
-      # Dev-only shortcut that mounts POST /api/dev/mint-token. Safe
-      # defaults: OFF. Local dev should set DEV_MINT_ENABLED=true +
-      # ALLOW_DEV_MINT_TENANTS=default via a .env.dev (never in prod).
-      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-false}
-      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-}
+      # The dev router (POST /api/dev/mint-token, GET /api/dev/personas)
+      # is auto-mounted whenever NODE_ENV !== "production". No env var
+      # toggle: setting NODE_ENV=production in this compose disables it
+      # unconditionally.
       # Optional: base64-encoded 32-byte key that wraps Tenant.jwtSecret
       # at rest (AES-256-GCM). If unset, secrets are stored plaintext
       # (HMAC requires plaintext at verify time, so this is a DB-at-rest

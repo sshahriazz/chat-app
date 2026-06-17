@@ -70,18 +70,24 @@ const EnvSchema = z.object({
   // Charset restricted to base64url / hex so a hand-rolled `min(32)`
   // string of repeated `a`s fails fast. Reject obvious low-entropy
   // patterns (all-same-char, fewer than 16 unique characters).
-  MASTER_API_KEY: z
-    .string()
-    .min(43, "MASTER_API_KEY must be at least 43 chars (32B of base64url entropy)")
-    .regex(
-      /^[A-Za-z0-9_\-+/=]+$/,
-      "MASTER_API_KEY must be base64url / hex chars only",
-    )
-    .refine(
-      (s) => new Set(s).size >= 16,
-      "MASTER_API_KEY is too low-entropy (need ≥16 unique chars)",
-    )
-    .optional(),
+  // Empty-string env (`MASTER_API_KEY=` in `.env` to mean "unset") is
+  // preprocessed to undefined so the optional() chain accepts it. Otherwise
+  // the .min(43) check fires on "".
+  MASTER_API_KEY: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z
+      .string()
+      .min(43, "MASTER_API_KEY must be at least 43 chars (32B of base64url entropy)")
+      .regex(
+        /^[A-Za-z0-9_\-+/=]+$/,
+        "MASTER_API_KEY must be base64url / hex chars only",
+      )
+      .refine(
+        (s) => new Set(s).size >= 16,
+        "MASTER_API_KEY is too low-entropy (need ≥16 unique chars)",
+      )
+      .optional(),
+  ),
   // Optional comma-separated allowlist for `/api/admin/*` sources.
   // Each entry is an IPv4/IPv6 address. Requests from outside this
   // list are rejected with 403 regardless of master-key validity.
@@ -128,14 +134,6 @@ const EnvSchema = z.object({
   // middleware/auth.ts is now just the JWT path; if you flip this,
   // you'll also need to revert the middleware.
   AUTH_MODE: z.enum(["both", "session", "jwt"]).default("jwt"),
-  // Dev-only: opt-in switch that mounts `POST /api/dev/mint-token`
-  // outside non-production. Stays false in prod unless explicitly
-  // enabled (e.g. staging envs where you want to e2e-test end-to-end).
-  DEV_MINT_ENABLED: z.coerce.boolean().default(false),
-  // When dev mint is enabled in production, ONLY these tenant ids can
-  // be minted for. Comma-separated. Prevents a leaked flag from
-  // becoming a tenant-impersonation backdoor.
-  ALLOW_DEV_MINT_TENANTS: z.string().optional(),
   // Seconds of clock skew tolerated when verifying tenant-signed user
   // JWTs. Defaults to 5s — every additional second is also extra
   // post-expiry validity for a leaked token. Capped at 60s to prevent
@@ -160,8 +158,18 @@ const EnvSchema = z.object({
   // Optional ClamAV INSTREAM scan target. When BOTH host + port are
   // set, every attachment is scanned post-upload; infected uploads are
   // deleted from S3 and the row purged. Leave unset to skip (no-op).
-  CLAMAV_HOST: z.string().optional(),
-  CLAMAV_PORT: z.coerce.number().int().positive().max(65535).optional(),
+  // Docker compose passes through `${CLAMAV_HOST:-}` / `${CLAMAV_PORT:-}`,
+  // which means the server sees literal empty strings when unset rather
+  // than missing values. Preprocess "" → undefined so the optional/
+  // coerce-number chain treats "unset" as "skip the AV scan".
+  CLAMAV_HOST: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.string().optional(),
+  ),
+  CLAMAV_PORT: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.coerce.number().int().positive().max(65535).optional(),
+  ),
 
   // CORS allowlist (comma separated). Falls back to dev defaults.
   CORS_ALLOWED_ORIGINS: z.string().optional(),

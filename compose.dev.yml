@@ -25,6 +25,11 @@ services:
       args:
         NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
         NEXT_PUBLIC_CENTRIFUGO_URL: ws://localhost:8000/connection/websocket
+    # Prod docker-compose.yml dropped the host port binding (Traefik
+    # handles ingress). Restore it for local dev so the browser can
+    # reach the UI. Override `WEB_PORT` in `.env` if 3000 is taken.
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
 
   postgres:
     environment:
@@ -68,11 +73,15 @@ services:
       CENTRIFUGO_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
       CENTRIFUGO_TOKEN_SECRET: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
 
-      # Loud-failure overrides relaxed for the laptop. Mirror these in
-      # Dokploy's panel for prod (they're already strict there).
-      MASTER_API_KEY: ${MASTER_API_KEY:-dev-master-key-laptop-only}
-      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-true}
-      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-default,demo_acme,demo_beta}
+      # MASTER_API_KEY override removed: the prod compose's
+      # `${MASTER_API_KEY:-}` already injects an empty string when
+      # unset, which the server schema preprocesses back to undefined.
+      # An empty key disables both `/api/admin/*` and the master-key
+      # gate on `/api/dev/*`, so the persona picker works without auth.
+      # To EXERCISE the gate locally, set MASTER_API_KEY in .env to a
+      # value satisfying the ≥43-char base64url + ≥16-unique check.
+      # Webhooks: signature default ON in prod; off locally so you can
+      # curl /api/webhooks/* without computing an HMAC.
       WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-false}
 
       # Dev URLs that differ from prod. In prod the API + storage live
