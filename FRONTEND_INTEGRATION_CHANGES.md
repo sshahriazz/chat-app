@@ -394,11 +394,27 @@ The reference web client in `apps/web/` has all of these changes wired up. Pull 
 
 | Concern | File |
 |---|---|
-| Auth-bearer API client | [`apps/web/src/lib/api.ts`](apps/web/src/lib/api.ts) |
+| Auth-bearer API client (no cookies, throws `ApiError` with `.status`) | [`apps/web/src/lib/api.ts`](apps/web/src/lib/api.ts) |
 | Attachment upload (presigned POST) | [`apps/web/src/lib/upload.ts`](apps/web/src/lib/upload.ts) |
 | Signed view/download URL helpers | [`apps/web/src/lib/attachment-url.ts`](apps/web/src/lib/attachment-url.ts) |
 | Inline image component | [`apps/web/src/components/chat/MessageBubble.tsx`](apps/web/src/components/chat/MessageBubble.tsx) |
 | Compose-time blob previews | [`apps/web/src/components/chat/MessageInput.tsx`](apps/web/src/components/chat/MessageInput.tsx) |
-| Push subscribe flow | [`apps/web/src/lib/notify.ts`](apps/web/src/lib/notify.ts) |
+| Push subscribe flow (handles 409 on hijacked endpoint) | [`apps/web/src/lib/notify.ts`](apps/web/src/lib/notify.ts) |
+
+### Not yet wired in `apps/web` (intentional — needs UX design)
+
+The reference app does NOT yet implement these — the doc covers them as
+recommended patterns for integrators:
+
+- A global **410 Gone** handler that navigates to an "account deleted"
+  screen. `apps/web/src/lib/api.ts` now throws `ApiError` with
+  `.status`, so wiring it is a small change in the auth context, but
+  the deleted-screen UX is design-dependent.
+- A **"Sign out everywhere"** button calling `POST /api/users/me/revoke`.
+- A client-side **mention cap** in `MessageInput`. The server already
+  rejects >50 mentions with 400; a UX guard is optional polish.
+- The Settings **avatar upload** still stores a private-bucket URL that
+  won't render cross-user. Production avatars come from the tenant JWT
+  `image` claim (§7).
 
 For full server-side / operator-facing changes, see [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md).

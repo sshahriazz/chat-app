@@ -24,6 +24,24 @@ interface RequestOpts {
   signal?: AbortSignal;
 }
 
+/**
+ * Error thrown for any non-2xx HTTP response. Carries the status code +
+ * the parsed error payload so callers can branch on it (e.g. 410 → "your
+ * account was deleted, take the user to a sign-out screen"; 409 → "this
+ * push endpoint is registered to another user"). Previous behavior
+ * collapsed everything into `new Error(message)` and lost the status.
+ */
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly body?: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -33,23 +51,29 @@ async function request<T>(
   const token = getAuthToken();
   const headers: Record<string, string> = {};
   if (body) headers["Content-Type"] = "application/json";
-  // Bearer header is the JWT path; server middleware dispatches to
-  // requireUserJwt when present. credentials:include keeps the legacy
-  // cookie-session path working in parallel during the dual-auth
-  // window (AUTH_MODE=both, default) — dropped in PR 3.
+  // Bearer-only: every authenticated request carries `Authorization:
+  // Bearer <jwt>`. There are no cookies — `credentials: "include"` was
+  // dropped because the server now sends `Access-Control-Allow-
+  // Credentials: false` and including credentials with a non-credentialed
+  // CORS allowlist throws a browser error.
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
   const res = await fetch(`${BASE_URL}${path}`, {
     method,
     headers: Object.keys(headers).length ? headers : undefined,
     body: body ? JSON.stringify(body) : undefined,
-    credentials: "include",
     signal: opts.signal,
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+    const errBody = await res.json().catch(() => ({ error: res.statusText }));
+    const msg =
+      (typeof errBody === "object" &&
+        errBody &&
+        typeof (errBody as { error?: unknown }).error === "string"
+        ? (errBody as { error: string }).error
+        : res.statusText) || res.statusText;
+    throw new ApiError(res.status, msg, errBody);
   }
 
   return res.json();

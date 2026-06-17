@@ -141,13 +141,29 @@ export async function enablePushSubscription(): Promise<void> {
     endpointHead: subscription.endpoint.slice(0, 60),
   });
 
-  await api.post("/api/push/subscribe", {
-    endpoint: subscription.endpoint,
-    keys: {
-      p256dh: bufferToBase64(subscription.getKey("p256dh")),
-      auth: bufferToBase64(subscription.getKey("auth")),
-    },
-  });
+  try {
+    await api.post("/api/push/subscribe", {
+      endpoint: subscription.endpoint,
+      keys: {
+        p256dh: bufferToBase64(subscription.getKey("p256dh")),
+        auth: bufferToBase64(subscription.getKey("auth")),
+      },
+    });
+  } catch (err) {
+    // The server now scopes push subscriptions by userId. A 409 means
+    // this endpoint is already registered to a DIFFERENT user (someone
+    // else signed in on this same device/browser before us). Drop the
+    // freshly-minted subscription so a later sign-in can reclaim it.
+    const { ApiError } = await import("./api");
+    if (err instanceof ApiError && err.status === 409) {
+      console.warn(
+        "[push] endpoint already registered to another user; aborting",
+      );
+      await subscription.unsubscribe().catch(() => {});
+      throw err;
+    }
+    throw err;
+  }
   console.debug("[push] 5/5 server registered the subscription");
 }
 
