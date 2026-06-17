@@ -94,6 +94,20 @@ function formatBytes(n: number): string {
 // uploading bytes the server will reject anyway).
 const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+// Mirror of MAX_MENTIONS_PER_MESSAGE in lib/message-content.ts on the
+// server. Sending a 51st mention is a 400 there; we fail fast in the UI
+// to give a clear message instead of a generic API error.
+const MAX_MENTIONS_PER_MESSAGE = 50;
+
+function countMentions(node: unknown): number {
+  if (!node || typeof node !== "object") return 0;
+  const n = node as { type?: string; content?: unknown[] };
+  let n_count = n.type === "mention" ? 1 : 0;
+  if (Array.isArray(n.content)) {
+    for (const child of n.content) n_count += countMentions(child);
+  }
+  return n_count;
+}
 
 export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps) {
   const { sendMessage, sendTyping, conversations, activeConversationId } =
@@ -113,6 +127,10 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploadingCount, setUploadingCount] = useState(0);
+  // Mirrors the server-side `MAX_MENTIONS_PER_MESSAGE` cap; recomputed
+  // on every editor update so the submit button can disable + a hint
+  // can render before the user hits send.
+  const [mentionCount, setMentionCount] = useState(0);
 
   const clearAttachments = () =>
     setAttachments((prev) => {
@@ -245,12 +263,23 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
     onCreate: ({ editor: e }) => {
       editorRef.current = e;
     },
-    onUpdate: () => {
+    onUpdate: ({ editor: e }) => {
       sendTyping();
+      setMentionCount(countMentions(e.getJSON()));
     },
   });
 
+  const overMentionCap = mentionCount > MAX_MENTIONS_PER_MESSAGE;
   const handleSubmit = () => {
+    if (overMentionCap) {
+      notifications.show({
+        title: "Too many mentions",
+        message: `Max ${MAX_MENTIONS_PER_MESSAGE} per message — currently ${mentionCount}.`,
+        color: "red",
+        autoClose: 4000,
+      });
+      return;
+    }
     submitFromEditor(
       editor,
       sendMessage,
@@ -426,10 +455,22 @@ export function MessageInput({ replyTo, onCancelReply, ref }: MessageInputProps)
           </RichTextEditor.Toolbar>
           <RichTextEditor.Content />
         </RichTextEditor>
-        <ActionIcon size="lg" variant="filled" onClick={handleSubmit} mb={4}>
+        <ActionIcon
+          size="lg"
+          variant="filled"
+          onClick={handleSubmit}
+          mb={4}
+          disabled={overMentionCap}
+          aria-label="Send"
+        >
           <IconSend size={18} />
         </ActionIcon>
       </Group>
+      {overMentionCap && (
+        <Text size="xs" c="red" mt={4} px="xs">
+          Too many mentions ({mentionCount} / {MAX_MENTIONS_PER_MESSAGE}). Remove some before sending.
+        </Text>
+      )}
     </Box>
   );
 }

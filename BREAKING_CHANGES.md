@@ -286,7 +286,22 @@ The reference web client implements this in
 clients that previously did `fetch(uploadUrl, { method: "PUT", body: file })`
 must update.
 
----
+### 3.7 Avatar uploads via `purpose: "avatar"`
+The upload-url endpoint accepts an optional `purpose: "attachment" |
+"avatar"` field (default `"attachment"`). When `"avatar"`:
+
+- Key is routed under `avatars/<userId>/...`. The MinIO bucket policy
+  applied by `minio-init` grants anonymous `s3:GetObject` on that
+  prefix only — message attachments stay private.
+- `contentType` must start with `image/`; `size` must be ≤ **2 MB**
+  (`MAX_AVATAR_SIZE`). Both enforced server-side AND in the presigned
+  POST policy.
+- Not tracked in the `attachments` table; not counted toward quota.
+- Response omits `attachmentId` (only `upload`, `publicUrl`, `expiresIn`).
+
+The new `avatars/*` public prefix is safe: SVG/XML aren't in the upload
+allowlist + the POST policy locks `Content-Type` at write time, so the
+public prefix cannot be used as a stored-XSS vector.
 
 ## 4. 🛠 Operator — headers, transport & infra (Phase 6)
 

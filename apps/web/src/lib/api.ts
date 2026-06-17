@@ -73,6 +73,22 @@ async function request<T>(
         typeof (errBody as { error?: unknown }).error === "string"
         ? (errBody as { error: string }).error
         : res.statusText) || res.statusText;
+    // 410 Gone: the server-side GDPR tombstone has rejected this
+    // user's token — the account has been deleted (sticky for 30 days).
+    // Clear the local token and bounce to the "account deleted" page
+    // unconditionally; a freshly-fetched token for the same externalId
+    // would also be rejected, so there's no useful retry.
+    if (res.status === 410 && typeof window !== "undefined") {
+      try {
+        const { setAuthToken } = await import("./auth-token");
+        setAuthToken(null);
+      } catch {
+        /* ignore */
+      }
+      if (!window.location.pathname.startsWith("/account-deleted")) {
+        window.location.replace("/account-deleted");
+      }
+    }
     throw new ApiError(res.status, msg, errBody);
   }
 

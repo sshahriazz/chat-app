@@ -290,18 +290,45 @@ Message and conversation cursors (`before=<id>`) are unchanged — they're messa
 
 ## 7. Avatars
 
-Avatars come from the **tenant JWT `image` claim** (an externally hosted URL). The legacy demo flow (settings page uploads a file to the now-private MinIO bucket and uses that URL as the avatar) renders only locally.
+Two supported paths:
 
-### Production: put a real CDN URL in the JWT
+### A. Tenant-supplied avatar URL (recommended for production)
+Set the JWT `image` claim to an externally hosted URL:
+
 ```ts
-// in your tenant's mint-token call
 jwt.sign({ sub, name, image: "https://cdn.example.com/avatars/u123.jpg", ... }, secret, opts);
 ```
 
-The JWT `image` claim is length-capped to 2048 chars and is **not** scheme-validated server-side — your client renders it as an `<img src>`, so only send `https://` URLs.
+The JWT `image` claim is length-capped to 2048 chars and is **not**
+scheme-validated server-side — only send `https://` URLs.
 
-### If you really need uploaded-via-MinIO demo avatars to work
-Expose a public read prefix for avatars only (keep message attachments private). Apply a MinIO bucket policy in `minio-init` that grants anonymous `s3:GetObject` on `arn:aws:s3:::<bucket>/avatars/*`, and route avatar uploads under an `avatars/` key prefix.
+### B. App-managed avatar upload (`purpose: "avatar"`)
+The `/api/attachments/upload-url` endpoint accepts a `purpose` field
+that routes the upload under a public `avatars/<userId>/` prefix
+(granted anonymous `s3:GetObject` by the bucket policy applied in
+`minio-init`). The returned `publicUrl` renders cross-user without any
+per-render signed-URL fetch.
+
+```ts
+const att = await uploadFile(file, { purpose: "avatar" });
+// att.url is publicly readable; save it as the user's image
+await api.post("/api/me/broadcast-profile", { image: att.url });
+```
+
+Constraints when `purpose === "avatar"`:
+- `contentType` must start with `image/` (server enforces).
+- `size` ≤ **2 MB** (smaller than the 10 MB message-attachment cap).
+- Avatars are **not** counted toward your storage quota.
+- They are **not** tracked in the `attachments` table — overwrite by
+  uploading a new avatar; the old object lingers until the next bucket
+  lifecycle sweep.
+- SVG / XML are NOT in the upload allowlist, and the presigned POST
+  policy locks `Content-Type` at write time, so the public prefix can't
+  be used as a stored-XSS vector.
+
+Reference: [`apps/web/src/app/settings/page.tsx`](apps/web/src/app/settings/page.tsx)
+calls `uploadFile(file, { purpose: "avatar" })` and stores
+`att.url` as the user's avatar.
 
 ---
 
@@ -401,20 +428,27 @@ The reference web client in `apps/web/` has all of these changes wired up. Pull 
 | Compose-time blob previews | [`apps/web/src/components/chat/MessageInput.tsx`](apps/web/src/components/chat/MessageInput.tsx) |
 | Push subscribe flow (handles 409 on hijacked endpoint) | [`apps/web/src/lib/notify.ts`](apps/web/src/lib/notify.ts) |
 
-### Not yet wired in `apps/web` (intentional — needs UX design)
+### Now wired in `apps/web` (previously deferred)
 
-The reference app does NOT yet implement these — the doc covers them as
-recommended patterns for integrators:
+The reference web app now implements every recommended pattern in this
+doc:
 
-- A global **410 Gone** handler that navigates to an "account deleted"
-  screen. `apps/web/src/lib/api.ts` now throws `ApiError` with
-  `.status`, so wiring it is a small change in the auth context, but
-  the deleted-screen UX is design-dependent.
-- A **"Sign out everywhere"** button calling `POST /api/users/me/revoke`.
-- A client-side **mention cap** in `MessageInput`. The server already
-  rejects >50 mentions with 400; a UX guard is optional polish.
-- The Settings **avatar upload** still stores a private-bucket URL that
-  won't render cross-user. Production avatars come from the tenant JWT
-  `image` claim (§7).
+- **410 Gone handler** in [`lib/api.ts`](apps/web/src/lib/api.ts):
+  on a 410 response, the local token is cleared and the browser is
+  navigated to [`/account-deleted`](apps/web/src/app/account-deleted/page.tsx)
+  (a terminal page explaining the 30-day tombstone). Wired for any
+  authenticated request, not just `/me`.
+- **"Sign out everywhere"** button in the
+  [Settings page](apps/web/src/app/settings/page.tsx) under
+  *Account security*. Calls `POST /api/users/me/revoke` inside a
+  confirmation modal, then signs the user out locally.
+- **Client-side mention cap** in
+  [`MessageInput`](apps/web/src/components/chat/MessageInput.tsx):
+  the editor's mention count is recomputed on every update; the send
+  button disables + an inline hint renders at >50 mentions, so the user
+  gets feedback before hitting the 400 from the server.
+- **Avatar uploads** now use `purpose: "avatar"` (§7 below) — the
+  server routes the key under a public `avatars/<userId>/` prefix so
+  the URL renders cross-user without per-render signed-URL fetches.
 
 For full server-side / operator-facing changes, see [`BREAKING_CHANGES.md`](./BREAKING_CHANGES.md).

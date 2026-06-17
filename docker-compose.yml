@@ -198,12 +198,19 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+    # Apply a bucket policy that keeps `*/` private (signed GETs only)
+    # but grants anonymous `s3:GetObject` on `avatars/*` so user avatars
+    # render cross-user without per-render signed-URL fetches. SVG/XML
+    # are NOT in the upload allowlist + the presigned POST policy locks
+    # Content-Type on write, so the public prefix can't be used as a
+    # stored-XSS vector.
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-chatapp} ${MINIO_ROOT_PASSWORD:-chatapp-dev-only} &&
       mc mb --ignore-existing local/${MINIO_BUCKET:-chatapp} &&
-      mc anonymous set none local/${MINIO_BUCKET:-chatapp} &&
-      echo '[minio-init] bucket ready (private; reads go through signed GETs)'
+      printf '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::%s/avatars/*\"]}]}\n' \"${MINIO_BUCKET:-chatapp}\" > /tmp/avatars-policy.json &&
+      mc anonymous set-json /tmp/avatars-policy.json local/${MINIO_BUCKET:-chatapp} &&
+      echo '[minio-init] bucket ready (private except avatars/*; reads go through signed GETs)'
       "
     restart: "no"
 

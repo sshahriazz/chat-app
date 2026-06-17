@@ -2,10 +2,19 @@ import { api } from "./api";
 import type { Attachment } from "./types";
 
 interface PresignResponse {
-  attachmentId: string;
+  // Present for `purpose: "attachment"`; omitted for `purpose: "avatar"`.
+  attachmentId?: string;
   upload: { url: string; fields: Record<string, string> };
   publicUrl: string;
   expiresIn: number;
+}
+
+export interface UploadOptions {
+  /** "attachment" (default) puts the object in the private bucket
+   *  namespace and tracks it in `attachments` for quota + GC. "avatar"
+   *  uploads to `avatars/<userId>/*` which is anonymously readable, and
+   *  is NOT tracked — the URL goes on `User.image`. */
+  purpose?: "attachment" | "avatar";
 }
 
 /**
@@ -45,9 +54,13 @@ async function readImageDimensions(
  * Used for both message attachments and user avatars — the Attachment row
  * has `messageId: null` either way until it's later linked or referenced.
  */
-export async function uploadFile(file: File): Promise<Attachment> {
+export async function uploadFile(
+  file: File,
+  opts: UploadOptions = {},
+): Promise<Attachment> {
   const contentType = file.type || "application/octet-stream";
   const dims = await readImageDimensions(file);
+  const purpose = opts.purpose ?? "attachment";
 
   const presign = await api.post<PresignResponse>(
     "/api/attachments/upload-url",
@@ -56,6 +69,7 @@ export async function uploadFile(file: File): Promise<Attachment> {
       contentType,
       size: file.size,
       ...(dims ? { width: dims.width, height: dims.height } : {}),
+      ...(purpose === "avatar" ? { purpose } : {}),
     },
   );
 
@@ -77,8 +91,12 @@ export async function uploadFile(file: File): Promise<Attachment> {
   // S3 returns 204 (or 201 if success_action_status set) on success.
   if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
 
+  // For avatars, the server doesn't track the row, so `attachmentId` is
+  // absent. We still return the same `Attachment` shape — callers that
+  // need the id (message-send) only ever invoke uploadFile without
+  // `purpose: "avatar"`; the settings page only reads `url`.
   return {
-    id: presign.attachmentId,
+    id: presign.attachmentId ?? "",
     url: presign.publicUrl,
     contentType,
     filename: file.name,

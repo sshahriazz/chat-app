@@ -189,7 +189,10 @@ const messageWithRelationsSchema = MessageModelSchema.pick({
 
 const uploadUrlResponseSchema = z
   .object({
-    attachmentId: z.string(),
+    // Present for `purpose: "attachment"`; absent for `purpose: "avatar"`
+    // (avatars aren't tracked in the attachments table — the URL lives
+    // on User.image and is served anonymously from `avatars/*`).
+    attachmentId: z.string().optional(),
     // Presigned POST: form target + policy fields. Client POSTs
     // multipart/form-data (fields first, `file` last) to `url`.
     upload: z.object({

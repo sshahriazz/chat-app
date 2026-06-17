@@ -88,12 +88,13 @@ router.post(
   validate({ body: UploadUrlBodySchema }),
   async (req, res) => {
     const { user, tenantId } = req as AuthenticatedRequest;
-    const { filename, contentType, size, width, height } = req.body as {
+    const { filename, contentType, size, width, height, purpose } = req.body as {
       filename: string;
       contentType: string;
       size: number;
       width?: number;
       height?: number;
+      purpose: "attachment" | "avatar";
     };
 
     // Schema enforces size / content-type / dimension bounds + filename
@@ -105,7 +106,14 @@ router.post(
     // filename — the filename can carry double extensions / RTL overrides
     // that a naive `path.extname` would propagate into the key.
     const ext = extForContentType(contentType);
-    const key = `${user.id}/${crypto.randomUUID()}${ext}`;
+    // Avatars live under `avatars/<userId>/...` so the bucket policy
+    // applied by `minio-init` can grant anonymous GET to that prefix only
+    // (every other key stays private). Message attachments stay in the
+    // user-id-rooted private namespace.
+    const key =
+      purpose === "avatar"
+        ? `avatars/${user.id}/${crypto.randomUUID()}${ext}`
+        : `${user.id}/${crypto.randomUUID()}${ext}`;
 
     // Mint the presign first (no DB state). The row insert below reserves
     // the quota; the presigned POST policy bounds the actual upload size.
@@ -115,6 +123,20 @@ router.post(
       contentType,
       contentLength: size,
     });
+
+    // Avatars are NOT tracked in the attachments table: they have no
+    // message link, no GC need (a User row carries the URL on `image`
+    // and is overwritten on the next save), and shouldn't count against
+    // the per-user message-attachment quota. Return early without the
+    // transaction.
+    if (purpose === "avatar") {
+      res.status(201).json({
+        upload: { url: signed.url, fields: signed.fields },
+        publicUrl: signed.publicUrl,
+        expiresIn: signed.expiresIn,
+      });
+      return;
+    }
 
     // Atomic quota enforcement. A per-tenant advisory lock serializes
     // concurrent presigns within the tenant so the sum-then-insert can't

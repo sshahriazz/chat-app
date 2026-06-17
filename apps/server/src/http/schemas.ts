@@ -241,6 +241,10 @@ function sanitizeFilename(raw: string): string {
   return s.slice(0, 100);
 }
 
+/** Tight cap for avatar uploads — smaller than MAX_ATTACHMENT_SIZE so a
+ *  user can't park a 10 MB blob in the public `avatars/*` prefix. */
+export const MAX_AVATAR_SIZE = 2 * 1024 * 1024;
+
 export const UploadUrlBodySchema = z
   .object({
     filename: z
@@ -253,7 +257,24 @@ export const UploadUrlBodySchema = z
     size: z.number().int().positive().max(MAX_ATTACHMENT_SIZE),
     width: z.number().int().positive().max(16384).optional(),
     height: z.number().int().positive().max(16384).optional(),
+    /** What the upload is for:
+     *  - "attachment" (default): private bucket, quota-counted, attached
+     *    to a message later via `attachmentIds`.
+     *  - "avatar": uploaded to the public `avatars/<userId>/` prefix
+     *    (granted anonymous GET by the bucket policy in `minio-init`).
+     *    Stricter type+size constraints; NOT tracked in the attachments
+     *    table — the URL lives on User.image. */
+    purpose: z.enum(["attachment", "avatar"]).default("attachment"),
   })
+  .refine(
+    (b) =>
+      b.purpose !== "avatar" ||
+      (b.contentType.startsWith("image/") && b.size <= MAX_AVATAR_SIZE),
+    {
+      message: `Avatars must be image/* and ≤ ${MAX_AVATAR_SIZE} bytes`,
+      path: ["purpose"],
+    },
+  )
   .meta({ id: "UploadUrlBody" });
 
 // ─── Centrifugo ──────────────────────────────────────────────
