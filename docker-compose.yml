@@ -312,6 +312,31 @@ services:
       VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       VAPID_SUBJECT: ${VAPID_SUBJECT:-}
+      # Anti-malware (optional, opt-in). Uncomment the `clamav`
+      # service block below AND set both vars to enable. With both
+      # unset, attachment uploads skip the scan (no-op).
+      CLAMAV_HOST: ${CLAMAV_HOST:-}
+      CLAMAV_PORT: ${CLAMAV_PORT:-}
+
+  # ─── ClamAV (OPTIONAL — opt-in attachment scanning) ─────────
+  #
+  # Uncomment this block AND set CLAMAV_HOST=clamav + CLAMAV_PORT=3310
+  # in the server's env to enable. The clamd container is ~1.2 GB resident
+  # (signature DB) so it's off by default.
+  #
+  # clamav:
+  #   <<: *hardened
+  #   image: clamav/clamav:stable
+  #   restart: unless-stopped
+  #   networks: [dokploy-network]
+  #   volumes:
+  #     - clamav_data:/var/lib/clamav
+  #   healthcheck:
+  #     test: ["CMD", "clamdcheck.sh"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 120s
 
   # ─── Web / Next.js (UI only — pure presentation layer) ───────
   web:
@@ -347,3 +372,5 @@ volumes:
   postgres_data:
   redis_data:
   minio_data:
+  # Uncomment when enabling the clamav sidecar above.
+  # clamav_data:

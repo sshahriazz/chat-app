@@ -1,4 +1,4 @@
-# Breaking Changes — Security Hardening (Phases 1–6, +3.2/3.8/3.9, +6.19)
+# Breaking Changes — Security Hardening (Phases 1–7)
 
 This release hardens the chat server (`apps/server`) following a security
 review. Several changes alter the API/deploy contract. Read this before
@@ -39,13 +39,15 @@ DSNs (previously fell back to `chatapp`). Make sure it is set.
   storing tenant secrets in plaintext); now it aborts startup.
 
 ### 1.4 Database migrations (run before/with deploy)
-Three new migrations must be applied (`prisma migrate deploy` runs them):
+Four new migrations must be applied (`prisma migrate deploy` runs them):
 - `20260519100000_tokens_valid_after_and_deleted_externals`
   — `User.tokensValidAfter`, new `DeletedExternalId` table.
 - `20260520100000_attachment_object_key`
   — `Attachment.objectKey`.
 - `20260522100000_tenant_storage_quota`
   — `Tenant.storageQuotaBytes` (nullable; null = no tenant-level cap).
+- `20260522120000_admin_audit_log`
+  — new `AdminAuditLog` append-only forensics table (Phase 7.2).
 
 ### 1.5 Object storage is now PRIVATE
 - The MinIO bucket is no longer anonymously readable
@@ -318,7 +320,37 @@ must update.
 - New env vars: `TRUST_PROXY_CIDRS` (optional), `METRICS_TOKEN`
   (optional).
 
-## 5. Upgrade checklist
+## 5. 🛠 Operator — CI / audit / antivirus (Phase 7)
+
+- **Admin audit log**: every successful operator mutation (`tenant.create`,
+  `tenant.rotateApiKey`, `tenant.rotateJwtSecret`) now writes an
+  append-only row to `admin_audit_log` (action, tenantId, actor IP from
+  `socket.remoteAddress`, request id, JSON details). The raw key/secret
+  never reaches the table. Read it for forensics; never mutate it.
+- **ClamAV antivirus (opt-in)**: set `CLAMAV_HOST` + `CLAMAV_PORT` to
+  scan every successful upload against a ClamAV daemon (INSTREAM
+  protocol; no new npm dep). Infected attachments are deleted from S3
+  and the row purged. Unset → no-op. A commented-out `clamav` sidecar
+  block is in `docker-compose.yml`; uncomment + uncomment the
+  `clamav_data` volume to enable.
+- **CI gates**: new `.github/workflows/security.yml` runs on every
+  push / PR — gitleaks (secret scan), `pnpm audit --audit-level high`,
+  server `tsc` + tests, and Semgrep with the OWASP/JS/TS rule packs.
+  Make these required status checks in branch protection when the
+  baseline is clean.
+- **Security smoke script**: `apps/server/scripts/security-smoke.ts`
+  exercises a curated set of security behaviors against a live API
+  (garbage-Bearer rejection, Tiptap depth-bomb 400, clientMessageId
+  charset, push host allowlist, push subscribe IDOR, GDPR tombstone).
+  Run against staging before promoting:
+  ```sh
+  API_BASE_URL=https://staging.example.com \
+    DEV_TENANT_ID=default \
+    pnpm exec tsx scripts/security-smoke.ts
+  ```
+  Each check self-reports ✅/❌; the script exits non-zero on any failure.
+
+## 6. Upgrade checklist
 
 - [ ] Set `REDIS_PASSWORD`, confirm `POSTGRES_PASSWORD` + `CORS_ALLOWED_ORIGINS`.
 - [ ] **Rename** `BETTER_AUTH_URL` → `PUBLIC_URL` in your deploy env
@@ -341,3 +373,9 @@ must update.
       over the numeric hop count.
 - [ ] Update Prometheus scrape config + any monitor parsing `/livez`,
       `/readyz` dependency fields (now `{ status }` only).
+- [ ] Enable the security CI workflow (`.github/workflows/security.yml`)
+      as required status checks once the baseline is clean.
+- [ ] Optional: bring up the ClamAV sidecar and set `CLAMAV_HOST` +
+      `CLAMAV_PORT` if you want per-attachment AV scanning.
+- [ ] Run `scripts/security-smoke.ts` against staging as part of the
+      promote-to-prod gate.

@@ -1,0 +1,84 @@
+# Security CI — runs on every push and PR. Each job is independent so a
+# single failure surfaces the specific class of issue (secret leak vs.
+# dep CVE vs. broken type) rather than collapsing them all into "CI is
+# red". All jobs are non-blocking-by-default (no `required-status-check`
+# wiring in the repo settings yet) — flip them to required once the
+# baseline is clean.
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so gitleaks can scan commits, not just the tree.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  audit:
+    name: pnpm audit (high+critical)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # `--prod` skips dev dependencies; `--audit-level high` exits
+      # non-zero only on high or critical advisories. Tune up to
+      # `moderate` once the baseline is clean.
+      - run: pnpm audit --prod --audit-level high
+
+  typecheck-test:
+    name: typecheck + unit tests (server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @chat-app/server exec prisma generate
+        env:
+          # `prisma generate` doesn't connect; a dummy URL is enough.
+          DATABASE_URL: postgresql://x:x@x:5432/x
+      - run: pnpm --filter @chat-app/server exec tsc --noEmit
+      - run: pnpm --filter @chat-app/server test
+        env:
+          DATABASE_URL: postgresql://x:x@x:5432/x
+
+  semgrep:
+    name: semgrep (SAST)
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      # `p/owasp-top-ten` + `p/javascript` + `p/typescript` is a solid
+      # baseline; tune via .semgrep.yml in the repo if/when noise grows.
+      - run: semgrep ci --config p/owasp-top-ten --config p/javascript --config p/typescript
+        env:
+          SEMGREP_TIMEOUT: "120"

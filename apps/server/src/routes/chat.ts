@@ -24,6 +24,8 @@ import {
   getObjectHead,
 } from "../lib/s3";
 import { bytesMatchContentType } from "../lib/file-signature";
+import { isClamAvConfigured, scanBytesLogged } from "../lib/clamav";
+import { MAX_ATTACHMENT_SIZE } from "../http/schemas";
 import {
   canonicalizeFromJson,
   canonicalizeMentionLabels,
@@ -1147,6 +1149,24 @@ router.post("/conversations/:id/messages", requireAuth, sendMessageLimiter, vali
               declaredContentType: a.contentType,
             });
             continue;
+          }
+
+          // Anti-malware scan via ClamAV INSTREAM (opt-in via env). Only
+          // pulled when configured; otherwise scanBytesLogged returns
+          // {clean:true, skipped:true} and we move on. Full attachment
+          // bytes are scanned (capped by S3 to MAX_ATTACHMENT_SIZE).
+          if (isClamAvConfigured()) {
+            const full = await getObjectHead(key, MAX_ATTACHMENT_SIZE);
+            if (full) {
+              const scan = await scanBytesLogged(full, {
+                attachmentId: a.id,
+                size: a.expectedSize,
+              });
+              if (!scan.clean) {
+                await drop("antivirus hit", { virus: scan.virus });
+                continue;
+              }
+            }
           }
         } catch (err) {
           logger.warn("attachment verification failed", {

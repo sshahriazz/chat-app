@@ -124,6 +124,36 @@ model User {
   @@map("user")
 }
 
+// Append-only audit log for admin (operator) mutations. Captures who
+// did what, from where, when — so a leaked MASTER_API_KEY incident has
+// a forensic trail. Never read on the request path; only written. No
+// FK to Tenant: rows must survive tenant deletion (you need the trail
+// of "tenant X was deleted by Y" exactly when the tenant row is gone).
+model AdminAuditLog {
+  id        String   @id @default(uuid())
+  // Free-form action identifier, e.g. "tenant.create", "tenant.rotateApiKey",
+  // "tenant.rotateJwtSecret". Indexed for `WHERE action = ...` filters.
+  action    String
+  // Subject of the action when applicable (e.g. the tenant id whose key
+  // was rotated). Nullable because not every action has a single subject.
+  tenantId  String?  @map("tenant_id")
+  // TCP peer IP from `req.socket.remoteAddress` (NOT `req.ip` — see
+  // require-master-key.ts for why X-Forwarded-For is unsafe here).
+  actorIp   String?  @map("actor_ip")
+  // Request id (from the requestId middleware) so the audit row can be
+  // correlated with the access logs.
+  requestId String?  @map("request_id")
+  // Structured detail blob (e.g. previous key prefix). Schema-less to
+  // avoid lock-step migrations for every new audited action; readers
+  // should treat it as untrusted JSON.
+  details   Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([action, createdAt])
+  @@index([tenantId, createdAt])
+  @@map("admin_audit_log")
+}
+
 // GDPR-delete tombstones. When a user calls `DELETE /api/users/me`,
 // the (tenantId, externalId) pair is added here with an `expiresAt`
 // of NOW() + 30 days. `requireUserJwt` checks this table and returns

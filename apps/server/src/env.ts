@@ -157,6 +157,12 @@ const EnvSchema = z.object({
   // Redis — used by rate limiter + (future) outbox worker + caches
   REDIS_URL: z.string().min(1).default("redis://localhost:6379"),
 
+  // Optional ClamAV INSTREAM scan target. When BOTH host + port are
+  // set, every attachment is scanned post-upload; infected uploads are
+  // deleted from S3 and the row purged. Leave unset to skip (no-op).
+  CLAMAV_HOST: z.string().optional(),
+  CLAMAV_PORT: z.coerce.number().int().positive().max(65535).optional(),
+
   // CORS allowlist (comma separated). Falls back to dev defaults.
   CORS_ALLOWED_ORIGINS: z.string().optional(),
 
