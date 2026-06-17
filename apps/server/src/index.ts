@@ -41,10 +41,9 @@ const app = express();
 /**
  * CORS allowlist resolution order:
  *   1. `CORS_ALLOWED_ORIGINS` env (comma-separated) — explicit override
- *   2. `publicUrl` — the app's public URL (PUBLIC_URL, or legacy
- *      BETTER_AUTH_URL). Must be the browser's origin since everything
- *      is same-origin behind the Next.js proxy. Falling back to it
- *      means "I set the public URL, origins Just Work".
+ *   2. `publicUrl` — the app's `PUBLIC_URL`. Must be the browser's
+ *      origin since everything is same-origin behind the Next.js proxy.
+ *      Falling back to it means "I set the public URL, origins Just Work".
  *   3. Dev fallback
  *
  * env.ts already hard-fails at boot if CORS_ALLOWED_ORIGINS is unset

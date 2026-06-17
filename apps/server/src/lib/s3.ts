@@ -1,11 +1,11 @@
 import {
   S3Client,
-  PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
   HeadObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 import { env } from "../env";
 
 /**
@@ -110,7 +110,10 @@ function getPresignClient(): S3Client {
 }
 
 export interface UploadUrlResult {
-  uploadUrl: string;
+  /** Form POST target. The client builds a multipart/form-data body
+   *  from `fields` (in order) followed by the `file` field last. */
+  url: string;
+  fields: Record<string, string>;
   publicUrl: string;
   key: string;
   expiresIn: number;
@@ -129,16 +132,27 @@ export async function createUploadUrl(params: {
   // extension, proxy log).
   const expiresIn = params.expiresIn ?? 90;
 
-  const cmd = new PutObjectCommand({
+  // Presigned POST (not PUT): the POST policy enforces both the exact
+  // content-type AND a content-length-range AT THE S3 LAYER — so even a
+  // non-strict backend (older MinIO) cannot accept bytes larger than the
+  // declared size or a different MIME. This is authoritative, unlike a
+  // presigned PUT where ContentLength is only advisory. The post-upload
+  // magic-byte sniff still runs as defense-in-depth.
+  const { url, fields } = await createPresignedPost(getPresignClient(), {
     Bucket: cfg.bucket,
     Key: params.key,
-    ContentType: params.contentType,
-    ContentLength: params.contentLength,
+    Conditions: [
+      ["content-length-range", 1, params.contentLength],
+      ["eq", "$Content-Type", params.contentType],
+    ],
+    Fields: {
+      "Content-Type": params.contentType,
+    },
+    Expires: expiresIn,
   });
 
-  const uploadUrl = await getSignedUrl(getPresignClient(), cmd, { expiresIn });
   const publicUrl = `${cfg.publicUrlBase}/${params.key}`;
-  return { uploadUrl, publicUrl, key: params.key, expiresIn };
+  return { url, fields, publicUrl, key: params.key, expiresIn };
 }
 
 /**

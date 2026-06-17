@@ -9,6 +9,7 @@ import {
   keyFromPublicUrl,
 } from "../lib/s3";
 import { extForContentType, isInlineSafeContentType } from "../lib/file-signature";
+import { acquireTenantLock } from "../lib/dm-lock";
 import { generalLimiter, uploadUrlLimiter } from "../middleware/rate-limit";
 import { validate } from "../http/validate";
 import { UploadUrlBodySchema } from "../http/schemas";
@@ -100,28 +101,14 @@ router.post(
     const attWidth = width ?? null;
     const attHeight = height ?? null;
 
-    // Per-user quota. Sums the uploader's existing attachments; rejects if
-    // this upload would push them over the cap. Racy under extreme
-    // concurrency (two parallel presigns can both pass), but the window is
-    // small and the worst case is a user ending up slightly over quota —
-    // acceptable while we don't need strict accounting.
-    const used = await prisma.attachment.aggregate({
-      where: { tenantId, uploaderId: user.id },
-      _sum: { size: true },
-    });
-    const usedBytes = used._sum.size ?? 0;
-    if (usedBytes + size > PER_USER_QUOTA_BYTES) {
-      throw new PayloadTooLargeError(
-        `storage quota exceeded (used ${usedBytes} / ${PER_USER_QUOTA_BYTES} bytes)`,
-      );
-    }
-
     // Derive the extension from the DECLARED MIME, never from the user's
     // filename — the filename can carry double extensions / RTL overrides
     // that a naive `path.extname` would propagate into the key.
     const ext = extForContentType(contentType);
     const key = `${user.id}/${crypto.randomUUID()}${ext}`;
 
+    // Mint the presign first (no DB state). The row insert below reserves
+    // the quota; the presigned POST policy bounds the actual upload size.
     const signed = await createUploadUrl({
       userId: user.id,
       key,
@@ -129,23 +116,63 @@ router.post(
       contentLength: size,
     });
 
-    const attachment = await prisma.attachment.create({
-      data: {
-        tenantId,
-        uploaderId: user.id,
-        url: signed.publicUrl,
-        objectKey: key,
-        contentType,
-        filename,
-        size,
-        width: attWidth,
-        height: attHeight,
-      },
+    // Atomic quota enforcement. A per-tenant advisory lock serializes
+    // concurrent presigns within the tenant so the sum-then-insert can't
+    // race — without it, N parallel uploads each read the old sum, all
+    // pass the check, and the cap is blown by up to N×maxFile. Both the
+    // per-user cap and the optional per-tenant cap are checked here.
+    const attachment = await prisma.$transaction(async (tx) => {
+      await acquireTenantLock(tx, tenantId, "attach-quota");
+
+      const userAgg = await tx.attachment.aggregate({
+        where: { tenantId, uploaderId: user.id },
+        _sum: { size: true },
+      });
+      const userUsed = userAgg._sum.size ?? 0;
+      if (userUsed + size > PER_USER_QUOTA_BYTES) {
+        throw new PayloadTooLargeError(
+          `per-user storage quota exceeded (used ${userUsed} / ${PER_USER_QUOTA_BYTES} bytes)`,
+        );
+      }
+
+      const tenantRow = await tx.tenant.findUnique({
+        where: { id: tenantId },
+        select: { storageQuotaBytes: true },
+      });
+      const tenantQuota = tenantRow?.storageQuotaBytes ?? null;
+      if (tenantQuota !== null) {
+        const tenantAgg = await tx.attachment.aggregate({
+          where: { tenantId },
+          _sum: { size: true },
+        });
+        const tenantUsed = tenantAgg._sum.size ?? 0;
+        if (BigInt(tenantUsed) + BigInt(size) > tenantQuota) {
+          throw new PayloadTooLargeError(
+            `tenant storage quota exceeded (used ${tenantUsed} / ${tenantQuota} bytes)`,
+          );
+        }
+      }
+
+      return tx.attachment.create({
+        data: {
+          tenantId,
+          uploaderId: user.id,
+          url: signed.publicUrl,
+          objectKey: key,
+          contentType,
+          filename,
+          size,
+          width: attWidth,
+          height: attHeight,
+        },
+      });
     });
 
     res.status(201).json({
       attachmentId: attachment.id,
-      uploadUrl: signed.uploadUrl,
+      // Presigned POST: client must POST multipart/form-data to `url`
+      // with these `fields` first, then the `file` field last.
+      upload: { url: signed.url, fields: signed.fields },
       publicUrl: signed.publicUrl,
       expiresIn: signed.expiresIn,
     });

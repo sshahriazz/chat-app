@@ -1,4 +1,4 @@
-# Breaking Changes — Security Hardening (Phases 1–6)
+# Breaking Changes — Security Hardening (Phases 1–6, +3.2/3.8/3.9, +6.19)
 
 This release hardens the chat server (`apps/server`) following a security
 review. Several changes alter the API/deploy contract. Read this before
@@ -39,11 +39,13 @@ DSNs (previously fell back to `chatapp`). Make sure it is set.
   storing tenant secrets in plaintext); now it aborts startup.
 
 ### 1.4 Database migrations (run before/with deploy)
-Two new migrations must be applied (`prisma migrate deploy` runs them):
+Three new migrations must be applied (`prisma migrate deploy` runs them):
 - `20260519100000_tokens_valid_after_and_deleted_externals`
   — `User.tokensValidAfter`, new `DeletedExternalId` table.
 - `20260520100000_attachment_object_key`
   — `Attachment.objectKey`.
+- `20260522100000_tenant_storage_quota`
+  — `Tenant.storageQuotaBytes` (nullable; null = no tenant-level cap).
 
 ### 1.5 Object storage is now PRIVATE
 - The MinIO bucket is no longer anonymously readable
@@ -62,7 +64,22 @@ Two new migrations must be applied (`prisma migrate deploy` runs them):
 - The Redis engine address is injected with credentials via
   `CENTRIFUGO_ENGINE_REDIS_ADDRESS`.
 
-### 1.7 Secrets hygiene
+### 1.7 `BETTER_AUTH_URL` env var removed  ⚠️ breaking
+The legacy `BETTER_AUTH_URL` alias for `PUBLIC_URL` has been removed
+from the server (`env.ts`) and the Centrifugo `CENTRIFUGO_CLIENT_ALLOWED_ORIGINS`
+fallback chain. Set `PUBLIC_URL` explicitly. A deploy that previously
+provided only `BETTER_AUTH_URL` will now fail to boot in production with
+`[env] PUBLIC_URL is required in production.`
+
+### 1.8 Per-tenant attachment quota (optional)
+A new `Tenant.storageQuotaBytes` column (nullable bigint) caps the
+aggregate attachment storage for a tenant. NULL = no tenant-level cap
+(the per-user cap still applies). Set it via DB / your admin tooling
+when you need it. Quota enforcement is now atomic across both per-user
+and per-tenant caps under a per-tenant advisory lock — concurrent
+presigns can no longer race past the limit.
+
+### 1.9 Secrets hygiene
 `.env.example` no longer ships real-looking secrets — every secret slot is
 a `__REPLACE_WITH__…__` placeholder. **Rotate any secret that previously
 matched the committed example values** (Centrifugo token/api/admin, VAPID
@@ -228,6 +245,45 @@ were synthesizing cursors yourself (don't).
 - Search query `q` has its LIKE wildcards (`%`, `_`) escaped server-side
   — they now match literally instead of acting as wildcards.
 
+### 3.6 Upload flow: presigned POST, not PUT  ⚠️ breaking
+The upload-url endpoint now returns a **presigned POST policy** instead
+of a presigned PUT URL. The S3 POST policy enforces both the exact
+`Content-Type` and a `content-length-range` cap at the S3 layer, so a
+non-strict backend can no longer accept oversized or mismatched bytes.
+
+**Response shape change** (`POST /api/attachments/upload-url`):
+```diff
+  {
+    "attachmentId": "...",
+-   "uploadUrl":   "https://…/<key>?X-Amz-Signature=…",
++   "upload": {
++     "url":    "https://…/<bucket>/",
++     "fields": { "key": "...", "Content-Type": "...", "Policy": "...",
++                 "X-Amz-Algorithm": "...", "X-Amz-Credential": "...",
++                 "X-Amz-Date": "...", "X-Amz-Signature": "..." }
++   },
+    "publicUrl":   "...",
+    "expiresIn":   90
+  }
+```
+
+**Client flow change**: build a `FormData` from `upload.fields` (in any
+order) and append the `file` field **last** (S3 requires it), then POST
+multipart/form-data to `upload.url`. Do not set `Content-Type` manually
+— the browser sets the multipart boundary.
+
+```ts
+const form = new FormData();
+for (const [k, v] of Object.entries(res.upload.fields)) form.append(k, v);
+form.append("file", file);
+await fetch(res.upload.url, { method: "POST", body: form });
+```
+
+The reference web client implements this in
+[`apps/web/src/lib/upload.ts`](apps/web/src/lib/upload.ts). Custom
+clients that previously did `fetch(uploadUrl, { method: "PUT", body: file })`
+must update.
+
 ---
 
 ## 4. 🛠 Operator — headers, transport & infra (Phase 6)
@@ -265,15 +321,21 @@ were synthesizing cursors yourself (don't).
 ## 5. Upgrade checklist
 
 - [ ] Set `REDIS_PASSWORD`, confirm `POSTGRES_PASSWORD` + `CORS_ALLOWED_ORIGINS`.
+- [ ] **Rename** `BETTER_AUTH_URL` → `PUBLIC_URL` in your deploy env
+      (the legacy alias is gone; boot fails in prod without it).
 - [ ] Remove any `localhost`/non-https origin from the prod `CORS_ALLOWED_ORIGINS` (boot now rejects them).
 - [ ] Rotate any secret that matched the old `.env.example`.
-- [ ] Run DB migrations (`prisma migrate deploy`).
+- [ ] Run DB migrations (`prisma migrate deploy`) — includes the new
+      `Tenant.storageQuotaBytes` column. Set per-tenant caps via your
+      admin tooling if you want a tenant-level limit (NULL = unlimited).
 - [ ] Make the bucket private; confirm `Attachment.objectKey` backfill plan.
 - [ ] Tenants: add `aud: "chat-app"`, keep token TTL ≤ 1h, send http(s)
       `image` URLs, ship the webhook HMAC signer (or set
       `WEBHOOK_SIGNATURE_REQUIRED=false` temporarily).
 - [ ] Clients: switch attachment rendering/downloads to the `/view` and
-      `/download` JSON endpoints; ensure `clientMessageId` is url-safe.
+      `/download` JSON endpoints; switch the upload flow from presigned
+      PUT to presigned POST (FormData with `upload.fields` + `file`
+      last); ensure `clientMessageId` is url-safe.
 - [ ] Verify Centrifugo admin is disabled / internal-only.
 - [ ] Set `METRICS_TOKEN` (or firewall `/metrics`); prefer `TRUST_PROXY_CIDRS`
       over the numeric hop count.

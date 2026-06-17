@@ -3,7 +3,7 @@ import type { Attachment } from "./types";
 
 interface PresignResponse {
   attachmentId: string;
-  uploadUrl: string;
+  upload: { url: string; fields: Record<string, string> };
   publicUrl: string;
   expiresIn: number;
 }
@@ -59,11 +59,22 @@ export async function uploadFile(file: File): Promise<Attachment> {
     },
   );
 
-  const res = await fetch(presign.uploadUrl, {
-    method: "PUT",
-    headers: { "Content-Type": contentType },
-    body: file,
+  // Presigned POST: build multipart/form-data from the server-provided
+  // policy fields, then append the file LAST (S3 requires `file` to be
+  // the final field). Do NOT set Content-Type manually — the browser
+  // sets the multipart boundary. The "Content-Type" form field (from
+  // `fields`) is what S3 stores + enforces against the signed policy.
+  const form = new FormData();
+  for (const [k, v] of Object.entries(presign.upload.fields)) {
+    form.append(k, v);
+  }
+  form.append("file", file);
+
+  const res = await fetch(presign.upload.url, {
+    method: "POST",
+    body: form,
   });
+  // S3 returns 204 (or 201 if success_action_status set) on success.
   if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
 
   return {

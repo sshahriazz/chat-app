@@ -49,6 +49,10 @@ model Tenant {
   // resolve via the full-scan fallback in findTenantByApiKey.
   apiKeyPrefix String?  @map("api_key_prefix")
   jwtSecret    String   @map("jwt_secret")
+  // Optional aggregate attachment-storage cap for the whole tenant
+  // (bytes). NULL = no tenant-level cap (per-user cap still applies).
+  // Enforced atomically at presign time under an advisory lock.
+  storageQuotaBytes BigInt? @map("storage_quota_bytes")
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 

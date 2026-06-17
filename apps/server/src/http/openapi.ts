@@ -190,7 +190,12 @@ const messageWithRelationsSchema = MessageModelSchema.pick({
 const uploadUrlResponseSchema = z
   .object({
     attachmentId: z.string(),
-    uploadUrl: z.string().url(),
+    // Presigned POST: form target + policy fields. Client POSTs
+    // multipart/form-data (fields first, `file` last) to `url`.
+    upload: z.object({
+      url: z.string().url(),
+      fields: z.record(z.string(), z.string()),
+    }),
     publicUrl: z.string().url(),
     expiresIn: z.number().int().positive(),
   })

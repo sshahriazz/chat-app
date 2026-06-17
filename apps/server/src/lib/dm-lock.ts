@@ -41,3 +41,19 @@ export async function acquireDmLock(
   // statement we only call for its side effect.
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}::text, 0))`;
 }
+
+/**
+ * Per-tenant transaction-scoped advisory lock. Serializes operations
+ * that must read-then-write a tenant-wide aggregate consistently — e.g.
+ * the attachment storage-quota check (sum existing bytes, then insert),
+ * which would otherwise let concurrent presigns each pass the check and
+ * blow past the cap. Released automatically on commit/rollback.
+ */
+export async function acquireTenantLock(
+  tx: Prisma.TransactionClient,
+  tenantId: string,
+  scope: string,
+): Promise<void> {
+  const key = `${scope}:${tenantId}`;
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}::text, 0))`;
+}

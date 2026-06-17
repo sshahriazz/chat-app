@@ -21,11 +21,9 @@ const EnvSchema = z.object({
   // Core infra (required)
   DATABASE_URL: z.string().min(1),
   // Public base URL of the deployed app (used for OpenAPI server
-  // listing + absolute-URL links). Previously named BETTER_AUTH_URL;
-  // kept under that name for backwards-compat with existing deploys
-  // via an alias below.
+  // listing + absolute-URL links). The legacy `BETTER_AUTH_URL` alias
+  // has been removed — set PUBLIC_URL explicitly.
   PUBLIC_URL: z.string().url().optional(),
-  BETTER_AUTH_URL: z.string().url().optional(),
   // Overrides the server URL shown in the OpenAPI document (and used
   // as the base for Scalar's "Try it" buttons). Set per-deployment to
   // match however the API is publicly reached:
@@ -193,16 +191,14 @@ export const isProduction = env.NODE_ENV === "production";
 export const isTest = env.NODE_ENV === "test";
 
 /**
- * Resolved public base URL. Prefers `PUBLIC_URL`, falls back to
- * `BETTER_AUTH_URL` for deploys that haven't renamed their env var yet.
+ * Resolved public base URL. The legacy `BETTER_AUTH_URL` alias has been
+ * dropped — deploys that previously set only that var must set
+ * `PUBLIC_URL` instead.
  */
-export const publicUrl: string | undefined =
-  env.PUBLIC_URL ?? env.BETTER_AUTH_URL;
+export const publicUrl: string | undefined = env.PUBLIC_URL;
 
 if (isProduction && !publicUrl) {
-  console.error(
-    "[env] PUBLIC_URL (or BETTER_AUTH_URL) is required in production.",
-  );
+  console.error("[env] PUBLIC_URL is required in production.");
   process.exit(1);
 }
 
