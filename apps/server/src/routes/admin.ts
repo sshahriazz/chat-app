@@ -3,6 +3,7 @@ import { validate } from "../http/validate";
 import { CreateTenantBodySchema } from "../http/schemas";
 import { requireMasterKey } from "../middleware/require-master-key";
 import { createTenant, rotateApiKey, rotateJwtSecret } from "../lib/tenant";
+import { writeAdminAudit } from "../lib/admin-audit";
 import { NotFoundError } from "../http/errors";
 import { prisma } from "../db";
 
@@ -27,6 +28,11 @@ router.post(
     const tenant = await createTenant(name);
     // apiKey + jwtSecret are surfaced HERE and nowhere else. Caller
     // MUST persist both; re-rotation is the only recovery path.
+    await writeAdminAudit(req, {
+      action: "tenant.create",
+      tenantId: tenant.id,
+      details: { name },
+    });
     res.status(201).json(tenant);
   },
 );
@@ -43,9 +49,20 @@ router.get("/tenants", async (_req, res) => {
 // POST /api/admin/tenants/:id/api-keys — rotate API key
 router.post("/tenants/:id/api-keys", async (req, res) => {
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-  const tenant = await prisma.tenant.findUnique({ where: { id } });
+  const tenant = await prisma.tenant.findUnique({
+    where: { id },
+    select: { id: true, apiKeyPrefix: true },
+  });
   if (!tenant) throw new NotFoundError("Tenant not found");
   const apiKey = await rotateApiKey(id);
+  await writeAdminAudit(req, {
+    action: "tenant.rotateApiKey",
+    tenantId: id,
+    // Record the previous key prefix only — never the raw key, even at
+    // the moment of rotation. The new key is returned to the caller and
+    // never reaches the audit log.
+    details: { previousApiKeyPrefix: tenant.apiKeyPrefix ?? null },
+  });
   res.status(200).json({ apiKey, rotatedAt: new Date().toISOString() });
 });
 
@@ -55,6 +72,13 @@ router.post("/tenants/:id/jwt-secret/rotate", async (req, res) => {
   const tenant = await prisma.tenant.findUnique({ where: { id } });
   if (!tenant) throw new NotFoundError("Tenant not found");
   const jwtSecret = await rotateJwtSecret(id);
+  await writeAdminAudit(req, {
+    action: "tenant.rotateJwtSecret",
+    tenantId: id,
+    // No previous-secret data captured — the secret never reaches the
+    // audit log, even hashed. Rotation alone is the audited event.
+    details: {},
+  });
   res.status(200).json({ jwtSecret, rotatedAt: new Date().toISOString() });
 });
 

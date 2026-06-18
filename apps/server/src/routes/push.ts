@@ -7,7 +7,7 @@ import {
   PushSubscribeBodySchema,
   PushUnsubscribeBodySchema,
 } from "../http/schemas";
-import { ServiceUnavailableError } from "../http/errors";
+import { ConflictError, ServiceUnavailableError } from "../http/errors";
 
 const router: Router = Router();
 
@@ -26,9 +26,12 @@ router.get("/vapid-public-key", requireAuth, (_req, res) => {
 });
 
 // POST /api/push/subscribe
-// Upserts on endpoint (unique) so the same browser re-subscribing doesn't
-// leave stale rows. Also rebinds an endpoint to a different user if that
-// browser signs in as someone else.
+// Inserts (or refreshes keys for) a push subscription owned by the
+// authenticated user. We do NOT silently rebind endpoints across
+// users: if `endpoint` already belongs to a different user we reject
+// with 409. Reusing an endpoint owned by someone else would let an
+// attacker who learned another user's endpoint (via leaked logs,
+// device sharing, etc.) hijack push delivery.
 router.post(
   "/subscribe",
   requireAuth,
@@ -45,6 +48,14 @@ router.post(
       keys: { p256dh: string; auth: string };
     };
 
+    const existing = await prisma.pushSubscription.findUnique({
+      where: { endpoint: body.endpoint },
+      select: { userId: true, tenantId: true },
+    });
+    if (existing && (existing.userId !== user.id || existing.tenantId !== tenantId)) {
+      throw new ConflictError("Push endpoint already registered to another user");
+    }
+
     await prisma.pushSubscription.upsert({
       where: { endpoint: body.endpoint },
       create: {
@@ -55,8 +66,8 @@ router.post(
         auth: body.keys.auth,
       },
       update: {
-        tenantId,
-        userId: user.id,
+        // Only the keys can change — userId/tenantId are pinned via the
+        // ownership check above and intentionally not in this update.
         p256dh: body.keys.p256dh,
         auth: body.keys.auth,
       },
@@ -67,15 +78,18 @@ router.post(
 );
 
 // POST /api/push/unsubscribe
+// Scoped to the authenticated user — without userId, any tenant
+// member who learned another user's endpoint could silently
+// unsubscribe them (denial of notifications).
 router.post(
   "/unsubscribe",
   requireAuth,
   validate({ body: PushUnsubscribeBodySchema }),
   async (req, res) => {
-    const { tenantId } = req as AuthenticatedRequest;
+    const { user, tenantId } = req as AuthenticatedRequest;
     const { endpoint } = req.body as { endpoint: string };
     await prisma.pushSubscription
-      .deleteMany({ where: { tenantId, endpoint } })
+      .deleteMany({ where: { tenantId, userId: user.id, endpoint } })
       .catch(() => {});
     res.json({ ok: true });
   },

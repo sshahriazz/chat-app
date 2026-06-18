@@ -45,6 +45,10 @@ export interface MaterializedUser {
   image: string | null;
   email: string | null;
   scope: string | null;
+  /** Token revocation horizon. JWTs whose `iat` predates this are
+   *  refused even if the signature is otherwise valid. Bumped by
+   *  GDPR-delete + explicit revoke endpoint. */
+  tokensValidAfter: Date | null;
 }
 
 /**
@@ -121,6 +125,7 @@ export async function upsertFederatedUser(
     select: {
       id: true, tenantId: true, externalId: true,
       name: true, image: true, email: true, scope: true,
+      tokensValidAfter: true,
     },
   });
 
@@ -147,6 +152,7 @@ export async function upsertFederatedUser(
         image: existing.image ?? null,
         email: existing.email ?? null,
         scope: existing.scope ?? null,
+        tokensValidAfter: existing.tokensValidAfter ?? null,
       };
     } else {
       const updated = await prisma.user.update({
@@ -161,6 +167,7 @@ export async function upsertFederatedUser(
         select: {
           id: true, tenantId: true, externalId: true,
           name: true, image: true, email: true, scope: true,
+          tokensValidAfter: true,
         },
       });
       await invalidateUserProfile(updated.id);
@@ -172,6 +179,7 @@ export async function upsertFederatedUser(
         image: updated.image ?? null,
         email: updated.email ?? null,
         scope: updated.scope ?? null,
+        tokensValidAfter: updated.tokensValidAfter ?? null,
       };
     }
     await cacheSet<CachedFederatedUser>(
@@ -209,6 +217,7 @@ export async function upsertFederatedUser(
     select: {
       id: true, tenantId: true, externalId: true,
       name: true, image: true, email: true, scope: true,
+      tokensValidAfter: true,
     },
   });
   const result: MaterializedUser = {
@@ -219,6 +228,7 @@ export async function upsertFederatedUser(
     image: row.image ?? null,
     email: row.email ?? null,
     scope: row.scope ?? null,
+    tokensValidAfter: row.tokensValidAfter ?? null,
   };
   await cacheSet<CachedFederatedUser>(
     CACHE_NS.fedUser,

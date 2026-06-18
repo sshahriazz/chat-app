@@ -1,11 +1,11 @@
 import {
   S3Client,
-  PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
   HeadObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 import { env } from "../env";
 
 /**
@@ -110,7 +110,10 @@ function getPresignClient(): S3Client {
 }
 
 export interface UploadUrlResult {
-  uploadUrl: string;
+  /** Form POST target. The client builds a multipart/form-data body
+   *  from `fields` (in order) followed by the `file` field last. */
+  url: string;
+  fields: Record<string, string>;
   publicUrl: string;
   key: string;
   expiresIn: number;
@@ -124,32 +127,56 @@ export async function createUploadUrl(params: {
   expiresIn?: number;
 }): Promise<UploadUrlResult> {
   const cfg = requireS3Config();
-  const expiresIn = params.expiresIn ?? 5 * 60; // 5 min
+  // 90s is plenty for a one-shot upload and bounds the replay window
+  // if the signed URL leaks (Referer to a third-party image, browser
+  // extension, proxy log).
+  const expiresIn = params.expiresIn ?? 90;
 
-  const cmd = new PutObjectCommand({
+  // Presigned POST (not PUT): the POST policy enforces both the exact
+  // content-type AND a content-length-range AT THE S3 LAYER — so even a
+  // non-strict backend (older MinIO) cannot accept bytes larger than the
+  // declared size or a different MIME. This is authoritative, unlike a
+  // presigned PUT where ContentLength is only advisory. The post-upload
+  // magic-byte sniff still runs as defense-in-depth.
+  const { url, fields } = await createPresignedPost(getPresignClient(), {
     Bucket: cfg.bucket,
     Key: params.key,
-    ContentType: params.contentType,
-    ContentLength: params.contentLength,
+    Conditions: [
+      ["content-length-range", 1, params.contentLength],
+      ["eq", "$Content-Type", params.contentType],
+    ],
+    Fields: {
+      "Content-Type": params.contentType,
+    },
+    Expires: expiresIn,
   });
 
-  const uploadUrl = await getSignedUrl(getPresignClient(), cmd, { expiresIn });
   const publicUrl = `${cfg.publicUrlBase}/${params.key}`;
-  return { uploadUrl, publicUrl, key: params.key, expiresIn };
+  return { url, fields, publicUrl, key: params.key, expiresIn };
 }
 
 /**
  * Signed GET URL that forces the browser to download rather than render.
- * `ResponseContentDisposition` is applied per-request so the same object
- * still serves inline for <img>/<video> on the unsigned public URL.
+ * The bucket is private (no anonymous read) — every read goes through a
+ * server-minted, membership-checked signed URL.
+ *
+ * We pin the response Content-Type to the value the caller passes (the
+ * stored MIME) and add `X-Content-Type-Options: nosniff` so a polyglot
+ * file declared as `image/png` can never be re-interpreted as HTML by
+ * the browser. `Content-Disposition: attachment` forces a download for
+ * any risky type.
  */
 export async function createDownloadUrl(params: {
   key: string;
   filename: string;
+  contentType?: string;
   expiresIn?: number;
 }): Promise<{ url: string; expiresIn: number }> {
   const cfg = requireS3Config();
-  const expiresIn = params.expiresIn ?? 60; // 1 min
+  // 120s: the client fetches this JSON, then navigates to the URL to
+  // download. Generous enough for click-to-fetch latency, short enough
+  // to bound leakage if the URL escapes (Referer, history, logs).
+  const expiresIn = params.expiresIn ?? 120;
 
   // RFC 5987 encoding so non-ASCII filenames survive.
   const encoded = encodeURIComponent(params.filename);
@@ -158,6 +185,46 @@ export async function createDownloadUrl(params: {
   const cmd = new GetObjectCommand({
     Bucket: cfg.bucket,
     Key: params.key,
+    ResponseContentDisposition: disposition,
+    ...(params.contentType ? { ResponseContentType: params.contentType } : {}),
+  });
+
+  const url = await getSignedUrl(getPresignClient(), cmd, { expiresIn });
+  return { url, expiresIn };
+}
+
+/**
+ * Signed GET URL for INLINE rendering (<img>/<video>/<audio>). Used by
+ * `/api/attachments/:id/view` after the caller's conversation
+ * membership has been verified. The response Content-Type is pinned to
+ * the stored MIME and `Content-Disposition: inline` is set explicitly.
+ *
+ * SAFETY: callers must only ever pass this through for content types
+ * that are safe to render inline (image/video/audio). HTML / SVG /
+ * XML must NOT reach this path — the route enforces that, and the
+ * upload allowlist already excludes them.
+ *
+ * 300s TTL: the client fetches this JSON then sets it as an <img>/
+ * <video> src; the URL only needs to stay valid long enough for the
+ * browser to load the bytes (which it then caches). Generous for slow
+ * mobile connections / large media; still bounded for leak exposure.
+ */
+export async function createViewUrl(params: {
+  key: string;
+  filename: string;
+  contentType: string;
+  expiresIn?: number;
+}): Promise<{ url: string; expiresIn: number }> {
+  const cfg = requireS3Config();
+  const expiresIn = params.expiresIn ?? 300;
+
+  const encoded = encodeURIComponent(params.filename);
+  const disposition = `inline; filename*=UTF-8''${encoded}`;
+
+  const cmd = new GetObjectCommand({
+    Bucket: cfg.bucket,
+    Key: params.key,
+    ResponseContentType: params.contentType,
     ResponseContentDisposition: disposition,
   });
 
@@ -194,12 +261,61 @@ export async function headObjectSize(key: string): Promise<number | null> {
 }
 
 /**
+ * Fetch the first `length` bytes of an object via a ranged GET. Used by
+ * the post-upload verification flow to magic-byte-sniff the stored
+ * content against the declared MIME. Returns null if the object is
+ * missing. Reads at most `length` bytes regardless of object size.
+ */
+export async function getObjectHead(
+  key: string,
+  length = 64,
+): Promise<Buffer | null> {
+  const cfg = requireS3Config();
+  try {
+    const res = await getInternalClient().send(
+      new GetObjectCommand({
+        Bucket: cfg.bucket,
+        Key: key,
+        Range: `bytes=0-${length - 1}`,
+      }),
+    );
+    const body = res.Body as unknown as AsyncIterable<Uint8Array> | undefined;
+    if (!body) return null;
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for await (const chunk of body) {
+      chunks.push(chunk);
+      total += chunk.length;
+      if (total >= length) break;
+    }
+    return Buffer.concat(chunks).subarray(0, length);
+  } catch (err: unknown) {
+    const status =
+      (err as { $metadata?: { httpStatusCode?: number } })?.$metadata
+        ?.httpStatusCode ?? 0;
+    if (status === 404 || status === 416) return null;
+    throw err;
+  }
+}
+
+/**
  * Recovers the bucket key from the public URL we stored at upload time.
  * Relies on S3_PUBLIC_URL_BASE pointing at the bucket origin.
+ *
+ * Prefer the persisted `Attachment.objectKey` column — this helper is
+ * the legacy fallback for rows created before that column existed. It
+ * fails closed: returns null on any prefix mismatch or traversal-shaped
+ * residue so the caller can refuse rather than operate on a guessed key.
  */
 export function keyFromPublicUrl(publicUrl: string): string | null {
   const base = env.S3_PUBLIC_URL_BASE?.replace(/\/$/, "");
   if (!base) return null;
   if (!publicUrl.startsWith(base + "/")) return null;
-  return publicUrl.slice(base.length + 1);
+  const key = publicUrl.slice(base.length + 1);
+  // Defense-in-depth: reject anything that doesn't look like our
+  // `<uuid-ish>/<uuid><ext>` key shape, and any path-traversal residue.
+  if (key.includes("..") || key.includes("//") || key.startsWith("/")) {
+    return null;
+  }
+  return key;
 }

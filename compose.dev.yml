@@ -25,16 +25,25 @@ services:
       args:
         NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
         NEXT_PUBLIC_CENTRIFUGO_URL: ws://localhost:8000/connection/websocket
+    # Prod docker-compose.yml dropped the host port binding (Traefik
+    # handles ingress). Restore it for local dev so the browser can
+    # reach the UI. Override `WEB_PORT` in `.env` if 3000 is taken.
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
 
   postgres:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatapp}
+    # All dev port bindings are pinned to 127.0.0.1 so backing services
+    # (Postgres, Redis, MinIO, Centrifugo admin) are reachable only from
+    # the developer's machine — never from the LAN / public Wi-Fi the
+    # laptop happens to be on.
     ports:
-      - "${POSTGRES_HOST_PORT:-5433}:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
 
   redis:
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
 
   centrifugo:
     environment:
@@ -43,18 +52,18 @@ services:
       CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:-admin}
       CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:-dev-admin-secret}
     ports:
-      - "${CENTRIFUGO_HOST_PORT:-8000}:8000"
+      - "127.0.0.1:${CENTRIFUGO_HOST_PORT:-8000}:8000"
 
   minio:
     environment:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-chatapp-dev-only}
     ports:
-      - "${MINIO_HOST_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+      - "127.0.0.1:${MINIO_HOST_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
 
   server:
     ports:
-      - "${SERVER_HOST_PORT:-3001}:3001"
+      - "127.0.0.1:${SERVER_HOST_PORT:-3001}:3001"
     environment:
       # Fallbacks for the vars `docker-compose.yml` now marks
       # `${VAR:?required}`. Without these, `make dev` would refuse to
@@ -64,11 +73,15 @@ services:
       CENTRIFUGO_API_KEY: ${CENTRIFUGO_API_KEY:-dev-api-key}
       CENTRIFUGO_TOKEN_SECRET: ${CENTRIFUGO_TOKEN_SECRET:-dev-secret-change-in-production}
 
-      # Loud-failure overrides relaxed for the laptop. Mirror these in
-      # Dokploy's panel for prod (they're already strict there).
-      MASTER_API_KEY: ${MASTER_API_KEY:-dev-master-key-laptop-only}
-      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-true}
-      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-default,demo_acme,demo_beta}
+      # MASTER_API_KEY override removed: the prod compose's
+      # `${MASTER_API_KEY:-}` already injects an empty string when
+      # unset, which the server schema preprocesses back to undefined.
+      # An empty key disables both `/api/admin/*` and the master-key
+      # gate on `/api/dev/*`, so the persona picker works without auth.
+      # To EXERCISE the gate locally, set MASTER_API_KEY in .env to a
+      # value satisfying the ≥43-char base64url + ≥16-unique check.
+      # Webhooks: signature default ON in prod; off locally so you can
+      # curl /api/webhooks/* without computing an HMAC.
       WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-false}
 
       # Dev URLs that differ from prod. In prod the API + storage live

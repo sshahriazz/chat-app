@@ -46,6 +46,14 @@ EXPOSE 3001
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
   CMD wget -q --spider http://localhost:3001/livez || exit 1
 
+# Run as the unprivileged built-in `node` user (uid 1000) rather than
+# root. Chown /app to node:node first — Prisma 7's runtime touches its
+# engine inside node_modules/@prisma/engines/, so a fully root-owned
+# tree fails `prisma migrate deploy`. We don't restrict write access in
+# the runtime image beyond the user boundary anyway.
+RUN chown -R node:node /app
+USER node
+
 WORKDIR /app/apps/server
 
 # Migrations run as a ONE-SHOT step before rolling deploys, not on every

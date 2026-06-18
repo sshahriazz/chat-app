@@ -29,9 +29,22 @@ networks:
   dokploy-network:
     external: true
 
+# Shared container hardening, merged into each service via `<<: *hardened`.
+# - no-new-privileges blocks setuid/setgid privilege escalation.
+# - cap_drop ALL removes every Linux capability; services that genuinely
+#   need one (postgres' initdb) add it back with cap_add.
+x-hardened: &hardened
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
 services:
   # ─── Postgres (INTERNAL) ─────────────────────────────────────
   postgres:
+    <<: *hardened
+    # initdb / the entrypoint's privilege-drop need these back.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     image: postgres:17-alpine
     restart: unless-stopped
     networks: [dokploy-network]
@@ -53,20 +66,33 @@ services:
 
   # ─── Redis (INTERNAL) ────────────────────────────────────────
   redis:
+    <<: *hardened
+    # Same caps as postgres: the entrypoint chowns /data and re-execs
+    # as the unprivileged `redis` user, which needs CHOWN + SETUID +
+    # SETGID + DAC_OVERRIDE + FOWNER. With cap_drop:[ALL] alone, the
+    # container fails to write its AOF dir (`appendonlydir`).
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     image: redis:8-alpine
     restart: unless-stopped
     networks: [dokploy-network]
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    # `--requirepass` mandatory in prod. Defense-in-depth against
+    # lateral-movement: every container in dokploy-network can reach
+    # redis:6379, and Redis caches unwrapped tenant secrets — a
+    # compromised sidecar would otherwise dump signing material.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --appendfsync everysec --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 5s
       timeout: 3s
       retries: 10
 
   # ─── Centrifugo (INTERNAL — browser reaches via /connection/websocket on web) ─
   centrifugo:
+    <<: *hardened
     image: centrifugo/centrifugo:v6
     restart: unless-stopped
     networks: [dokploy-network]
@@ -89,7 +115,12 @@ services:
       - -c
       - |
         if [ -n "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" ]; then
-          ORIGINS_JSON=$$(echo "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" | awk -F, '{printf "["; for(i=1;i<=NF;i++) {gsub(/^ +| +$$/, "", $$i); printf "%s%c%s%c", (i>1?",":""), 34, $$i, 34} printf "]"}')
+          # Build a JSON array of origins. Each element is stripped of
+          # leading/trailing whitespace AND of any " or \ chars, so a
+          # stray quote in the env value can't produce malformed JSON
+          # that crashes Centrifugo at boot (origins are scheme://host
+          # and never legitimately contain those characters).
+          ORIGINS_JSON=$$(echo "$$CENTRIFUGO_CLIENT_ALLOWED_ORIGINS" | awk -F, '{printf "["; for(i=1;i<=NF;i++) {gsub(/^ +| +$$/, "", $$i); gsub(/["\\]/, "", $$i); printf "%s%c%s%c", (i>1?",":""), 34, $$i, 34} printf "]"}')
           sed "s|\"allowed_origins\":[[:space:]]*\[[^]]*\]|\"allowed_origins\": $$ORIGINS_JSON|" /centrifugo/config.json > /tmp/centrifugo.json
         else
           cp /centrifugo/config.json /tmp/centrifugo.json
@@ -106,15 +137,19 @@ services:
       # interpolation produces an empty string and Centrifugo refuses to
       # boot. That's the intended behavior: a misconfigured deploy fails
       # loudly instead of silently authenticating against a dev secret.
+      # Override the Redis engine address with credentialed URL. The
+      # committed centrifugo.json holds the non-secret structure; the
+      # password is injected via env so it never lands in git.
+      CENTRIFUGO_ENGINE_REDIS_ADDRESS: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379/0
       CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_SECRET:?CENTRIFUGO_TOKEN_SECRET is required}
       CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_API_KEY:?CENTRIFUGO_API_KEY is required}
       CENTRIFUGO_ADMIN_PASSWORD: ${CENTRIFUGO_ADMIN_PASSWORD:?CENTRIFUGO_ADMIN_PASSWORD is required}
       CENTRIFUGO_ADMIN_SECRET: ${CENTRIFUGO_ADMIN_SECRET:?CENTRIFUGO_ADMIN_SECRET is required}
       # Must include the browser-facing origin — Centrifugo rejects the
       # WebSocket upgrade otherwise, breaking presence + live events.
-      # Falls back to BETTER_AUTH_URL for the same reason as the server's
-      # CORS allowlist.
-      CENTRIFUGO_CLIENT_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-${BETTER_AUTH_URL:-http://localhost:3000}}
+      # In prod the server already requires CORS_ALLOWED_ORIGINS, so the
+      # localhost fallback only fires for local dev / standalone runs.
+      CENTRIFUGO_CLIENT_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
       # Postgres consumer — picks outbox rows off the chat_outbox table
       # and publishes to the matching channels. DSN built from the same
       # POSTGRES_* vars the server uses; sslmode=disable skips the
@@ -122,7 +157,9 @@ services:
       # Centrifugo 6 treats CENTRIFUGO_CONSUMERS as a JSON-encoded
       # override of the top-level `consumers` array — this wins over any
       # definition in centrifugo.json.
-      CENTRIFUGO_CONSUMERS: '[{"name":"postgresql","type":"postgresql","enabled":true,"postgresql":{"dsn":"postgres://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}?sslmode=disable","outbox_table_name":"chat_outbox","num_partitions":1,"partition_select_limit":100,"partition_poll_interval":"300ms","partition_notification_channel":"centrifugo_partition_change"}}]'
+      # No `:-fallback` on the password — a missing env var must fail
+      # loudly rather than embed the well-known dev default `chatapp`.
+      CENTRIFUGO_CONSUMERS: '[{"name":"postgresql","type":"postgresql","enabled":true,"postgresql":{"dsn":"postgres://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}?sslmode=disable","outbox_table_name":"chat_outbox","num_partitions":1,"partition_select_limit":100,"partition_poll_interval":"300ms","partition_notification_channel":"centrifugo_partition_change"}}]'
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,7 +168,11 @@ services:
 
   # ─── MinIO (INTERNAL — browser reaches via /chatapp/* on web) ─
   minio:
-    image: minio/minio:latest
+    <<: *hardened
+    # Pinned to an immutable digest (not `:latest`) for reproducible
+    # builds + supply-chain safety. Re-pin deliberately when upgrading:
+    #   docker pull minio/minio:RELEASE.<date> && docker image inspect ... --format '{{index .RepoDigests 0}}'
+    image: minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     restart: unless-stopped
     networks: [dokploy-network]
     environment:
@@ -141,6 +182,11 @@ services:
       # via compose.dev.yml but would be catastrophic in prod.
       # Must be ≥ 8 chars.
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required}
+      # Restrict browser CORS to the app origin(s). MinIO defaults to
+      # `*`, which would let any website the user visits issue
+      # presigned PUT/GET against the bucket if a signed URL ever leaks
+      # to that origin. Mirror CORS_ALLOWED_ORIGINS.
+      MINIO_API_CORS_ALLOW_ORIGIN: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS is required}
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
@@ -151,25 +197,43 @@ services:
       retries: 5
 
   minio-init:
-    image: minio/mc:latest
+    <<: *hardened
+    image: minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     networks: [dokploy-network]
+    # mc stores its alias config in $HOME/.mc. With cap_drop:[ALL] the
+    # container can't create /root/.mc; redirect HOME into the world-
+    # writable /tmp so the bucket-policy apply succeeds.
+    environment:
+      HOME: /tmp
     depends_on:
       minio:
         condition: service_healthy
+    # Apply a bucket policy that keeps `*/` private (signed GETs only)
+    # but grants anonymous `s3:GetObject` on `avatars/*` so user avatars
+    # render cross-user without per-render signed-URL fetches. SVG/XML
+    # are NOT in the upload allowlist + the presigned POST policy locks
+    # Content-Type on write, so the public prefix can't be used as a
+    # stored-XSS vector.
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-chatapp} ${MINIO_ROOT_PASSWORD:-chatapp-dev-only} &&
       mc mb --ignore-existing local/${MINIO_BUCKET:-chatapp} &&
-      mc anonymous set download local/${MINIO_BUCKET:-chatapp} &&
-      echo '[minio-init] bucket ready'
+      printf '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::%s/avatars/*\"]}]}\n' \"${MINIO_BUCKET:-chatapp}\" > /tmp/avatars-policy.json &&
+      mc anonymous set-json /tmp/avatars-policy.json local/${MINIO_BUCKET:-chatapp} &&
+      echo '[minio-init] bucket ready (private except avatars/*; reads go through signed GETs)'
       "
     restart: "no"
 
   # ─── Prisma migrations (one-shot, INTERNAL) ──────────────────
   migrate:
+    <<: *hardened
     build:
       context: .
       dockerfile: apps/server/Dockerfile
+    # One-shot pre-deploy task. Runs as root to write Prisma's engine
+    # cache; the long-running server still runs as the unprivileged
+    # `node` user. cap_drop + no-new-privileges still apply.
+    user: root
     command: ["pnpm", "exec", "prisma", "migrate", "deploy"]
     restart: "no"
     networks: [dokploy-network]
@@ -177,10 +241,11 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}
 
   # ─── Server / Express (INTERNAL) ─────────────────────────────
   server:
+    <<: *hardened
     build:
       context: .
       dockerfile: apps/server/Dockerfile
@@ -197,8 +262,8 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
       TZ: UTC
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:-chatapp}@postgres:5432/${POSTGRES_DB:-chatapp}
-      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
       # The server's public base URL (used for OpenAPI server listing +
       # absolute-URL links). Required — wrong value breaks OpenAPI's
       # "Try it" + any feature that emits absolute links.
@@ -232,11 +297,10 @@ services:
       ADMIN_IP_ALLOWLIST: ${ADMIN_IP_ALLOWLIST:-}
       TENANT_JWT_CLOCK_SKEW_SEC: ${TENANT_JWT_CLOCK_SKEW_SEC:-30}
       AUTH_MODE: ${AUTH_MODE:-jwt}
-      # Dev-only shortcut that mounts POST /api/dev/mint-token. Safe
-      # defaults: OFF. Local dev should set DEV_MINT_ENABLED=true +
-      # ALLOW_DEV_MINT_TENANTS=default via a .env.dev (never in prod).
-      DEV_MINT_ENABLED: ${DEV_MINT_ENABLED:-false}
-      ALLOW_DEV_MINT_TENANTS: ${ALLOW_DEV_MINT_TENANTS:-}
+      # The dev router (POST /api/dev/mint-token, GET /api/dev/personas)
+      # is auto-mounted whenever NODE_ENV !== "production". No env var
+      # toggle: setting NODE_ENV=production in this compose disables it
+      # unconditionally.
       # Optional: base64-encoded 32-byte key that wraps Tenant.jwtSecret
       # at rest (AES-256-GCM). If unset, secrets are stored plaintext
       # (HMAC requires plaintext at verify time, so this is a DB-at-rest
@@ -247,7 +311,7 @@ services:
       # valid X-Chat-Signature header (HMAC-SHA256 of the raw body
       # signed with the tenant's apiKey). Off by default so existing
       # tenants don't break; flip on once your tenants ship the signer.
-      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-false}
+      WEBHOOK_SIGNATURE_REQUIRED: ${WEBHOOK_SIGNATURE_REQUIRED:-true}
       # S3 split clients (see apps/server/src/lib/s3.ts):
       #   S3_ENDPOINT        — internal, used for HEAD/DELETE/etc.
       #   S3_PUBLIC_URL_BASE — public, used to mint presigned PUT/GET
@@ -268,9 +332,35 @@ services:
       VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       VAPID_SUBJECT: ${VAPID_SUBJECT:-}
+      # Anti-malware (optional, opt-in). Uncomment the `clamav`
+      # service block below AND set both vars to enable. With both
+      # unset, attachment uploads skip the scan (no-op).
+      CLAMAV_HOST: ${CLAMAV_HOST:-}
+      CLAMAV_PORT: ${CLAMAV_PORT:-}
+
+  # ─── ClamAV (OPTIONAL — opt-in attachment scanning) ─────────
+  #
+  # Uncomment this block AND set CLAMAV_HOST=clamav + CLAMAV_PORT=3310
+  # in the server's env to enable. The clamd container is ~1.2 GB resident
+  # (signature DB) so it's off by default.
+  #
+  # clamav:
+  #   <<: *hardened
+  #   image: clamav/clamav:stable
+  #   restart: unless-stopped
+  #   networks: [dokploy-network]
+  #   volumes:
+  #     - clamav_data:/var/lib/clamav
+  #   healthcheck:
+  #     test: ["CMD", "clamdcheck.sh"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 120s
 
   # ─── Web / Next.js (UI only — pure presentation layer) ───────
   web:
+    <<: *hardened
     build:
       context: .
       dockerfile: apps/web/Dockerfile
@@ -290,10 +380,17 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3000
       HOSTNAME: 0.0.0.0
-    ports:
-      - "${WEB_PORT:-3000}:3000"
+    # No host port binding in the deployed stack: Dokploy's Traefik
+    # routes the domain to this container over `dokploy-network` and
+    # terminates TLS. A host bind would expose the app on a plaintext
+    # port that bypasses Traefik (no TLS, no edge rate limiting). For a
+    # bare-metal `docker compose up` (no Traefik), add the binding via an
+    # override file — compose.dev.yml already binds host ports for local
+    # use.
 
 volumes:
   postgres_data:
   redis_data:
   minio_data:
+  # Uncomment when enabling the clamav sidecar above.
+  # clamav_data:

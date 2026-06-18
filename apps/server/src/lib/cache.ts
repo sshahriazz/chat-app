@@ -198,6 +198,27 @@ export async function cacheDel(
 }
 
 /**
+ * Fail-CLOSED delete. Unlike `cacheDel`, this rethrows on Redis error
+ * so a security-critical invalidation (e.g. evicting a removed member
+ * from the fan-out set) cannot silently leave a stale entry. Callers
+ * must be on an idempotent path so a resulting 5xx is safe to retry.
+ */
+export async function cacheDelStrict(
+  ns: CacheNamespace,
+  ...ids: string[]
+): Promise<void> {
+  if (ids.length === 0) return;
+  const label = nsLabel(ns.prefix);
+  try {
+    await redis.del(...ids.map((id) => key(ns, id)));
+    recordCacheOp(label, "del", "ok");
+  } catch (err) {
+    recordCacheOp(label, "del", "error");
+    throw err;
+  }
+}
+
+/**
  * Read-through helper. On miss, invokes `loader`, stores the result,
  * and returns it. On Redis failure we still run `loader` — the cache is
  * a performance optimization, not a correctness dependency.

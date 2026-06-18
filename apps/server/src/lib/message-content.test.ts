@@ -5,6 +5,10 @@ import {
   extractMentions,
   extractPlainText,
   isEmptyContent,
+  MAX_MENTIONS_PER_MESSAGE,
+  MAX_CONTENT_DEPTH,
+  MAX_CONTENT_NODES,
+  MessageContentError,
 } from "./message-content";
 
 /**
@@ -37,6 +41,55 @@ describe("canonicalizeFromJson", () => {
     expect(() => canonicalizeFromJson("bare string" as unknown)).toThrow();
     expect(() => canonicalizeFromJson(42 as unknown)).toThrow();
     expect(() => canonicalizeFromJson(null as unknown)).toThrow();
+  });
+
+  it("rejects a doc exceeding the mention cap", () => {
+    const mentions = Array.from(
+      { length: MAX_MENTIONS_PER_MESSAGE + 1 },
+      (_, i) => ({
+        type: "mention",
+        attrs: { id: `u${i}`, label: `User ${i}` },
+      }),
+    );
+    const doc = {
+      type: "doc",
+      content: [{ type: "paragraph", content: mentions }],
+    };
+    expect(() => canonicalizeFromJson(doc)).toThrow(MessageContentError);
+  });
+
+  it("accepts a doc at exactly the mention cap", () => {
+    const mentions = Array.from(
+      { length: MAX_MENTIONS_PER_MESSAGE },
+      (_, i) => ({
+        type: "mention",
+        attrs: { id: `u${i}`, label: `User ${i}` },
+      }),
+    );
+    const doc = {
+      type: "doc",
+      content: [{ type: "paragraph", content: mentions }],
+    };
+    expect(() => canonicalizeFromJson(doc)).not.toThrow();
+  });
+
+  it("rejects a tree deeper than MAX_CONTENT_DEPTH before HTML round-trip", () => {
+    // Build a paragraph nested far past the depth cap.
+    let inner: Record<string, unknown> = { type: "text", text: "x" };
+    for (let i = 0; i < MAX_CONTENT_DEPTH + 5; i++) {
+      inner = { type: "paragraph", content: [inner] };
+    }
+    const doc = { type: "doc", content: [inner] };
+    expect(() => canonicalizeFromJson(doc)).toThrow(MessageContentError);
+  });
+
+  it("rejects a tree with more than MAX_CONTENT_NODES nodes", () => {
+    const many = Array.from({ length: MAX_CONTENT_NODES + 10 }, () => ({
+      type: "paragraph",
+      content: [{ type: "text", text: "x" }],
+    }));
+    const doc = { type: "doc", content: many };
+    expect(() => canonicalizeFromJson(doc)).toThrow(MessageContentError);
   });
 
   it("normalizes a non-doc root type into a doc", () => {

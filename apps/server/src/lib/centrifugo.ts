@@ -106,9 +106,25 @@ export function generateConnectionToken(
 }
 
 export function generateSubscriptionToken(userId: string, channel: string) {
+  // Short 30s TTL: a subscription token is only used at subscribe time,
+  // and the client re-requests one whenever it (re)subscribes. A long
+  // TTL means a user removed from a conversation keeps a valid presence
+  // token for the whole window. 30s bounds that to near-zero while
+  // staying comfortably above any client round-trip.
   return jwt.sign(
     { sub: userId, channel },
     env.CENTRIFUGO_TOKEN_SECRET,
-    { expiresIn: "10m" },
+    { expiresIn: "30s" },
   );
+}
+
+/**
+ * Force a user off a channel via Centrifugo's server API. Called when a
+ * member is removed from / leaves a conversation so they're evicted
+ * from `presence:conv_<id>` immediately, rather than lingering until
+ * their subscription token expires. Best-effort: failures are logged by
+ * the caller, not fatal (the short token TTL is the backstop).
+ */
+export function unsubscribe(userId: string, channel: string) {
+  return apiCall("unsubscribe", { user: userId, channel }, { retries: 1 });
 }

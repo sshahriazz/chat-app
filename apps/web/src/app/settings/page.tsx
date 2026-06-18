@@ -13,9 +13,17 @@ import {
   Avatar,
   ActionIcon,
   Loader,
+  Modal,
+  Divider,
 } from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconArrowLeft, IconCamera, IconTrash } from "@tabler/icons-react";
+import {
+  IconArrowLeft,
+  IconCamera,
+  IconLogout2,
+  IconTrash,
+} from "@tabler/icons-react";
 import Link from "next/link";
 import { useAuth } from "@/context/AuthContext";
 import { authClient } from "@/lib/auth-client";
@@ -23,10 +31,45 @@ import { uploadFile } from "@/lib/upload";
 import { api } from "@/lib/api";
 
 export default function SettingsPage() {
-  const { user, isLoading } = useAuth();
+  const { user, isLoading, signOut } = useAuth();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [name, setName] = useState("");
   const [image, setImage] = useState<string | null>(null);
+  const [revokeOpen, { open: openRevoke, close: closeRevoke }] =
+    useDisclosure(false);
+  const [revoking, setRevoking] = useState(false);
+
+  const handleRevoke = async () => {
+    setRevoking(true);
+    try {
+      // "Log out everywhere": bumps User.tokensValidAfter on the
+      // server, invalidating every JWT issued before now — including
+      // the one this tab is holding. Clear our local token + sign out
+      // proactively rather than waiting for the next 401.
+      await api.post("/api/users/me/revoke");
+      notifications.show({
+        title: "Signed out everywhere",
+        message: "Every existing session for this account has been revoked.",
+        color: "green",
+      });
+      await signOut();
+    } catch (err) {
+      notifications.show({
+        title: "Sign-out failed",
+        message: (err as Error).message,
+        color: "red",
+      });
+    } finally {
+      setRevoking(false);
+      closeRevoke();
+    }
+  };
+  // Local blob preview of a freshly-picked avatar. The storage bucket
+  // is private, so the uploaded `image` URL won't render directly — we
+  // show this blob for immediate feedback. NOTE: avatars are a demo
+  // convenience; in production the avatar comes from the tenant JWT
+  // `image` claim (an externally-hosted URL). See BREAKING_CHANGES.md.
+  const [previewSrc, setPreviewSrc] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -66,8 +109,17 @@ export default function SettingsPage() {
       return;
     }
     setUploading(true);
+    // Revoke any prior preview blob before creating a new one.
+    setPreviewSrc((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return URL.createObjectURL(file);
+    });
     try {
-      const att = await uploadFile(file);
+      // Avatars upload to `avatars/<userId>/...` and live in the public
+      // bucket prefix (granted anonymous GET in `minio-init`), so the
+      // returned `att.url` renders cross-user without any per-render
+      // signed-URL fetch.
+      const att = await uploadFile(file, { purpose: "avatar" });
       setImage(att.url);
     } catch (err) {
       notifications.show({
@@ -132,7 +184,7 @@ export default function SettingsPage() {
           <Group align="center">
             <div style={{ position: "relative" }}>
               <Avatar
-                src={image}
+                src={previewSrc ?? image}
                 name={name}
                 size={96}
                 radius={96}
@@ -165,7 +217,13 @@ export default function SettingsPage() {
                   color="red"
                   size="xs"
                   leftSection={<IconTrash size={14} />}
-                  onClick={() => setImage(null)}
+                  onClick={() => {
+                    setPreviewSrc((prev) => {
+                      if (prev) URL.revokeObjectURL(prev);
+                      return null;
+                    });
+                    setImage(null);
+                  }}
                   disabled={uploading}
                 >
                   Remove photo
@@ -198,6 +256,10 @@ export default function SettingsPage() {
               variant="subtle"
               onClick={() => {
                 setName(user.name);
+                setPreviewSrc((prev) => {
+                  if (prev) URL.revokeObjectURL(prev);
+                  return null;
+                });
                 setImage(user.image);
               }}
               disabled={!dirty || saving}
@@ -212,8 +274,51 @@ export default function SettingsPage() {
               Save changes
             </Button>
           </Group>
+
+          <Divider my="md" label="Account security" labelPosition="left" />
+
+          <Group justify="space-between" align="flex-start" wrap="nowrap">
+            <Stack gap={2}>
+              <Text fw={500}>Sign out of every session</Text>
+              <Text size="xs" c="dimmed">
+                Revokes every existing token for this account on every
+                device. New sessions are unaffected; you&apos;ll need to
+                sign in again here.
+              </Text>
+            </Stack>
+            <Button
+              variant="outline"
+              color="red"
+              leftSection={<IconLogout2 size={14} />}
+              onClick={openRevoke}
+            >
+              Sign out everywhere
+            </Button>
+          </Group>
         </Stack>
       </Paper>
+
+      <Modal
+        opened={revokeOpen}
+        onClose={closeRevoke}
+        title="Sign out of every session?"
+        centered
+      >
+        <Stack>
+          <Text size="sm">
+            This will revoke every existing access token for your account.
+            You&apos;ll be signed out of this tab and any other open session.
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={closeRevoke} disabled={revoking}>
+              Cancel
+            </Button>
+            <Button color="red" loading={revoking} onClick={handleRevoke}>
+              Sign out everywhere
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Container>
   );
 }

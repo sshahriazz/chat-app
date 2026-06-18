@@ -39,18 +39,22 @@ datasource db {
 // migration and carries every pre-existing row.
 
 model Tenant {
-  id         String   @id @default(uuid())
-  name       String
-  apiKeyHash String   @map("api_key_hash")
+  id           String   @id @default(uuid())
+  name         String
+  apiKeyHash   String   @map("api_key_hash")
   // First 8 base64url chars of the raw API key. Indexed so API-key
   // auth is O(log N) + a single Argon2 verify, instead of one Argon2
   // verify per tenant (a DoS vector once we have many tenants).
   // Nullable for legacy rows that pre-date the column — those still
   // resolve via the full-scan fallback in findTenantByApiKey.
-  apiKeyPrefix String? @map("api_key_prefix")
-  jwtSecret  String   @map("jwt_secret")
-  createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @updatedAt @map("updated_at")
+  apiKeyPrefix String?  @map("api_key_prefix")
+  jwtSecret    String   @map("jwt_secret")
+  // Optional aggregate attachment-storage cap for the whole tenant
+  // (bytes). NULL = no tenant-level cap (per-user cap still applies).
+  // Enforced atomically at presign time under an advisory lock.
+  storageQuotaBytes BigInt? @map("storage_quota_bytes")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
 
   users               User[]
   conversations       Conversation[]
@@ -59,6 +63,7 @@ model Tenant {
   reactions           Reaction[]
   attachments         Attachment[]
   pushSubscriptions   PushSubscription[]
+  deletedExternalIds  DeletedExternalId[]
 
   @@index([apiKeyPrefix])
   @@map("tenant")
@@ -72,12 +77,12 @@ model Tenant {
 // now — no longer unique, nullable.
 
 model User {
-  id           String    @id
+  id               String    @id
   // Tenant-scoped composite identity. `externalId` is the tenant's own
   // user id (never mutated), `id` stays server-internal (UUID) so our
   // FKs / Centrifugo channels don't need to change.
-  tenantId     String    @map("tenant_id")
-  externalId   String    @map("external_id")
+  tenantId         String    @map("tenant_id")
+  externalId       String    @map("external_id")
   // Optional second-level scope *within* a tenant. Lets a single tenant
   // partition its users into isolated contexts (project chats, support
   // tickets, deal rooms, per-client CRM spaces) without creating a new
@@ -92,13 +97,19 @@ model User {
   // Source of truth is the `scope` claim on the tenant-signed JWT,
   // re-materialized on every authenticated request via
   // `upsertFederatedUser`.
-  scope        String?   @map("scope")
-  name         String
-  email        String?
-  image        String?
-  lastActiveAt DateTime? @map("last_active_at")
-  createdAt    DateTime  @map("created_at")
-  updatedAt    DateTime  @map("updated_at")
+  scope            String?   @map("scope")
+  name             String
+  email            String?
+  image            String?
+  lastActiveAt     DateTime? @map("last_active_at")
+  // Token revocation epoch. Tokens whose `iat` (issued-at) is strictly
+  // less than this timestamp are rejected on verify, providing a
+  // per-user "log out everywhere" + GDPR-delete eviction primitive.
+  // Bumped to NOW() on DELETE /me and on POST /me/revoke. NULL means
+  // "no revocation horizon set" (treated as epoch 0).
+  tokensValidAfter DateTime? @map("tokens_valid_after")
+  createdAt        DateTime  @map("created_at")
+  updatedAt        DateTime  @map("updated_at")
 
   tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   conversationMembers ConversationMember[]
@@ -111,6 +122,57 @@ model User {
   @@index([tenantId])
   @@index([tenantId, scope])
   @@map("user")
+}
+
+// Append-only audit log for admin (operator) mutations. Captures who
+// did what, from where, when — so a leaked MASTER_API_KEY incident has
+// a forensic trail. Never read on the request path; only written. No
+// FK to Tenant: rows must survive tenant deletion (you need the trail
+// of "tenant X was deleted by Y" exactly when the tenant row is gone).
+model AdminAuditLog {
+  id        String   @id @default(uuid())
+  // Free-form action identifier, e.g. "tenant.create", "tenant.rotateApiKey",
+  // "tenant.rotateJwtSecret". Indexed for `WHERE action = ...` filters.
+  action    String
+  // Subject of the action when applicable (e.g. the tenant id whose key
+  // was rotated). Nullable because not every action has a single subject.
+  tenantId  String?  @map("tenant_id")
+  // TCP peer IP from `req.socket.remoteAddress` (NOT `req.ip` — see
+  // require-master-key.ts for why X-Forwarded-For is unsafe here).
+  actorIp   String?  @map("actor_ip")
+  // Request id (from the requestId middleware) so the audit row can be
+  // correlated with the access logs.
+  requestId String?  @map("request_id")
+  // Structured detail blob (e.g. previous key prefix). Schema-less to
+  // avoid lock-step migrations for every new audited action; readers
+  // should treat it as untrusted JSON.
+  details   Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([action, createdAt])
+  @@index([tenantId, createdAt])
+  @@map("admin_audit_log")
+}
+
+// GDPR-delete tombstones. When a user calls `DELETE /api/users/me`,
+// the (tenantId, externalId) pair is added here with an `expiresAt`
+// of NOW() + 30 days. `requireUserJwt` checks this table and returns
+// 410 Gone for any token whose `(iss, sub)` is present and not yet
+// expired — preventing the federated upsert from silently
+// re-materializing a "deleted" user the next time their tenant mints
+// a token. A nightly job removes rows past `expiresAt` so the same
+// externalId can eventually be re-registered.
+model DeletedExternalId {
+  tenantId   String   @map("tenant_id")
+  externalId String   @map("external_id")
+  deletedAt  DateTime @map("deleted_at")
+  expiresAt  DateTime @map("expires_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@id([tenantId, externalId])
+  @@index([expiresAt])
+  @@map("deleted_external_id")
 }
 
 // ─── Chat tables ──────────────────────────────────────────────
@@ -227,6 +289,13 @@ model Attachment {
   messageId   String?  @map("message_id")
   uploaderId  String   @map("uploader_id")
   url         String
+  // Authoritative object-storage key (`<uploaderId>/<uuid><ext>`).
+  // Stored explicitly so reads/deletes never have to reverse-engineer
+  // the key from `url` via string-prefix matching — that helper was
+  // fragile to S3_PUBLIC_URL_BASE rotation and was a key-confusion
+  // surface. Nullable for rows created before this column existed;
+  // those still fall back to keyFromPublicUrl until backfilled.
+  objectKey   String?  @map("object_key")
   contentType String   @map("content_type")
   filename    String
   size        Int

@@ -21,18 +21,87 @@ const messageExtensions = [
 
 export type MessageContentJson = JSONContent;
 
+/** Hard cap on mention nodes per message. A single message mentioning
+ *  hundreds of users is a notification-flood / push-amplification
+ *  vector (each mention bypasses mute). 50 is far above any legitimate
+ *  use. */
+export const MAX_MENTIONS_PER_MESSAGE = 50;
+
+/** Thrown when content exceeds a structural limit (mentions, etc.).
+ *  Callers map this to a 400. */
+export class MessageContentError extends Error {}
+
+/** Max nesting depth of the Tiptap tree. Real documents are a handful
+ *  deep (doc > list > listItem > paragraph > text). 32 is generous. */
+export const MAX_CONTENT_DEPTH = 32;
+/** Max total node count. A 512 KB payload can encode ~10^4-10^5 tiny
+ *  nodes; both generateHTML and generateJSON are recursive over the
+ *  tree and materialize a DOM, so an unbounded tree pegs the event
+ *  loop. 5000 covers any legitimate message. */
+export const MAX_CONTENT_NODES = 5000;
+
+/**
+ * Walk the RAW (pre-canonicalization) tree once and reject trees that
+ * are too deep or too large BEFORE handing them to the recursive,
+ * DOM-materializing generateHTML/generateJSON pair. This is the cheap
+ * guard that turns a CPU-DoS payload into a fast 400.
+ */
+function assertWithinStructuralLimits(raw: unknown): void {
+  let nodes = 0;
+  const walk = (node: unknown, depth: number): void => {
+    if (!node || typeof node !== "object") return;
+    if (depth > MAX_CONTENT_DEPTH) {
+      throw new MessageContentError(
+        `content nesting too deep (max ${MAX_CONTENT_DEPTH})`,
+      );
+    }
+    nodes++;
+    if (nodes > MAX_CONTENT_NODES) {
+      throw new MessageContentError(
+        `content has too many nodes (max ${MAX_CONTENT_NODES})`,
+      );
+    }
+    const n = node as { content?: unknown };
+    if (Array.isArray(n.content)) {
+      for (const child of n.content) walk(child, depth + 1);
+    }
+  };
+  walk(raw, 0);
+}
+
+function countMentions(json: MessageContentJson): number {
+  let count = 0;
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    const n = node as { type?: string; content?: unknown[] };
+    if (n.type === "mention") count++;
+    if (Array.isArray(n.content)) n.content.forEach(walk);
+  };
+  walk(json);
+  return count;
+}
+
 /**
  * Defense in depth: normalize a client-supplied Tiptap JSON tree by
  * round-tripping it through the extension schema. Unknown node types,
  * forbidden marks, stray attributes all disappear. Throws on input that
- * isn't even structurally JSON.
+ * isn't even structurally JSON, that is too deep/large, or that exceeds
+ * the mention cap.
  */
 export function canonicalizeFromJson(raw: unknown): MessageContentJson {
   if (!raw || typeof raw !== "object") {
     throw new Error("content must be a Tiptap JSON document");
   }
+  // Bound the tree BEFORE the expensive recursive HTML round-trip.
+  assertWithinStructuralLimits(raw);
   const html = generateHTML(raw as JSONContent, messageExtensions);
-  return generateJSON(html, messageExtensions) as MessageContentJson;
+  const json = generateJSON(html, messageExtensions) as MessageContentJson;
+  if (countMentions(json) > MAX_MENTIONS_PER_MESSAGE) {
+    throw new MessageContentError(
+      `too many mentions (max ${MAX_MENTIONS_PER_MESSAGE})`,
+    );
+  }
+  return json;
 }
 
 /**

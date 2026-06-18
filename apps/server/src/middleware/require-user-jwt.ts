@@ -1,8 +1,9 @@
 import type { Request, Response, NextFunction } from "express";
-import { UnauthorizedError } from "../http/errors";
+import { GoneError, UnauthorizedError } from "../http/errors";
 import { peekTokenIssuer, verifyUserToken } from "../http/jwt-tenant";
 import { getTenantById } from "../lib/tenant";
 import { upsertFederatedUser } from "../lib/user-federation";
+import { prisma } from "../db";
 import type { AuthenticatedRequest } from "./auth";
 
 /**
@@ -42,9 +43,52 @@ export async function requireUserJwt(
 
     let claims;
     try {
-      claims = verifyUserToken(token, tenant.jwtSecret);
+      claims = verifyUserToken(token, tenant.jwtSecret, tenant.id);
     } catch {
       throw new UnauthorizedError("Invalid user token");
+    }
+
+    // GDPR-delete tombstone check. If the user previously called
+    // `DELETE /me`, refuse to re-materialize them until the
+    // (tenantId, externalId) tombstone expires. This is the
+    // "right to be forgotten" enforcement primitive: without it,
+    // the next authenticated request would silently recreate the
+    // User row from the JWT claims.
+    const tombstoneExternalId = String(claims.sub).slice(0, 256);
+    if (tombstoneExternalId.length > 0) {
+      const tombstone = await prisma.deletedExternalId.findUnique({
+        where: {
+          tenantId_externalId: {
+            tenantId: tenant.id,
+            externalId: tombstoneExternalId,
+          },
+        },
+        select: { expiresAt: true },
+      });
+      if (tombstone && tombstone.expiresAt > new Date()) {
+        throw new GoneError("Account has been deleted");
+      }
+    }
+
+    // Cap string-claim lengths server-side. A tenant minting a name
+    // of 100 KB would otherwise inflate every realtime broadcast,
+    // every push payload, and every User row. The tenant is supposed
+    // to bound these, but we don't trust them on the verify path.
+    const name = typeof claims.name === "string" ? claims.name.slice(0, 128) : "";
+    if (name.length === 0) {
+      throw new UnauthorizedError("Token missing display name");
+    }
+    const image =
+      typeof claims.image === "string" && claims.image.length > 0
+        ? claims.image.slice(0, 2048)
+        : null;
+    const email =
+      typeof claims.email === "string" && claims.email.length > 0
+        ? claims.email.slice(0, 254)
+        : null;
+    const externalId = String(claims.sub).slice(0, 256);
+    if (externalId.length === 0) {
+      throw new UnauthorizedError("Token missing subject");
     }
 
     // Normalize scope: treat empty string / whitespace as unscoped.
@@ -54,16 +98,26 @@ export async function requireUserJwt(
     const rawScope = claims.scope;
     const scope =
       typeof rawScope === "string" && rawScope.trim().length > 0
-        ? rawScope
+        ? rawScope.slice(0, 128)
         : null;
 
     const user = await upsertFederatedUser(tenant.id, {
-      externalId: claims.sub,
-      name: claims.name,
-      image: claims.image ?? null,
-      email: claims.email ?? null,
+      externalId,
+      name,
+      image,
+      email,
       scope,
     });
+
+    // Token revocation horizon. Tokens whose `iat` predates
+    // `user.tokensValidAfter` are rejected even if signature, audience,
+    // and expiry pass. Bumped by GDPR-delete + `POST /me/revoke`.
+    if (user.tokensValidAfter && typeof claims.iat === "number") {
+      const iatMs = claims.iat * 1000;
+      if (iatMs < user.tokensValidAfter.getTime()) {
+        throw new UnauthorizedError("Token revoked");
+      }
+    }
 
     const r = req as AuthenticatedRequest;
     r.user = {

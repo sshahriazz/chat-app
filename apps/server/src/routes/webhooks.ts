@@ -25,18 +25,26 @@ const router: Router = Router();
 // (10/min) catches bugs in a tenant's backend that would re-push the
 // same profile on every frame.
 
+// Each store carries an explicit `prefix` so its counters live in their
+// own Redis keyspace and can't collide with the general app limiters
+// (which use `rl:<name>:`). The keyGenerators return the un-prefixed
+// suffix; RedisStore prepends the prefix.
+function webhookStore(prefix: string) {
+  return new RedisStore({
+    prefix,
+    sendCommand: (...args: string[]) =>
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (redis.call as any)(...args),
+  });
+}
+
 const tenantBucket = rateLimit({
   windowMs: 60_000,
   limit: 100,
   standardHeaders: "draft-7",
   legacyHeaders: false,
-  keyGenerator: (req) =>
-    `rl:webhook:tenant:${(req as ApiKeyAuthenticatedRequest).tenantId}`,
-  store: new RedisStore({
-    sendCommand: (...args: string[]) =>
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (redis.call as any)(...args),
-  }),
+  keyGenerator: (req) => (req as ApiKeyAuthenticatedRequest).tenantId,
+  store: webhookStore("rl:webhook:tenant:"),
 });
 
 const userBucket = rateLimit({
@@ -44,16 +52,15 @@ const userBucket = rateLimit({
   limit: 10,
   standardHeaders: "draft-7",
   legacyHeaders: false,
+  // `validate({ body })` runs BEFORE this limiter (see route order), so
+  // `externalId` is a validated, length-bounded string here — not raw,
+  // unbounded client input.
   keyGenerator: (req) => {
     const tid = (req as ApiKeyAuthenticatedRequest).tenantId;
     const ext = (req.body as { externalId?: unknown })?.externalId ?? "unknown";
-    return `rl:webhook:user:${tid}:${String(ext)}`;
+    return `${tid}:${String(ext)}`;
   },
-  store: new RedisStore({
-    sendCommand: (...args: string[]) =>
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (redis.call as any)(...args),
-  }),
+  store: webhookStore("rl:webhook:user:"),
 });
 
 // ─── POST /api/webhooks/users.updated ────────────────────────
@@ -68,9 +75,9 @@ router.post(
   "/users.updated",
   requireApiKey,
   requireWebhookSignature,
+  validate({ body: UsersUpdatedWebhookBodySchema }),
   tenantBucket,
   userBucket,
-  validate({ body: UsersUpdatedWebhookBodySchema }),
   async (req, res) => {
     const { tenantId } = req as ApiKeyAuthenticatedRequest;
     const body = req.body as {
@@ -101,9 +108,9 @@ router.post(
   "/users.deleted",
   requireApiKey,
   requireWebhookSignature,
+  validate({ body: UsersDeletedWebhookBodySchema }),
   tenantBucket,
   userBucket,
-  validate({ body: UsersDeletedWebhookBodySchema }),
   async (req, res) => {
     const { tenantId } = req as ApiKeyAuthenticatedRequest;
     const { externalId } = req.body as { externalId: string };

@@ -2,8 +2,16 @@ import crypto from "node:crypto";
 import argon2 from "argon2";
 import { prisma } from "../db";
 import { env } from "../env";
-import { logger } from "./logger";
+import { logger } from "../infra/logger";
 import { CACHE_NS, cacheDel, cacheGet, cacheSet } from "./cache";
+
+/** Hard cap on the legacy NULL-prefix fallback. Each entry costs one
+ *  Argon2id verify (~30-50ms) — N tenants means a single unauthenticated
+ *  bad-key probe burns N × 50ms of CPU. Bounding keeps the worst-case
+ *  cost predictable while we drive the legacy count to zero via
+ *  operator rotation. Boot warns loudly if the actual count exceeds
+ *  the cap; calls return early after consuming this budget. */
+const LEGACY_FALLBACK_LIMIT = 5;
 
 /**
  * Tenant management. A Tenant is a third-party app that uses this chat
@@ -70,15 +78,12 @@ const ENC_PREFIX = "enc:v1:";
 function encryptionKey(): Buffer | null {
   const b64 = env.JWT_SECRET_ENCRYPTION_KEY;
   if (!b64) return null;
-  const key = Buffer.from(b64, "base64");
-  if (key.length !== 32) {
-    logger.error(
-      "[tenant] JWT_SECRET_ENCRYPTION_KEY must be 32 bytes (base64). Ignoring; secrets will be stored plaintext.",
-      { len: key.length },
-    );
-    return null;
-  }
-  return key;
+  // Format is enforced at boot in env.ts — by the time we get here the
+  // value is either absent or guaranteed to decode to exactly 32 bytes.
+  // Returning the buffer unconditionally removes a silent-downgrade
+  // path that previously fell back to plaintext storage on malformed
+  // input.
+  return Buffer.from(b64, "base64");
 }
 
 export function wrapSecret(plain: string): string {
@@ -221,10 +226,15 @@ export async function findTenantByApiKey(rawKey: string): Promise<{
     }
   }
 
-  // 2. Legacy rows with NULL prefix (rotated away over time).
+  // 2. Legacy rows with NULL prefix (rotated away over time). Capped
+  //    at LEGACY_FALLBACK_LIMIT to bound Argon2 cost per request — N
+  //    unscanned legacy rows would otherwise be an algorithmic DoS
+  //    amplifier on random bearer keys. The startup audit emits a
+  //    warning so operators can rotate the affected tenants.
   const legacy = await prisma.tenant.findMany({
     where: { apiKeyPrefix: null },
     select: { id: true, apiKeyHash: true, jwtSecret: true },
+    take: LEGACY_FALLBACK_LIMIT,
   });
   for (const t of legacy) {
     if (await verifyApiKey(rawKey, t.apiKeyHash)) {
@@ -235,28 +245,55 @@ export async function findTenantByApiKey(rawKey: string): Promise<{
   return null;
 }
 
-interface CachedTenant {
+/** Boot-time audit: log a warning if any tenant rows still carry a
+ *  NULL `apiKeyPrefix`. These widen the per-request Argon2 budget on
+ *  the unauthenticated path; rotate them so the legacy fallback can
+ *  be removed entirely. Idempotent — safe to call once per boot. */
+export async function auditLegacyApiKeyPrefixes(): Promise<void> {
+  const count = await prisma.tenant.count({ where: { apiKeyPrefix: null } });
+  if (count > 0) {
+    logger.warn(
+      { legacyCount: count, fallbackLimit: LEGACY_FALLBACK_LIMIT },
+      "[tenant] legacy NULL apiKeyPrefix rows detected — rotate via POST /api/admin/tenants/:id/api-keys to remove the Argon2 DoS amplifier",
+    );
+  }
+}
+
+interface CachedTenantStored {
   id: string;
-  /** Unwrapped — ready to HMAC-verify a JWT with. Never store the
-   *  `enc:v1:...` ciphertext in cache; that would defeat the fast path. */
+  /** As stored in the DB: either `enc:v1:…` ciphertext (when
+   *  JWT_SECRET_ENCRYPTION_KEY is set) or legacy plaintext. We
+   *  deliberately do NOT cache the unwrapped form — a Redis dump
+   *  would otherwise hand the attacker every tenant's signing
+   *  material. Unwrap happens in-process on every read; the
+   *  AES-256-GCM cost is microseconds and bounded by the JWT
+   *  verify itself. */
+  jwtSecretWrapped: string;
+}
+
+export interface CachedTenant {
+  id: string;
+  /** Unwrapped — ready to HMAC-verify a JWT with. Re-derived on each
+   *  call from the wrapped form held in Redis. */
   jwtSecret: string;
 }
 
 export async function getTenantById(tenantId: string): Promise<CachedTenant | null> {
-  const cached = await cacheGet<CachedTenant>(CACHE_NS.tenant, tenantId);
-  if (cached !== null) return cached;
+  const cached = await cacheGet<CachedTenantStored>(CACHE_NS.tenant, tenantId);
+  if (cached !== null) {
+    return { id: cached.id, jwtSecret: unwrapSecret(cached.jwtSecretWrapped) };
+  }
 
   const row = await prisma.tenant.findUnique({
     where: { id: tenantId },
     select: { id: true, jwtSecret: true },
   });
   if (!row) return null;
-  const resolved: CachedTenant = {
+  await cacheSet<CachedTenantStored>(CACHE_NS.tenant, tenantId, {
     id: row.id,
-    jwtSecret: unwrapSecret(row.jwtSecret),
-  };
-  await cacheSet(CACHE_NS.tenant, tenantId, resolved);
-  return resolved;
+    jwtSecretWrapped: row.jwtSecret,
+  });
+  return { id: row.id, jwtSecret: unwrapSecret(row.jwtSecret) };
 }
 
 /** Purge the tenant cache entry for instant rotation effect.

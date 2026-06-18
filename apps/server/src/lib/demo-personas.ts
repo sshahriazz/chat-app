@@ -5,8 +5,8 @@
  * on `POST /api/dev/seed-demo` so a fresh DB boot demos end-to-end
  * without any operator / admin-API steps.
  *
- * This is DEV-ONLY. The routes mount only when `DEV_MINT_ENABLED=true`
- * (or NODE_ENV !== "production"). No production deploy ever runs this.
+ * This is DEV-ONLY. The dev router returns 404 when
+ * `NODE_ENV === "production"`, so no production deploy ever runs this.
  */
 
 export interface DemoPersona {

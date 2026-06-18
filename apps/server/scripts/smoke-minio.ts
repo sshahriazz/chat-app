@@ -12,46 +12,56 @@
  * Run: `npx tsx scripts/smoke-minio.ts`
  */
 import "dotenv/config";
-import { createUploadUrl, deleteObject, headObjectSize } from "../src/lib/s3";
+import {
+  createUploadUrl,
+  createDownloadUrl,
+  deleteObject,
+  headObjectSize,
+} from "../src/lib/s3";
 
 const KEY = `smoke/${Date.now()}.txt`;
 const BODY = `smoke-test-${Date.now()}\n`;
 
 async function main() {
-  console.log("1. Minting presigned PUT URL");
+  console.log("1. Minting presigned POST policy");
   const signed = await createUploadUrl({
     userId: "smoke",
     key: KEY,
     contentType: "text/plain",
     contentLength: Buffer.byteLength(BODY, "utf8"),
   });
-  console.log(`   uploadUrl: ${signed.uploadUrl.slice(0, 80)}…`);
+  console.log(`   url:       ${signed.url}`);
+  console.log(`   fields:    ${Object.keys(signed.fields).join(", ")}`);
   console.log(`   publicUrl: ${signed.publicUrl}`);
 
-  console.log("\n2. PUT-ing bytes to the presigned URL");
-  const putRes = await fetch(signed.uploadUrl, {
-    method: "PUT",
-    headers: { "Content-Type": "text/plain" },
-    body: BODY,
-  });
-  if (!putRes.ok) {
-    const text = await putRes.text();
-    throw new Error(`PUT failed: ${putRes.status} ${text}`);
+  console.log("\n2. POST-ing bytes via multipart form (presigned POST)");
+  const form = new FormData();
+  for (const [k, v] of Object.entries(signed.fields)) form.append(k, v);
+  form.append("file", new Blob([BODY], { type: "text/plain" }));
+  const postRes = await fetch(signed.url, { method: "POST", body: form });
+  if (!postRes.ok) {
+    const text = await postRes.text();
+    throw new Error(`POST failed: ${postRes.status} ${text}`);
   }
-  console.log(`   status: ${putRes.status}`);
+  console.log(`   status: ${postRes.status}`);
 
   console.log("\n3. HEAD the object to verify stored size");
   const size = await headObjectSize(KEY);
   console.log(`   size: ${size} (expected ${BODY.length})`);
   if (size !== BODY.length) throw new Error("size mismatch");
 
-  console.log("\n4. Public GET (anonymous — simulates the browser <img src>)");
-  const getRes = await fetch(signed.publicUrl);
+  console.log("\n4. Signed GET (bucket is private — anonymous read is denied)");
+  const { url: downloadUrl } = await createDownloadUrl({
+    key: KEY,
+    filename: "smoke.txt",
+    contentType: "text/plain",
+  });
+  const getRes = await fetch(downloadUrl);
   const body = await getRes.text();
   console.log(`   status: ${getRes.status}`);
   console.log(`   body:   ${JSON.stringify(body)}`);
   if (getRes.status !== 200 || body !== BODY) {
-    throw new Error("public GET did not return the uploaded body");
+    throw new Error("signed GET did not return the uploaded body");
   }
 
   console.log("\n5. Cleanup");

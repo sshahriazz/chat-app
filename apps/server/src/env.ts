@@ -21,11 +21,9 @@ const EnvSchema = z.object({
   // Core infra (required)
   DATABASE_URL: z.string().min(1),
   // Public base URL of the deployed app (used for OpenAPI server
-  // listing + absolute-URL links). Previously named BETTER_AUTH_URL;
-  // kept under that name for backwards-compat with existing deploys
-  // via an alias below.
+  // listing + absolute-URL links). The legacy `BETTER_AUTH_URL` alias
+  // has been removed — set PUBLIC_URL explicitly.
   PUBLIC_URL: z.string().url().optional(),
-  BETTER_AUTH_URL: z.string().url().optional(),
   // Overrides the server URL shown in the OpenAPI document (and used
   // as the base for Scalar's "Try it" buttons). Set per-deployment to
   // match however the API is publicly reached:
@@ -50,14 +48,46 @@ const EnvSchema = z.object({
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .optional(),
+  // Optional bearer token gating GET /metrics. When set, scrapers must
+  // send `Authorization: Bearer <token>`. Leave unset only when the
+  // endpoint is already firewalled to an internal network.
+  METRICS_TOKEN: z.string().min(16).optional(),
+  // Numeric hop count (legacy fallback). Prefer TRUST_PROXY_CIDRS.
   TRUST_PROXY: z.coerce.number().int().nonnegative().default(1),
+  // Comma-separated list of trusted proxy IPs/CIDRs. When set, Express
+  // only honors X-Forwarded-* from these sources — closes the
+  // X-Forwarded-For spoofing window that a mis-counted hop count opens
+  // (rate-limit + admin IP-allowlist bypass). e.g. "10.0.0.0/8,172.18.0.1".
+  TRUST_PROXY_CIDRS: z.string().optional(),
 
   // Tenancy (PR 1 onward).
   //
   // MASTER_API_KEY gates `POST /api/admin/tenants` and the key/secret
   // rotation endpoints. In production this MUST be set; the optional()
   // below is only for dev / tests where admin endpoints aren't mounted.
-  MASTER_API_KEY: z.string().min(32).optional(),
+  //
+  // Length requirement: ≥ 43 chars (≈ 32 bytes of base64url entropy).
+  // Charset restricted to base64url / hex so a hand-rolled `min(32)`
+  // string of repeated `a`s fails fast. Reject obvious low-entropy
+  // patterns (all-same-char, fewer than 16 unique characters).
+  // Empty-string env (`MASTER_API_KEY=` in `.env` to mean "unset") is
+  // preprocessed to undefined so the optional() chain accepts it. Otherwise
+  // the .min(43) check fires on "".
+  MASTER_API_KEY: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z
+      .string()
+      .min(43, "MASTER_API_KEY must be at least 43 chars (32B of base64url entropy)")
+      .regex(
+        /^[A-Za-z0-9_\-+/=]+$/,
+        "MASTER_API_KEY must be base64url / hex chars only",
+      )
+      .refine(
+        (s) => new Set(s).size >= 16,
+        "MASTER_API_KEY is too low-entropy (need ≥16 unique chars)",
+      )
+      .optional(),
+  ),
   // Optional comma-separated allowlist for `/api/admin/*` sources.
   // Each entry is an IPv4/IPv6 address. Requests from outside this
   // list are rejected with 403 regardless of master-key validity.
@@ -66,12 +96,33 @@ const EnvSchema = z.object({
   // Optional base64-encoded 32-byte key. When set, Tenant.jwtSecret
   // is AES-256-GCM wrapped at rest. The server still needs plaintext
   // in memory to verify HMAC JWTs — this is a DB-leak defense only.
-  JWT_SECRET_ENCRYPTION_KEY: z.string().optional(),
+  //
+  // Validated at boot: if the value is set but doesn't decode to
+  // exactly 32 bytes, env parsing throws — refusing to boot instead
+  // of silently storing future secrets in plaintext (the prior
+  // behavior was to log an error and continue, downgrading silently).
+  JWT_SECRET_ENCRYPTION_KEY: z
+    .string()
+    .optional()
+    .refine(
+      (s) => {
+        if (s === undefined || s === "") return true;
+        try {
+          return Buffer.from(s, "base64").length === 32;
+        } catch {
+          return false;
+        }
+      },
+      "JWT_SECRET_ENCRYPTION_KEY must decode to exactly 32 bytes (base64)",
+    ),
   // When "true", every `POST /api/webhooks/*` request must carry a
   // valid `X-Chat-Signature` header (HMAC-SHA256 of the raw request
-  // body signed with the tenant's apiKey). Off by default; opt in
-  // once your tenants have shipped the signer.
-  WEBHOOK_SIGNATURE_REQUIRED: z.coerce.boolean().default(false),
+  // body signed with the tenant's apiKey). Defaults to ON: a leaked
+  // bearer API key would otherwise be sufficient to forge any webhook
+  // payload (e.g. `users.deleted`, `users.updated`). Tenants must
+  // ship the signer; explicitly set this to `false` only during a
+  // migration window.
+  WEBHOOK_SIGNATURE_REQUIRED: z.coerce.boolean().default(true),
   // Auth dispatch mode. `both` accepts either the legacy cookie
   // session or a tenant-issued Bearer JWT (preferred during the
   // dual-auth cutover window). `jwt` rejects cookie requests outright
@@ -83,18 +134,17 @@ const EnvSchema = z.object({
   // middleware/auth.ts is now just the JWT path; if you flip this,
   // you'll also need to revert the middleware.
   AUTH_MODE: z.enum(["both", "session", "jwt"]).default("jwt"),
-  // Dev-only: opt-in switch that mounts `POST /api/dev/mint-token`
-  // outside non-production. Stays false in prod unless explicitly
-  // enabled (e.g. staging envs where you want to e2e-test end-to-end).
-  DEV_MINT_ENABLED: z.coerce.boolean().default(false),
-  // When dev mint is enabled in production, ONLY these tenant ids can
-  // be minted for. Comma-separated. Prevents a leaked flag from
-  // becoming a tenant-impersonation backdoor.
-  ALLOW_DEV_MINT_TENANTS: z.string().optional(),
   // Seconds of clock skew tolerated when verifying tenant-signed user
-  // JWTs. Defaults to a conservative 30s; raise if tenants run on
-  // systems with unsynced clocks.
-  TENANT_JWT_CLOCK_SKEW_SEC: z.coerce.number().int().nonnegative().default(30),
+  // JWTs. Defaults to 5s — every additional second is also extra
+  // post-expiry validity for a leaked token. Capped at 60s to prevent
+  // accidental "raise it until it works" misconfig from widening the
+  // replay window further.
+  TENANT_JWT_CLOCK_SKEW_SEC: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .max(60)
+    .default(5),
   SHUTDOWN_TIMEOUT_MS: z.coerce
     .number()
     .int()
@@ -104,6 +154,22 @@ const EnvSchema = z.object({
 
   // Redis — used by rate limiter + (future) outbox worker + caches
   REDIS_URL: z.string().min(1).default("redis://localhost:6379"),
+
+  // Optional ClamAV INSTREAM scan target. When BOTH host + port are
+  // set, every attachment is scanned post-upload; infected uploads are
+  // deleted from S3 and the row purged. Leave unset to skip (no-op).
+  // Docker compose passes through `${CLAMAV_HOST:-}` / `${CLAMAV_PORT:-}`,
+  // which means the server sees literal empty strings when unset rather
+  // than missing values. Preprocess "" → undefined so the optional/
+  // coerce-number chain treats "unset" as "skip the AV scan".
+  CLAMAV_HOST: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.string().optional(),
+  ),
+  CLAMAV_PORT: z.preprocess(
+    (v) => (v === "" ? undefined : v),
+    z.coerce.number().int().positive().max(65535).optional(),
+  ),
 
   // CORS allowlist (comma separated). Falls back to dev defaults.
   CORS_ALLOWED_ORIGINS: z.string().optional(),
@@ -139,16 +205,14 @@ export const isProduction = env.NODE_ENV === "production";
 export const isTest = env.NODE_ENV === "test";
 
 /**
- * Resolved public base URL. Prefers `PUBLIC_URL`, falls back to
- * `BETTER_AUTH_URL` for deploys that haven't renamed their env var yet.
+ * Resolved public base URL. The legacy `BETTER_AUTH_URL` alias has been
+ * dropped — deploys that previously set only that var must set
+ * `PUBLIC_URL` instead.
  */
-export const publicUrl: string | undefined =
-  env.PUBLIC_URL ?? env.BETTER_AUTH_URL;
+export const publicUrl: string | undefined = env.PUBLIC_URL;
 
 if (isProduction && !publicUrl) {
-  console.error(
-    "[env] PUBLIC_URL (or BETTER_AUTH_URL) is required in production.",
-  );
+  console.error("[env] PUBLIC_URL is required in production.");
   process.exit(1);
 }
 
@@ -213,6 +277,29 @@ if (isProduction) {
   if (origins.length === 0) {
     console.error(
       "[env] CORS_ALLOWED_ORIGINS is required in production (comma-separated list of origins).",
+    );
+    process.exit(1);
+  }
+  // Reject dev-shaped origins that an operator may have copy-pasted from
+  // .env.example: any non-https origin, or a localhost/loopback host, in
+  // a CORS allowlist would let an attacker-controlled local dev server
+  // make authenticated cross-origin requests against prod.
+  const bad = origins.filter((o) => {
+    try {
+      const u = new URL(o);
+      const isLoopback =
+        u.hostname === "localhost" ||
+        u.hostname === "127.0.0.1" ||
+        u.hostname === "::1" ||
+        u.hostname.endsWith(".localhost");
+      return u.protocol !== "https:" || isLoopback;
+    } catch {
+      return true; // unparseable origin
+    }
+  });
+  if (bad.length > 0) {
+    console.error(
+      `[env] CORS_ALLOWED_ORIGINS contains non-https / localhost / invalid origins in production: ${bad.join(", ")}`,
     );
     process.exit(1);
   }

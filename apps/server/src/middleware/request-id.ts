@@ -16,17 +16,21 @@ export function requestId(
   res: Response,
   next: NextFunction,
 ): void {
-  const incoming =
+  const rawIncoming =
     typeof req.headers["x-request-id"] === "string"
       ? req.headers["x-request-id"]
       : undefined;
 
-  // Reject absurd values. A malicious client could otherwise flood logs
-  // with 10 MB "request ids".
-  const id =
-    incoming && incoming.length > 0 && incoming.length <= 128
-      ? incoming
-      : crypto.randomUUID();
+  // Sanitize: strip anything outside a safe id charset. The value is
+  // echoed back in a response header AND logged + returned in error
+  // envelopes, so an unsanitized value could carry control chars /
+  // markup that render in a log viewer or admin UI. Length-cap too, so
+  // a malicious client can't flood logs with a 10 MB "request id".
+  const incoming = rawIncoming
+    ? rawIncoming.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 128)
+    : undefined;
+
+  const id = incoming && incoming.length > 0 ? incoming : crypto.randomUUID();
 
   res.setHeader("X-Request-Id", id);
   runWithRequestContext({ requestId: id }, () => next());

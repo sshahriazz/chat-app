@@ -1,5 +1,5 @@
 import { prisma } from "../db";
-import { CACHE_NS, cacheDel, cacheGetOrSet } from "./cache";
+import { CACHE_NS, cacheDel, cacheDelStrict, cacheGetOrSet } from "./cache";
 
 /**
  * Redis-backed cache of `conversationId → userId[]` for realtime fan-out.
@@ -41,4 +41,19 @@ export async function invalidateConversation(
   conversationId: string,
 ): Promise<void> {
   await cacheDel(CACHE_NS.convMembers, conversationId);
+}
+
+/**
+ * Fail-CLOSED invalidation for membership-REMOVAL paths (kick / leave).
+ *
+ * Unlike `invalidateConversation`, this rethrows if Redis is
+ * unreachable, so a removed user cannot linger in the cached fan-out
+ * set (still receiving conversation events on their own channel) for
+ * the cache TTL. Callers are idempotent DELETE handlers, so surfacing a
+ * 5xx that the client retries is safe.
+ */
+export async function invalidateConversationStrict(
+  conversationId: string,
+): Promise<void> {
+  await cacheDelStrict(CACHE_NS.convMembers, conversationId);
 }
