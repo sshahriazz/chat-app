@@ -55,11 +55,11 @@ services:
       # supplies a fallback for the laptop.
       POSTGRES_USER: ${POSTGRES_USER:-chatapp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      POSTGRES_DB: ${POSTGRES_DB:-chatapp}
+      POSTGRES_DB: ${POSTGRES_DB:-chatapp_v2}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data_v2:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatapp} -d ${POSTGRES_DB:-chatapp}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatapp} -d ${POSTGRES_DB:-chatapp_v2}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -159,7 +159,7 @@ services:
       # definition in centrifugo.json.
       # No `:-fallback` on the password — a missing env var must fail
       # loudly rather than embed the well-known dev default `chatapp`.
-      CENTRIFUGO_CONSUMERS: '[{"name":"postgresql","type":"postgresql","enabled":true,"postgresql":{"dsn":"postgres://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}?sslmode=disable","outbox_table_name":"chat_outbox","num_partitions":1,"partition_select_limit":100,"partition_poll_interval":"300ms","partition_notification_channel":"centrifugo_partition_change"}}]'
+      CENTRIFUGO_CONSUMERS: '[{"name":"postgresql","type":"postgresql","enabled":true,"postgresql":{"dsn":"postgres://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp_v2}?sslmode=disable","outbox_table_name":"chat_outbox","num_partitions":1,"partition_select_limit":100,"partition_poll_interval":"300ms","partition_notification_channel":"centrifugo_partition_change"}}]'
     depends_on:
       postgres:
         condition: service_healthy
@@ -251,7 +251,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp_v2}
 
   # ─── Server / Express (INTERNAL) ─────────────────────────────
   server:
@@ -272,7 +272,7 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
       TZ: UTC
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp_v2}
       REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
       # The server's public base URL (used for OpenAPI server listing +
       # absolute-URL links). Required — wrong value breaks OpenAPI's
@@ -399,7 +399,12 @@ services:
     # use.
 
 volumes:
-  postgres_data:
+  # `postgres_data_v2` is a fresh volume created post-Phase-1-7 rollout.
+  # The original `postgres_data` is still on disk and can be inspected
+  # or backed up with `docker volume ls`/`inspect`; remove it with
+  # `docker volume rm <project>_postgres_data` after you've confirmed
+  # the v2 deploy is healthy and no rollback is needed.
+  postgres_data_v2:
   redis_data:
   minio_data:
   # Uncomment when enabling the clamav sidecar above.
