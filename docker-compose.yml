@@ -227,6 +227,16 @@ services:
   # ─── Prisma migrations (one-shot, INTERNAL) ──────────────────
   migrate:
     <<: *hardened
+    # Same cap_add as postgres/redis. The Dockerfile chowns /app to
+    # node:node, so the image is fine to read everywhere — but Prisma 7's
+    # `migrate deploy` CLI verifies (and may write) inside
+    # node_modules/@prisma/engines/ on startup. With `user: root` and
+    # cap_drop:[ALL] alone, root can't bypass DAC checks on the
+    # node-owned files: kernel enforces ownership without CAP_DAC_OVERRIDE.
+    # Adding the standard initdb-style caps back lets root do its job for
+    # this one-shot task. The long-running server still runs as `node`
+    # (unprivileged) and never re-execs.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     build:
       context: .
       dockerfile: apps/server/Dockerfile
