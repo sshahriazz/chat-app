@@ -148,6 +148,12 @@ model AdminAuditLog {
   // should treat it as untrusted JSON.
   details   Json     @default("{}")
   createdAt DateTime @default(now()) @map("created_at")
+  // Tamper-evident hash chain. `hash` = SHA-256(prev_hash || canonical
+  // row content); `prevHash` links to the previous row. Nullable for
+  // legacy rows written before the chain was introduced. See
+  // lib/admin-audit.ts (writeAdminAudit / verifyAuditChain).
+  prevHash  String?  @map("prev_hash")
+  hash      String?  @map("hash")
 
   @@index([action, createdAt])
   @@index([tenantId, createdAt])
