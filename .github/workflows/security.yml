@@ -101,3 +101,31 @@ jobs:
         with:
           name: sbom-cyclonedx
           path: sbom.cyclonedx.json
+
+  trivy:
+    name: trivy (IaC misconfig + fs CVE/secret)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Misconfiguration scan of Dockerfiles + docker-compose (privileged
+      # containers, missing cap_drop, root user, etc.). CASA/ASVS V14.
+      - name: Trivy config (misconfiguration)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      # Filesystem scan: vulnerable OS/lang packages + leaked secrets.
+      # Complements gitleaks (git-history) and pnpm audit (prod deps) with
+      # a whole-tree view. Add a `.trivyignore` to triage accepted findings.
+      - name: Trivy filesystem (vuln + secret)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
