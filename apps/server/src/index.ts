@@ -237,7 +237,11 @@ const docsCsp =
   "font-src 'self' data: https://cdn.jsdelivr.net; " +
   "connect-src 'self' https://cdn.jsdelivr.net https://api.scalar.com; " +
   "worker-src 'self' blob:; " +
-  "frame-ancestors 'none'; base-uri 'self'";
+  // `form-action` has no fallback to `default-src`, so it must be named
+  // explicitly or ZAP/CSP-linters flag it (rule 10055). Scalar's "send
+  // request" feature uses fetch (covered by connect-src), not <form>
+  // POST, so scoping form submissions to 'self' is safe for the docs UI.
+  "frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
 const stripCsp: express.RequestHandler = (_req, res, next) => {
   // Replace the global `default-src 'none'` with the Scalar-scoped
   // policy for the docs renderer only.
@@ -327,6 +331,29 @@ app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
       },
       "domain error",
     );
+    // Structured security-event log for authn/authz denials (ASVS V7.2).
+    // Emitted as a distinct, greppable `security.auth_denied` event keyed
+    // on the real socket peer (NOT the spoofable X-Forwarded-For) so a
+    // SIEM / alerting rule can detect credential-stuffing or enumeration
+    // sweeps without parsing generic "domain error" lines. Path only (no
+    // query string) to keep search terms / cursors out of the log.
+    if (
+      err.httpStatus === 401 ||
+      err.httpStatus === 403 ||
+      err.httpStatus === 410
+    ) {
+      req.log?.warn(
+        {
+          event: "security.auth_denied",
+          code: err.code,
+          status: err.httpStatus,
+          method: req.method,
+          path: req.path,
+          actorIp: req.socket.remoteAddress,
+        },
+        "security auth denied",
+      );
+    }
     res.status(err.httpStatus).json({
       status: err.httpStatus,
       error: err.message,
@@ -464,6 +491,27 @@ import("node-cron").then(({ default: cron }) => {
         logger.error(
           { err: { message: (err as Error).message } },
           "cron attachments-gc failed",
+        );
+      }
+    });
+  });
+
+  // GDPR deletion-tombstone GC — nightly at 03:20. Purges expired
+  // `DeletedExternalId` rows once their 30-day stickiness has elapsed so
+  // the table stays bounded and data-minimization is honored (ASVS
+  // V8.3). Idempotent, so per-instance scheduling is safe under a
+  // multi-instance deploy.
+  import("./lib/tombstone-gc").then(({ gcExpiredTombstones }) => {
+    cron.schedule("20 3 * * *", async () => {
+      try {
+        const result = await gcExpiredTombstones();
+        if (result.deleted > 0) {
+          logger.info({ deleted: result.deleted }, "cron tombstone-gc");
+        }
+      } catch (err) {
+        logger.error(
+          { err: { message: (err as Error).message } },
+          "cron tombstone-gc failed",
         );
       }
     });

@@ -1,0 +1,6 @@
+# chat-app security contact — https://datatracker.ietf.org/doc/html/rfc9116
+# NOTE (operator): confirm the contact inbox exists, then keep `Expires` < 1 year out.
+Contact: mailto:security@technext.it
+Expires: 2027-07-26T00:00:00.000Z
+Preferred-Languages: en
+Policy: https://chat.technext.it/docs/security/VULNERABILITY_DISCLOSURE_POLICY.md

@@ -217,6 +217,35 @@ if (isProduction && !publicUrl) {
 }
 
 /**
+ * Production hard-fail: JWT_SECRET_ENCRYPTION_KEY is required in prod.
+ * Without it, every `Tenant.jwtSecret` (the HMAC key that authenticates
+ * ALL of a tenant's user JWTs) is persisted in Postgres as plaintext, so
+ * a single DB backup leak would enable token forgery for every user of
+ * every tenant. In dev the key stays optional so `docker compose up`
+ * works with zero setup; in prod it is mandatory (CASA/ASVS V6.2 —
+ * secrets encrypted at rest). Generate with: `openssl rand -base64 32`.
+ */
+if (isProduction && !env.JWT_SECRET_ENCRYPTION_KEY) {
+  console.error(
+    "[env] JWT_SECRET_ENCRYPTION_KEY is required in production (base64-encoded 32-byte key). Generate with: openssl rand -base64 32",
+  );
+  process.exit(1);
+}
+
+/**
+ * Production advisory (non-fatal): recommend anti-malware scanning when
+ * user uploads are enabled. Magic-byte sniffing + private bucket + signed
+ * URLs are the primary defenses; ClamAV is defense-in-depth (CASA/ASVS
+ * V12.6). We warn rather than fail because the clamd sidecar is a heavy
+ * (~1.2 GB) opt-in and some deployments accept the residual risk.
+ */
+if (isProduction && env.S3_BUCKET && !env.CLAMAV_HOST) {
+  console.warn(
+    "[env] attachments are enabled but no CLAMAV_HOST is configured — uploads are not AV-scanned. Set CLAMAV_HOST/CLAMAV_PORT to enable (recommended), or accept the documented compensating controls (magic-byte sniffing, private bucket, signed URLs).",
+  );
+}
+
+/**
  * Production hard-fail on known dev-only secrets. Compose ships with
  * placeholder defaults so `docker compose up` works out of the box in
  * development; shipping those to production silently would be a major

@@ -73,6 +73,31 @@ async function request<T>(
         typeof (errBody as { error?: unknown }).error === "string"
         ? (errBody as { error: string }).error
         : res.statusText) || res.statusText;
+    // 401 Unauthorized: the bearer token is missing, invalid, expired,
+    // or has been revoked server-side. Revocation is a first-class
+    // security primitive — `POST /api/users/me/revoke` ("log out
+    // everywhere") and the `tokensValidAfter` horizon both cause every
+    // outstanding JWT to start returning 401. In a bearer-only client
+    // (no cookies) there is nothing to silently refresh, so the correct
+    // response is to drop the local token and fall back to the sign-in
+    // screen. Clearing the token fires `onAuthTokenChange(null)`, which
+    // flips `useSession` to unauthenticated and renders <AuthForm/>.
+    // Guard against clobbering the session while it's still booting
+    // (no token attached yet) — only react when we actually sent one.
+    if (res.status === 401 && token && typeof window !== "undefined") {
+      try {
+        const { setAuthToken } = await import("./auth-token");
+        setAuthToken(null);
+      } catch {
+        /* ignore */
+      }
+      // Deep routes (e.g. /settings) won't render <AuthForm/> on their
+      // own, so route home where the auth gate lives. Skip if we're
+      // already there (the reactive state change handles it).
+      if (window.location.pathname !== "/") {
+        window.location.replace("/");
+      }
+    }
     // 410 Gone: the server-side GDPR tombstone has rejected this
     // user's token — the account has been deleted (sticky for 30 days).
     // Clear the local token and bounce to the "account deleted" page

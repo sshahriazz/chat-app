@@ -43,10 +43,10 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # `--prod` skips dev dependencies; `--audit-level high` exits
-      # non-zero only on high or critical advisories. Tune up to
-      # `moderate` once the baseline is clean.
-      - run: pnpm audit --prod --audit-level high
+      # `--prod` skips dev dependencies; `--audit-level moderate` exits
+      # non-zero on moderate advisories and above (CASA/ASVS V10.3 wants
+      # a documented process for moderate+, not just high/critical).
+      - run: pnpm audit --prod --audit-level moderate
 
   typecheck-test:
     name: typecheck + unit tests (server)
@@ -82,3 +82,22 @@ jobs:
       - run: semgrep ci --config p/owasp-top-ten --config p/javascript --config p/typescript
         env:
           SEMGREP_TIMEOUT: "120"
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Generate a CycloneDX software bill of materials from the repo +
+      # lockfile. CASA/ASVS V10.3 evidence: a machine-readable inventory
+      # of every dependency and version shipped. Uploaded as a build
+      # artifact so it can be attached to the CASA workbook each release.
+      - uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cyclonedx.json

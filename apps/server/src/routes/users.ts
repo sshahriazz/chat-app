@@ -431,9 +431,13 @@ router.delete("/me", requireAuth, generalLimiter, async (req, res) => {
 
   // 6. Audit log. Emit at info level so it lands in the primary log
   //    stream and can be filtered for compliance reports.
+  // Do NOT log email (or any PII) here — the userId is a stable,
+  // non-PII handle sufficient for compliance tracing, and the deletion
+  // itself is separately captured (tombstone row). Logging the email of
+  // a user exercising "right to be forgotten" would defeat the purpose
+  // and violate data-minimization (CASA/ASVS V7.1).
   logger.info("gdpr: user deleted", {
     userId: user.id,
-    email: user.email,
     attachmentsDeleted: s3Keys.length,
   });
 
