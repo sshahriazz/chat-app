@@ -2,6 +2,7 @@ import webpush, { type PushSubscription as WPSubscription } from "web-push";
 import { env } from "../env";
 import { prisma } from "../db";
 import { logger } from "./logger";
+import { decryptField } from "./field-crypto";
 
 /**
  * Web Push dispatch. Kept lazy so the server can boot without VAPID
@@ -60,11 +61,15 @@ export async function pushToUsers(
 
   await Promise.all(
     subs.map(async (s) => {
-      const subscription: WPSubscription = {
-        endpoint: s.endpoint,
-        keys: { p256dh: s.p256dh, auth: s.auth },
-      };
       try {
+        // Decrypt at-rest keys (passthrough for legacy plaintext rows).
+        // Kept inside the try so a decrypt failure (e.g. the field key was
+        // rotated away) skips this one subscription rather than breaking
+        // the whole dispatch — pushToUsers must never throw.
+        const subscription: WPSubscription = {
+          endpoint: s.endpoint,
+          keys: { p256dh: decryptField(s.p256dh), auth: decryptField(s.auth) },
+        };
         // 5s timeout so a hung/slow (or internal, if an old unfiltered
         // endpoint slipped through) target can't tie up the dispatch.
         await webpush.sendNotification(subscription, body, {

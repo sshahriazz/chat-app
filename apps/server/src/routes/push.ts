@@ -8,6 +8,7 @@ import {
   PushUnsubscribeBodySchema,
 } from "../http/schemas";
 import { ConflictError, ServiceUnavailableError } from "../http/errors";
+import { encryptFieldIfEnabled } from "../lib/field-crypto";
 
 const router: Router = Router();
 
@@ -62,14 +63,17 @@ router.post(
         tenantId,
         userId: user.id,
         endpoint: body.endpoint,
-        p256dh: body.keys.p256dh,
-        auth: body.keys.auth,
+        // Encrypt the Web Push keys at rest when FIELD_ENCRYPTION_KEY is
+        // set (no-op passthrough otherwise). These are non-searched
+        // secrets, so field encryption costs nothing functionally.
+        p256dh: encryptFieldIfEnabled(body.keys.p256dh),
+        auth: encryptFieldIfEnabled(body.keys.auth),
       },
       update: {
         // Only the keys can change — userId/tenantId are pinned via the
         // ownership check above and intentionally not in this update.
-        p256dh: body.keys.p256dh,
-        auth: body.keys.auth,
+        p256dh: encryptFieldIfEnabled(body.keys.p256dh),
+        auth: encryptFieldIfEnabled(body.keys.auth),
       },
     });
 

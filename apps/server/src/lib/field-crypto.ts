@@ -97,3 +97,19 @@ export function decryptField(stored: string): string {
   if (!isEncrypted(stored)) return stored;
   return decryptWithKey(stored, fieldKey());
 }
+
+/** Whether field encryption is configured (FIELD_ENCRYPTION_KEY present). */
+export function isFieldCryptoEnabled(): boolean {
+  return Boolean(process.env["FIELD_ENCRYPTION_KEY"]);
+}
+
+/**
+ * Encrypt when a key is configured, else return plaintext unchanged. Lets a
+ * deployment opt into field encryption WITHOUT a data migration: existing
+ * plaintext rows keep working (`decryptField` passes them through), and new
+ * writes become ciphertext once the key is set. Backfill of old rows is
+ * optional and can run lazily.
+ */
+export function encryptFieldIfEnabled(plaintext: string): string {
+  return isFieldCryptoEnabled() ? encryptField(plaintext) : plaintext;
+}

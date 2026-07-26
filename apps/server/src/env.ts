@@ -115,6 +115,27 @@ const EnvSchema = z.object({
       },
       "JWT_SECRET_ENCRYPTION_KEY must decode to exactly 32 bytes (base64)",
     ),
+  // Optional base64-encoded 32-byte key for application-layer field
+  // encryption (lib/field-crypto.ts) of non-searched sensitive columns
+  // (push-subscription keys, etc.). Keep DISTINCT from
+  // JWT_SECRET_ENCRYPTION_KEY (key separation by purpose). When unset,
+  // those columns are stored as plaintext (current behavior) — enabling
+  // the key needs no migration: new writes encrypt, old plaintext rows
+  // still read (decrypt passes plaintext through). Same 32-byte rule.
+  FIELD_ENCRYPTION_KEY: z
+    .string()
+    .optional()
+    .refine(
+      (s) => {
+        if (s === undefined || s === "") return true;
+        try {
+          return Buffer.from(s, "base64").length === 32;
+        } catch {
+          return false;
+        }
+      },
+      "FIELD_ENCRYPTION_KEY must decode to exactly 32 bytes (base64)",
+    ),
   // When "true", every `POST /api/webhooks/*` request must carry a
   // valid `X-Chat-Signature` header (HMAC-SHA256 of the raw request
   // body signed with the tenant's apiKey). Defaults to ON: a leaked
