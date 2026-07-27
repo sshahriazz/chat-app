@@ -12,12 +12,26 @@ Infrastructure-layer controls that complement the application hardening. Maps to
 
 Choose based on the "keep all search" constraint (see [THREAT_MODEL.md](./THREAT_MODEL.md) §5):
 
-### Recommended: `pg_tde` (Percona TDE) + Vault principal key
-Transparent DB-layer encryption of tables, indexes, and WAL. **Preserves 100% of search** (decrypts below SQL), with the principal key in Vault (key/data separation).
-- Switch the DB image from `postgres:17-alpine` to **Percona Distribution for PostgreSQL** (ships `pg_tde`).
-- Store the **principal key in HashiCorp Vault** (KMIP), not a local keyring file.
-- Migrate the data directory; validate perf (~single-digit % overhead with AES-NI).
-- **Covers:** leaked backup / stolen disk / compliance. **Does NOT cover:** live DB read / rogue DBA / SQLi (transparent = plaintext to any query).
+### `pg_tde` (Percona TDE) — **implemented in dev, proven encrypting**
+Transparent DB-layer encryption via the `tde_heap` access method. **Preserves 100% of search** (decrypts below SQL). **Covers:** leaked backup / stolen disk / compliance. **Does NOT cover:** live DB read / rogue DBA / SQLi (transparent = plaintext to any authenticated query — that's what field-crypto + least-priv roles are for).
+
+**Dev (already wired):** `compose.dev.yml` runs **Percona Distribution for PostgreSQL 17** (ships `pg_tde` 2.2) with `shared_preload_libraries=pg_tde`; `docker/postgres-init/01-pg-tde.sh` creates the extension + a **file** key provider + principal key and sets `default_table_access_method='tde_heap'` so every migrate-created table is encrypted. Verified: all app tables report `amname=tde_heap`, a message written via the API is **absent as plaintext** in the raw `messages` file on disk, yet reads back normally, and the full suite (86) + isolation suite pass. `make dev-nuke && make dev` to pick it up.
+
+> The dev keyring lives inside PGDATA purely to prove the mechanism — that's key-next-to-data, which is pointless in production.
+
+**Prod activation:**
+1. Swap the `postgres` image → `percona/percona-distribution-postgresql:17`; set `PGDATA` to your data-volume mount; add `command: postgres -c shared_preload_libraries=pg_tde` (+ run the container as root/uid 0 for the entrypoint's perms fixup, as dev does).
+2. Use the **Vault** global provider so the principal key is separate from the data (NOT the file provider):
+   ```sql
+   CREATE EXTENSION pg_tde;
+   SELECT pg_tde_add_global_key_provider_vault_v2('vault_provider', :'vault_token', :'vault_url', :'vault_mount', NULL);
+   SELECT pg_tde_create_key_using_global_key_provider('principal', 'vault_provider');
+   SELECT pg_tde_set_default_key_using_global_key_provider('principal', 'vault_provider');
+   ALTER DATABASE <db> SET default_table_access_method = 'tde_heap';
+   ```
+3. **Existing tables** created before TDE stay `heap` — rewrite them to encrypt: `ALTER TABLE <t> SET ACCESS METHOD tde_heap;` (takes a lock; do per-table in a low-traffic window), or dump/restore into the TDE-default DB.
+4. *(Optional)* WAL encryption: set a **server** key (`pg_tde_set_server_key_using_global_key_provider`) then `ALTER SYSTEM SET pg_tde.wal_encrypt=on` + restart.
+5. Validate perf (~single-digit % with AES-NI).
 
 ### Baseline alternative: encrypted volume (LUKS / cloud disk)
 Simpler, no DB change, but one key unlocks everything and no WAL/backup granularity. Use if you can't adopt Percona yet.

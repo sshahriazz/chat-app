@@ -32,11 +32,25 @@ services:
       - "127.0.0.1:${WEB_PORT:-3000}:3000"
 
   postgres:
+    # pg_tde transparent data-at-rest encryption (DEV). Percona
+    # Distribution for PostgreSQL ships pg_tde; the base compose keeps
+    # stock postgres:17-alpine (no pg_tde), so PROD is unchanged until you
+    # opt in (see DEPLOYMENT_RUNBOOK / OPS_HARDENING).
+    image: percona/percona-distribution-postgresql:17
+    # The Percona image sets USER 26; run the entrypoint as root (like the
+    # stock postgres image) so it can fix data-dir perms then drop to the
+    # postgres user itself. cap_add (CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID)
+    # from the base makes that possible under cap_drop:[ALL].
+    user: "0:0"
+    # Preload pg_tde so CREATE EXTENSION + the tde_heap access method work.
+    command: postgres -c shared_preload_libraries=pg_tde
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatapp}
-    # Create the non-superuser `chatapp_app` role on fresh init so RLS
-    # enforces in dev (see docker/postgres-init/00-app-role.sql). Merged
-    # with the base data volume; runs only when the volume is empty.
+      # Percona's default PGDATA is /data/db; pin it to the base volume's
+      # mount path so postgres_data_v2 is used unchanged.
+      PGDATA: /var/lib/postgresql/data
+    # Init scripts (fresh volume only): 00 creates the non-superuser
+    # chatapp_app role (RLS); 01 enables pg_tde + tde_heap default.
     volumes:
       - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     # All dev port bindings are pinned to 127.0.0.1 so backing services
