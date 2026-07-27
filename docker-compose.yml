@@ -45,7 +45,16 @@ services:
     <<: *hardened
     # initdb / the entrypoint's privilege-drop need these back.
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
-    image: postgres:17-alpine
+    # Default: stock Postgres. For pg_tde at-rest encryption (Phase 3 of
+    # docs/security/PRODUCTION_GO_LIVE.md) set in the deploy env:
+    #   POSTGRES_IMAGE=percona/percona-distribution-postgresql:17
+    #   POSTGRES_COMMAND=postgres -c shared_preload_libraries=pg_tde
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    command: ${POSTGRES_COMMAND:-postgres}
+    # Run the entrypoint as root so it can fix data-dir perms then drop to
+    # the postgres user itself — required by the Percona (pg_tde) image;
+    # a no-op for stock Postgres, which already starts as root.
+    user: "0:0"
     restart: unless-stopped
     networks: [dokploy-network]
     environment:
@@ -56,6 +65,9 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-chatapp}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: ${POSTGRES_DB:-chatapp_v2}
+      # Percona's default PGDATA is /data/db; pin to the volume mount so
+      # stock and Percona images use the same data path.
+      PGDATA: /var/lib/postgresql/data
     volumes:
       - postgres_data_v2:/var/lib/postgresql/data
     healthcheck:
@@ -272,7 +284,11 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
       TZ: UTC
-      DATABASE_URL: postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-chatapp_v2}
+      # The SERVER connects as APP_DATABASE_URL when set — point this at the
+      # non-superuser `chatapp_app` role to ACTIVATE Row-Level Security
+      # (Phase 1 of docs/security/PRODUCTION_GO_LIVE.md). The `migrate`
+      # service keeps the owner URL below (it needs DDL). Default: owner.
+      DATABASE_URL: ${APP_DATABASE_URL:-postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chatapp_v2}}
       REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
       # The server's public base URL (used for OpenAPI server listing +
       # absolute-URL links). Required — wrong value breaks OpenAPI's

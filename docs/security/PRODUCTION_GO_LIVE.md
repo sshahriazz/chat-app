@@ -56,9 +56,11 @@ RLS only enforces when the app connects as a **non-superuser** role. Prod has ex
    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO chatapp_app;  -- future
    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO chatapp_app;
    ```
-2. **Split the connections** in Dokploy:
-   - `migrate` service `DATABASE_URL` → keep the **owner** (needs DDL).
-   - `server` service `DATABASE_URL` → point at **`chatapp_app`**.
+2. **Set `APP_DATABASE_URL`** in the deploy env (the base compose routes the
+   **server** to it while `migrate` keeps the owner URL — no compose edit):
+   ```
+   APP_DATABASE_URL=postgresql://chatapp_app:<pw>@postgres:5432/<db>
+   ```
 3. **Redeploy the server.**
 4. **Verify enforcement** (as the app role):
    ```sql
@@ -86,7 +88,12 @@ RLS only enforces when the app connects as a **non-superuser** role. Prod has ex
 Encrypts message content/email/all tables at rest while preserving search. Requires an image swap, a key store, and a **rewrite of existing tables** (they were created as plain `heap`).
 
 1. **Stand up HashiCorp Vault** (or KMIP) reachable from the DB — the principal key must live **separate from the data** (the dev file-provider is a mechanism proof only).
-2. **Swap the prod `postgres` image** → `percona/percona-distribution-postgresql:17`; set `PGDATA` to your data-volume mount; `command: postgres -c shared_preload_libraries=pg_tde`; run the container as **root (uid 0)** so the entrypoint fixes perms then drops. *(Percona is PostgreSQL-compatible; restore your dump into it.)*
+2. **Switch the DB to Percona** via deploy env (the base compose already pins `PGDATA` + runs the entrypoint as root — no compose edit):
+   ```
+   POSTGRES_IMAGE=percona/percona-distribution-postgresql:17
+   POSTGRES_COMMAND=postgres -c shared_preload_libraries=pg_tde
+   ```
+   *(Percona is PostgreSQL-compatible; restore your dump into it on a fresh volume.)*
 3. **Enable + key (Vault provider):**
    ```sql
    CREATE EXTENSION pg_tde;
@@ -95,12 +102,7 @@ Encrypts message content/email/all tables at rest while preserving search. Requi
    SELECT pg_tde_set_default_key_using_global_key_provider('principal', 'vault');
    ALTER DATABASE <db> SET default_table_access_method = 'tde_heap';   -- future tables
    ```
-4. **Encrypt existing tables** (low-traffic window; each takes a rewrite lock):
-   ```sql
-   ALTER TABLE "user" SET ACCESS METHOD tde_heap;
-   ALTER TABLE messages SET ACCESS METHOD tde_heap;
-   -- …repeat for every table (or dump/restore into the TDE-default DB)
-   ```
+4. **Encrypt existing tables** — run [`pg_tde-encrypt-existing-tables.sql`](./pg_tde-encrypt-existing-tables.sql) (idempotent; rewrites every `public` table to `tde_heap`). Low-traffic window; each takes an `ACCESS EXCLUSIVE` rewrite lock.
 5. **Verify:** every table `amname = tde_heap`; a message sent via the API is **absent as plaintext** in the raw data file on disk (`pg_relation_filepath` + `grep`), yet reads back; app smoke passes.
 6. *(Optional)* WAL encryption: `pg_tde_set_server_key_using_global_key_provider(...)` then `ALTER SYSTEM SET pg_tde.wal_encrypt=on` + restart.
 7. **Rollback:** `ALTER TABLE … SET ACCESS METHOD heap` (decrypts back) and revert the image. **Take a verified backup before starting** — this phase touches every table.
