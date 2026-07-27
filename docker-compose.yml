@@ -45,12 +45,15 @@ services:
     <<: *hardened
     # initdb / the entrypoint's privilege-drop need these back.
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
-    # Default: stock Postgres. For pg_tde at-rest encryption (Phase 3 of
-    # docs/security/PRODUCTION_GO_LIVE.md) set in the deploy env:
-    #   POSTGRES_IMAGE=percona/percona-distribution-postgresql:17
-    #   POSTGRES_COMMAND=postgres -c shared_preload_libraries=pg_tde
-    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
-    command: ${POSTGRES_COMMAND:-postgres}
+    # Percona Distribution for PostgreSQL ships pg_tde (transparent at-rest
+    # encryption); it is the DEFAULT so a fresh deploy self-activates pg_tde
+    # via docker/postgres-init/01-pg-tde.sh. To run stock Postgres instead
+    # (no at-rest encryption) override in the deploy env:
+    #   POSTGRES_IMAGE=postgres:17-alpine
+    #   POSTGRES_COMMAND=postgres
+    # (01-pg-tde.sh skips itself gracefully when pg_tde isn't preloaded.)
+    image: ${POSTGRES_IMAGE:-percona/percona-distribution-postgresql:17}
+    command: ${POSTGRES_COMMAND:-postgres -c shared_preload_libraries=pg_tde}
     # Run the entrypoint as root so it can fix data-dir perms then drop to
     # the postgres user itself — required by the Percona (pg_tde) image;
     # a no-op for stock Postgres, which already starts as root.
@@ -69,7 +72,14 @@ services:
       # stock and Percona images use the same data path.
       PGDATA: /var/lib/postgresql/data
     volumes:
-      - postgres_data_v2:/var/lib/postgresql/data
+      - postgres_data_v3:/var/lib/postgresql/data
+      # Fresh-init automation (runs ONCE, only when the volume is empty;
+      # skipped on every later redeploy): 00 creates the non-superuser
+      # chatapp_app role so RLS enforces; 01 enables pg_tde + makes tde_heap
+      # the default access method so every table is born encrypted. Ordinary
+      # redeploys never re-run these — the role, keyring, and encryption
+      # persist in the volume.
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chatapp} -d ${POSTGRES_DB:-chatapp_v2}"]
       interval: 5s
@@ -284,11 +294,15 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
       TZ: UTC
-      # The SERVER connects as APP_DATABASE_URL when set — point this at the
-      # non-superuser `chatapp_app` role to ACTIVATE Row-Level Security
-      # (Phase 1 of docs/security/PRODUCTION_GO_LIVE.md). The `migrate`
-      # service keeps the owner URL below (it needs DDL). Default: owner.
-      DATABASE_URL: ${APP_DATABASE_URL:-postgresql://${POSTGRES_USER:-chatapp}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chatapp_v2}}
+      # The SERVER connects as the non-superuser `chatapp_app` role by
+      # DEFAULT, so Row-Level Security enforces out of the box (Postgres
+      # bypasses RLS for superusers). That role is auto-created on fresh init
+      # by docker/postgres-init/00-app-role.sh with this same POSTGRES_PASSWORD
+      # (isolation comes from NOSUPERUSER, not a separate secret). The
+      # `migrate` service keeps the owner URL below (it needs DDL). Override
+      # APP_DATABASE_URL to point the server elsewhere (e.g. a distinct app-role
+      # password, or back at the owner to disable RLS).
+      DATABASE_URL: ${APP_DATABASE_URL:-postgresql://chatapp_app:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-chatapp_v2}}
       REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
       # The server's public base URL (used for OpenAPI server listing +
       # absolute-URL links). Required — wrong value breaks OpenAPI's
@@ -433,12 +447,14 @@ services:
     # use.
 
 volumes:
-  # `postgres_data_v2` is a fresh volume created post-Phase-1-7 rollout.
-  # The original `postgres_data` is still on disk and can be inspected
-  # or backed up with `docker volume ls`/`inspect`; remove it with
-  # `docker volume rm <project>_postgres_data` after you've confirmed
-  # the v2 deploy is healthy and no rollback is needed.
-  postgres_data_v2:
+  # `postgres_data_v3` is a FRESH volume for the automated RLS + pg_tde
+  # rollout — the bump from v2 guarantees the postgres-init scripts run
+  # (they only fire on an empty data dir), so the app-role and encryption
+  # can't half-apply to a pre-existing volume. The old `postgres_data_v2`
+  # (and `postgres_data`) stay on disk; remove with
+  # `docker volume rm <project>_postgres_data_v2` once the v3 deploy is
+  # confirmed healthy.
+  postgres_data_v3:
   redis_data:
   minio_data:
   # Uncomment when enabling the clamav sidecar above.
