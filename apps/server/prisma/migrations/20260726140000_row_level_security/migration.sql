@@ -39,10 +39,12 @@ BEGIN
       CREATE POLICY tenant_isolation ON %I
         USING (
           current_setting('app.current_tenant_id', true) IS NULL
+          OR current_setting('app.current_tenant_id', true) = ''
           OR tenant_id = current_setting('app.current_tenant_id', true)
         )
         WITH CHECK (
           current_setting('app.current_tenant_id', true) IS NULL
+          OR current_setting('app.current_tenant_id', true) = ''
           OR tenant_id = current_setting('app.current_tenant_id', true)
         )
     $f$, t);

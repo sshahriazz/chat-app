@@ -145,6 +145,9 @@ router.post(
     // pass the check, and the cap is blown by up to N×maxFile. Both the
     // per-user cap and the optional per-tenant cap are checked here.
     const attachment = await runInManagedTx(() => prisma.$transaction(async (tx) => {
+      // inManagedTx: the RLS extension skips this tx's queries, so set the
+      // tenant GUC here so RLS scopes the aggregate + insert below.
+      await tx.$executeRaw`SELECT set_config('app.current_tenant_id', ${tenantId}, true)`;
       await acquireTenantLock(tx, tenantId, "attach-quota");
 
       const userAgg = await tx.attachment.aggregate({

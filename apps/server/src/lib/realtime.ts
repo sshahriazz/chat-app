@@ -1,6 +1,6 @@
 import { prisma } from "../db";
 import { Prisma } from "../generated/prisma/client";
-import { runInManagedTx } from "./tenant-context";
+import { runInManagedTx, getTenantId } from "./tenant-context";
 import type { TxClient } from "../infra/prisma";
 import * as centrifugo from "./centrifugo";
 
@@ -67,6 +67,10 @@ export async function withRealtime<T>(
   const queue: PublishIntent[] = [];
 
   const result = await runInManagedTx(() => prisma.$transaction(async (tx) => {
+    // This interactive tx is inManagedTx (the RLS extension skips its
+    // queries), so it must set the tenant GUC itself so RLS scopes the
+    // writes below. '' when there's no ambient tenant (fail-open).
+    await tx.$executeRaw`SELECT set_config('app.current_tenant_id', ${getTenantId() ?? ""}, true)`;
     const rt: RealtimeTx = {
       tx,
       enqueue: (intent) => queue.push(intent),

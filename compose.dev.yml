@@ -34,6 +34,11 @@ services:
   postgres:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-chatapp}
+    # Create the non-superuser `chatapp_app` role on fresh init so RLS
+    # enforces in dev (see docker/postgres-init/00-app-role.sql). Merged
+    # with the base data volume; runs only when the volume is empty.
+    volumes:
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
     # All dev port bindings are pinned to 127.0.0.1 so backing services
     # (Postgres, Redis, MinIO, Centrifugo admin) are reachable only from
     # the developer's machine — never from the LAN / public Wi-Fi the
@@ -65,6 +70,12 @@ services:
     ports:
       - "127.0.0.1:${SERVER_HOST_PORT:-3001}:3001"
     environment:
+      # Connect the APP as the non-superuser `chatapp_app` role so RLS
+      # actually enforces in dev (superusers bypass RLS). The `migrate`
+      # service keeps the owner role from docker-compose.yml, so DDL still
+      # runs as chatapp. Prod does the equivalent via its deploy env
+      # (DEPLOYMENT_RUNBOOK.md "Activate RLS").
+      DATABASE_URL: postgresql://chatapp_app:${APP_DB_PASSWORD:-chatapp_app}@postgres:5432/${POSTGRES_DB:-chatapp_v2}
       # Fallbacks for the vars `docker-compose.yml` now marks
       # `${VAR:?required}`. Without these, `make dev` would refuse to
       # boot if your root `.env` was empty or missing one of them.

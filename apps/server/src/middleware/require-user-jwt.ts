@@ -102,13 +102,20 @@ export async function requireUserJwt(
         ? rawScope.slice(0, 128)
         : null;
 
-    const user = await upsertFederatedUser(tenant.id, {
-      externalId,
-      name,
-      image,
-      email,
-      scope,
-    });
+    // Run the federated upsert in this tenant's context so the RLS
+    // extension sets the GUC to tenant.id — the INSERT of a new user row
+    // must satisfy the WITH CHECK (tenant_id = GUC), and reads must see
+    // this tenant. (Without the explicit context it would run fail-open,
+    // which is fine for reads but relies on the GUC being unset.)
+    const user = await runWithTenant(tenant.id, () =>
+      upsertFederatedUser(tenant.id, {
+        externalId,
+        name,
+        image,
+        email,
+        scope,
+      }),
+    );
 
     // Token revocation horizon. Tokens whose `iat` predates
     // `user.tokensValidAfter` are rejected even if signature, audience,

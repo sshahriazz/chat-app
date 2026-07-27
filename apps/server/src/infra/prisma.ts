@@ -60,18 +60,23 @@ export const prisma = base.$extends({
     $allModels: {
       async $allOperations({ args, query }) {
         const ctx = tenantContext.getStore();
-        // No tenant context (system/cron/admin/boot, and auth-resolution
-        // queries that run before request context is established) OR
-        // already inside an app-managed interactive transaction: run
-        // as-is. RLS is fail-open-when-no-context, so this is safe; the
-        // app-layer tenant filters remain the primary control there.
-        if (!ctx?.tenantId || ctx.inManagedTx) {
+        // Inside an app-managed interactive transaction (withRealtime,
+        // attachment-quota): that transaction sets its own GUC as its
+        // first statement, so don't wrap here — a nested transaction
+        // would break atomicity.
+        if (ctx?.inManagedTx) {
           return query(args);
         }
-        // Set the tenant GUC (transaction-local) then run the query in the
-        // same transaction so the RLS policy restricts it to this tenant.
+        // Set the tenant GUC transaction-locally, then run the query in
+        // the SAME transaction so the RLS policy restricts it. For
+        // no-context paths (system/cron/admin/boot, auth-resolution reads)
+        // we set it to '' — an explicit RESET so a pooled connection can
+        // never inherit a stale tenant from a prior request and wrongly
+        // restrict cross-tenant work. The policy treats '' (and NULL) as
+        // fail-open. `set_config(..., true)` reverts on commit.
+        const tenantId = ctx?.tenantId ?? "";
         const [, result] = await base.$transaction([
-          base.$executeRaw`SELECT set_config('app.current_tenant_id', ${ctx.tenantId}, true)`,
+          base.$executeRaw`SELECT set_config('app.current_tenant_id', ${tenantId}, true)`,
           query(args),
         ]);
         return result;
