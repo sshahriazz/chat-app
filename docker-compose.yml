@@ -308,6 +308,16 @@ services:
       # report req.ip as the real client — critical for rate limiting
       # + admin IP allowlist enforcement.
       TRUST_PROXY: ${TRUST_PROXY:-2}
+      # PREFERRED over TRUST_PROXY: comma-separated trusted proxy IPs/CIDRs.
+      # When set, Express only honors X-Forwarded-* from these sources,
+      # closing the X-Forwarded-For spoof window (rate-limit + admin
+      # IP-allowlist bypass). Set to Traefik's address/range on the
+      # dokploy-network. Unset → falls back to the TRUST_PROXY hop count.
+      TRUST_PROXY_CIDRS: ${TRUST_PROXY_CIDRS:-}
+      # Optional bearer token gating GET /metrics. When set, Prometheus
+      # must send `Authorization: Bearer <token>` (min 16 chars). Leave
+      # unset only if /metrics is firewalled to an internal network.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       # Tenancy admin gate. Unset → admin endpoints return 403.
       # Rotate in Dokploy env when bootstrapping real tenants.
       MASTER_API_KEY: ${MASTER_API_KEY:-}
@@ -327,12 +337,20 @@ services:
       # is auto-mounted whenever NODE_ENV !== "production". No env var
       # toggle: setting NODE_ENV=production in this compose disables it
       # unconditionally.
-      # Optional: base64-encoded 32-byte key that wraps Tenant.jwtSecret
-      # at rest (AES-256-GCM). If unset, secrets are stored plaintext
-      # (HMAC requires plaintext at verify time, so this is a DB-at-rest
-      # defense — unwrap happens in memory only). Existing plaintext
-      # rows are still readable; new writes go through the wrap.
+      # REQUIRED IN PRODUCTION — base64-encoded 32-byte key that wraps
+      # Tenant.jwtSecret at rest (AES-256-GCM). The server REFUSES TO BOOT
+      # in prod without it (env.ts): every tenant's HMAC signing key would
+      # otherwise sit plaintext in Postgres, so one DB-backup leak enables
+      # token forgery for every user. Unwrap happens in memory only;
+      # existing plaintext rows still read. Generate: openssl rand -base64 32
       JWT_SECRET_ENCRYPTION_KEY: ${JWT_SECRET_ENCRYPTION_KEY:-}
+      # Optional (Phase 2): base64-encoded 32-byte key for application-layer
+      # field encryption of non-searched sensitive columns (push-subscription
+      # keys). MUST be DISTINCT from JWT_SECRET_ENCRYPTION_KEY. Unset → those
+      # columns stay plaintext (current behavior); enabling needs no migration
+      # (new writes encrypt, legacy plaintext still reads). Generate:
+      # openssl rand -base64 32
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:-}
       # Optional: if "true", every POST /api/webhooks/* must carry a
       # valid X-Chat-Signature header (HMAC-SHA256 of the raw body
       # signed with the tenant's apiKey). Off by default so existing
