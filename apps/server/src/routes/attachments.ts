@@ -2,6 +2,7 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/auth";
 import { prisma } from "../db";
+import { runInManagedTx } from "../lib/tenant-context";
 import {
   createUploadUrl,
   createDownloadUrl,
@@ -143,7 +144,7 @@ router.post(
     // race — without it, N parallel uploads each read the old sum, all
     // pass the check, and the cap is blown by up to N×maxFile. Both the
     // per-user cap and the optional per-tenant cap are checked here.
-    const attachment = await prisma.$transaction(async (tx) => {
+    const attachment = await runInManagedTx(() => prisma.$transaction(async (tx) => {
       await acquireTenantLock(tx, tenantId, "attach-quota");
 
       const userAgg = await tx.attachment.aggregate({
@@ -188,7 +189,7 @@ router.post(
           height: attHeight,
         },
       });
-    });
+    }));
 
     res.status(201).json({
       attachmentId: attachment.id,

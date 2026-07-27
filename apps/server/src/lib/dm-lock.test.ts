@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { Prisma } from "../generated/prisma/client";
+import type { TxClient } from "../infra/prisma";
 import { acquireDmLock } from "./dm-lock";
 
 /**
@@ -16,7 +16,7 @@ import { acquireDmLock } from "./dm-lock";
 
 function makeTx() {
   const $executeRaw = vi.fn().mockResolvedValue([]);
-  const tx = { $executeRaw } as unknown as Prisma.TransactionClient;
+  const tx = { $executeRaw } as unknown as TxClient;
   return { tx, $executeRaw };
 }
 

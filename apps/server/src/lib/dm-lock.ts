@@ -1,4 +1,4 @@
-import type { Prisma } from "../generated/prisma/client";
+import type { TxClient } from "../infra/prisma";
 
 /**
  * Serialize concurrent direct-chat creation for the same (tenantId, userPair).
@@ -27,7 +27,7 @@ import type { Prisma } from "../generated/prisma/client";
  * create; otherwise there's nothing the lock protects.
  */
 export async function acquireDmLock(
-  tx: Prisma.TransactionClient,
+  tx: TxClient,
   tenantId: string,
   userA: string,
   userB: string,
@@ -50,7 +50,7 @@ export async function acquireDmLock(
  * blow past the cap. Released automatically on commit/rollback.
  */
 export async function acquireTenantLock(
-  tx: Prisma.TransactionClient,
+  tx: TxClient,
   tenantId: string,
   scope: string,
 ): Promise<void> {

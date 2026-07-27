@@ -1,5 +1,7 @@
 import { prisma } from "../db";
 import { Prisma } from "../generated/prisma/client";
+import { runInManagedTx } from "./tenant-context";
+import type { TxClient } from "../infra/prisma";
 import * as centrifugo from "./centrifugo";
 
 interface PublishIntent {
@@ -27,7 +29,7 @@ interface PublishIntent {
  * readable by the default PG consumer config.
  */
 export interface RealtimeTx {
-  tx: Prisma.TransactionClient;
+  tx: TxClient;
   enqueue: (intent: PublishIntent) => void;
   enqueueToConversation: (
     conversationId: string,
@@ -42,7 +44,7 @@ export interface RealtimeTx {
   ) => Promise<{ id: string; seq: number; createdAt: Date }>;
 }
 
-async function flushToOutbox(tx: Prisma.TransactionClient, queue: PublishIntent[]) {
+async function flushToOutbox(tx: TxClient, queue: PublishIntent[]) {
   if (queue.length === 0) return;
   await tx.outbox.createMany({
     data: queue.map((q) => ({
@@ -64,7 +66,7 @@ export async function withRealtime<T>(
 ): Promise<T> {
   const queue: PublishIntent[] = [];
 
-  const result = await prisma.$transaction(async (tx) => {
+  const result = await runInManagedTx(() => prisma.$transaction(async (tx) => {
     const rt: RealtimeTx = {
       tx,
       enqueue: (intent) => queue.push(intent),
@@ -150,7 +152,7 @@ export async function withRealtime<T>(
     // with the business data — no split-brain.
     await flushToOutbox(tx, queue);
     return value;
-  });
+  }));
 
   return result;
 }

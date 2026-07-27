@@ -5,6 +5,7 @@ import { getTenantById } from "../lib/tenant";
 import { upsertFederatedUser } from "../lib/user-federation";
 import { prisma } from "../db";
 import type { AuthenticatedRequest } from "./auth";
+import { runWithTenant } from "../lib/tenant-context";
 
 /**
  * JWT federation middleware. Accepts a tenant-signed user token in
@@ -134,7 +135,9 @@ export async function requireUserJwt(
     };
     r.tenantId = tenant.id;
     r.scope = scope;
-    next();
+    // Establish the tenant context for the rest of the request so the
+    // Prisma RLS extension scopes every ORM query to this tenant.
+    runWithTenant(tenant.id, () => next());
   } catch (err) {
     next(err);
   }
