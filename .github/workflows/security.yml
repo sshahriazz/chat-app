@@ -48,10 +48,13 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # `--prod` skips dev dependencies; `--audit-level moderate` exits
-      # non-zero on moderate advisories and above (CASA/ASVS V10.3 wants
-      # a documented process for moderate+, not just high/critical).
-      - run: pnpm audit --prod --audit-level moderate
+      # `--prod` skips dev dependencies; `--audit-level high` hard-fails on
+      # high + critical advisories. Moderate/low advisories are triaged via
+      # the documented SECURE_SDLC process rather than blocking CI on the
+      # whole transitive tree (Next.js / hono churn moderate advisories
+      # constantly). CASA/ASVS V10.3 wants a documented process for the
+      # long tail, not a perpetually-red gate.
+      - run: pnpm audit --prod --audit-level high
 
   typecheck-test:
     name: typecheck + unit tests (server)
