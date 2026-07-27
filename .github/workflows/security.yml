@@ -4,6 +4,11 @@
 # red". All jobs are non-blocking-by-default (no `required-status-check`
 # wiring in the repo settings yet) — flip them to required once the
 # baseline is clean.
+#
+# Every third-party action is pinned to a full commit SHA (with the human
+# tag in a trailing comment) — a mutable tag like `@v4` can be re-pointed
+# at malicious code by whoever controls the action repo. Bump the SHA +
+# comment together when upgrading.
 name: security
 
 on:
@@ -22,11 +27,11 @@ jobs:
     name: gitleaks (secret scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Full history so gitleaks can scan commits, not just the tree.
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -34,11 +39,11 @@ jobs:
     name: pnpm audit (high+critical)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # No `version:` — action-setup reads `packageManager` in package.json.
+      # Specifying both errors with ERR_PNPM_BAD_PM_VERSION.
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
@@ -52,11 +57,9 @@ jobs:
     name: typecheck + unit tests (server)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: pnpm
@@ -76,7 +79,7 @@ jobs:
     container:
       image: returntocorp/semgrep
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # `p/owasp-top-ten` + `p/javascript` + `p/typescript` is a solid
       # baseline; tune via .semgrep.yml in the repo if/when noise grows.
       - run: semgrep ci --config p/owasp-top-ten --config p/javascript --config p/typescript
@@ -87,17 +90,17 @@ jobs:
     name: SBOM (CycloneDX)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Generate a CycloneDX software bill of materials from the repo +
       # lockfile. CASA/ASVS V10.3 evidence: a machine-readable inventory
       # of every dependency and version shipped. Uploaded as a build
       # artifact so it can be attached to the CASA workbook each release.
-      - uses: anchore/sbom-action@v0
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .
           format: cyclonedx-json
           output-file: sbom.cyclonedx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sbom-cyclonedx
           path: sbom.cyclonedx.json
@@ -106,11 +109,11 @@ jobs:
     name: trivy (IaC misconfig + fs CVE/secret)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Misconfiguration scan of Dockerfiles + docker-compose (privileged
       # containers, missing cap_drop, root user, etc.). CASA/ASVS V14.
       - name: Trivy config (misconfiguration)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: config
           scan-ref: .
@@ -121,7 +124,7 @@ jobs:
       # Complements gitleaks (git-history) and pnpm audit (prod deps) with
       # a whole-tree view. Add a `.trivyignore` to triage accepted findings.
       - name: Trivy filesystem (vuln + secret)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .

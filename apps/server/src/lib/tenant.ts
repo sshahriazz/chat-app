@@ -90,7 +90,7 @@ export function wrapSecret(plain: string): string {
   const key = encryptionKey();
   if (!key) return plain;
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   const ct = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
   return (
@@ -116,7 +116,7 @@ export function unwrapSecret(stored: string): string {
   const iv = Buffer.from(parts[0], "base64url");
   const ct = Buffer.from(parts[1], "base64url");
   const tag = Buffer.from(parts[2], "base64url");
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   decipher.setAuthTag(tag);
   const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
   return pt.toString("utf8");

@@ -39,7 +39,7 @@ export function encryptWithKey(plaintext: string, key: Buffer): string {
     throw new Error(`field-crypto: key must be ${KEY_BYTES} bytes, got ${key.length}`);
   }
   const iv = crypto.randomBytes(IV_BYTES);
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   const ct = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
   return [
@@ -64,7 +64,7 @@ export function decryptWithKey(blob: string, key: Buffer): string {
   if (iv.length !== IV_BYTES || tag.length !== 16) {
     throw new Error("field-crypto: malformed ciphertext");
   }
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   decipher.setAuthTag(tag); // any tamper (ct/iv/tag) fails final()
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
 }
