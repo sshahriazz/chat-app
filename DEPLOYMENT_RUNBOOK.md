@@ -213,6 +213,48 @@ docker compose run --rm migrate
 If any one of these fails, **STOP**. Do not deploy the new server.
 Old server keeps running fine without the new columns/tables.
 
+> The audit-hardening branch adds two more additive migrations
+> (`..._audit_log_hash_chain` — nullable columns; `..._row_level_security`
+> — RLS policies). Same rule: additive, apply before the server rolls. The
+> RLS `ENABLE`/`FORCE` briefly takes an `ACCESS EXCLUSIVE` lock per table —
+> fast, but prefer the low-traffic window.
+
+### 2.1 (Recommended) Activate Row-Level Security
+
+RLS is a second enforcement layer beneath the app-layer tenant filters.
+**It only enforces when the app connects as a NON-superuser, non-owner
+role** — Postgres bypasses RLS for superusers/owners. Without this step the
+migration is applied but inert (no enforcement, no breakage).
+
+1. **Once**, as the owner/superuser, create the app role + grants:
+   ```sql
+   CREATE ROLE chatapp_app NOSUPERUSER LOGIN PASSWORD '<strong-password>';
+   GRANT USAGE ON SCHEMA public TO chatapp_app;
+   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO chatapp_app;
+   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO chatapp_app;
+   ALTER DEFAULT PRIVILEGES IN SCHEMA public
+     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO chatapp_app;
+   ALTER DEFAULT PRIVILEGES IN SCHEMA public
+     GRANT USAGE, SELECT ON SEQUENCES TO chatapp_app;
+   ```
+2. **Split the two DB connections** in your Dokploy env:
+   - `migrate` service → keep the **owner** `DATABASE_URL` (needs DDL rights).
+   - `server` service → point `DATABASE_URL` at **`chatapp_app`**.
+3. Redeploy the server. Verify enforcement (as the app role):
+   ```sql
+   SET ROLE chatapp_app;  -- or connect as chatapp_app
+   SELECT set_config('app.current_tenant_id', '<some-tenant-id>', false);
+   SELECT count(*) FILTER (WHERE tenant_id <> '<some-tenant-id>') AS should_be_0
+   FROM "user";
+   RESET ROLE;
+   ```
+   `should_be_0` must be 0. The app itself sets this GUC per request — this
+   is only a manual spot-check.
+
+To roll back: point the `server` `DATABASE_URL` back at the owner role
+(RLS goes inert; no data change). Full details:
+`docs/security/AUDIT_HARDENING_CHANGES.md`.
+
 ---
 
 ## 3. The deploy itself (low-traffic window)

@@ -75,14 +75,27 @@ DATABASE_URL=postgresql://chatapp_app:<password>@<host>:5432/<db>
 Until this role switch, RLS is inert (no enforcement, no breakage). See
 [OPS_HARDENING.md](./OPS_HARDENING.md) §3.
 
+**Dev already enforces it**: `docker/postgres-init/00-app-role.sql` creates
+`chatapp_app` on fresh init (+ `ALTER DEFAULT PRIVILEGES` so migrate's
+tables auto-grant), and `compose.dev.yml` points the dev **server** at it
+while `migrate` stays the owner. So a `make dev-nuke && make dev` locally
+runs with RLS active — the isolation suite then exercises real enforcement.
+
+### GUC lifecycle (why the app doesn't break under enforcement)
+Because Prisma pools connections, a naive per-query GUC would let one
+request's tenant leak to the next. The extension therefore sets the GUC to
+`''` (explicit reset, treated as fail-open by the policy) for every
+no-context query, and the two interactive transactions set the GUC as their
+own first statement. This was necessary: without it, the auth-time user
+upsert failed WITH CHECK and interactive-tx writes weren't scoped.
+
 ---
 
 ## Verification performed
 - `tsc` clean; audit-chain + field-crypto unit tests pass; audit chain proven end-to-end vs live DB (append→verify→tamper→detect).
-- RLS policies proven at the DB level: non-superuser + tenant GUC → cross-tenant rows filtered to 0.
-- RLS code machinery (ALS context + Prisma extension + interactive-tx marking) exercised via the app; cross-tenant isolation integration suite green.
+- **RLS proven ENFORCING through the running app**: dev server connects as the non-superuser `chatapp_app`; isolation suite 6/6, message send 201 (interactive-tx path), full server suite 86/86, and a DB-level check as `chatapp_app` with `ctx=demo_acme` returns 0 `demo_beta` rows.
 
 ## Not done (follow-ups)
-- Switch prod/staging `DATABASE_URL` to the non-superuser role (activation step above).
+- Switch prod/staging `DATABASE_URL` to the non-superuser role (activation step above) — see DEPLOYMENT_RUNBOOK.md.
 - Optionally expose `verifyAuditChain()` via a scheduled job/endpoint + alert.
 - Optionally backfill existing push rows to ciphertext once `FIELD_ENCRYPTION_KEY` is set.
