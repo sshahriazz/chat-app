@@ -10,6 +10,7 @@ This folder holds the written deliverables an Authorized Lab expects for a CASA 
 | [INCIDENT_RESPONSE_PLAN.md](./INCIDENT_RESPONSE_PLAN.md) | V1 governance; V7 logging/monitoring-driven detection & response |
 | [VULNERABILITY_DISCLOSURE_POLICY.md](./VULNERABILITY_DISCLOSURE_POLICY.md) | V1 coordinated disclosure |
 | [OPS_HARDENING.md](./OPS_HARDENING.md) | V6/V8/V9/V14 infra: at-rest encryption (pg_tde/Vault), DB-TLS, least-priv roles, WAF/egress, key mgmt |
+| [AUDIT_HARDENING_CHANGES.md](./AUDIT_HARDENING_CHANGES.md) | Breaking-change/integration notes: audit hash-chain, push-key encryption, RLS (+ activation) |
 
 **Evidence produced elsewhere:**
 - Control-by-control mapping → [../CASA_ASVS_GAP_CHECKLIST.md](../CASA_ASVS_GAP_CHECKLIST.md)
