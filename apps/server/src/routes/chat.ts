@@ -1238,7 +1238,7 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
       userId: user.id,
       conversation: { tenantId },
     },
-    select: { id: true },
+    select: { id: true, joinedAt: true },
   });
   if (!member) {
     throw new ForbiddenError("Not a member of this conversation");
@@ -1246,6 +1246,12 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
 
   // Escape LIKE wildcards in q so `%`/`_` are literal (no full-scan abuse).
   const likePattern = `%${escapeLike(q)}%`;
+  // History fence — MUST match GET /conversations/:id/messages.
+  //
+  // Without this, search was a way around the fence: a member added today
+  // could read arbitrary pre-join content — text, sender and timestamp —
+  // straight out of the results, which made the fence on /messages
+  // decorative (H-5). Any change to the rule has to be made in both places.
   const rows = await prisma.$queryRaw<SearchRow[]>`
     SELECT m.id,
            m.content,
@@ -1263,6 +1269,7 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
     WHERE m.conversation_id = ${id}
       AND m.tenant_id = ${tenantId}
       AND m.deleted_at IS NULL
+      AND m.created_at >= ${member.joinedAt}
       AND (m.plain_content ILIKE ${likePattern} OR m.plain_content % ${q})
     ORDER BY GREATEST(similarity(m.plain_content, ${q}), 0) DESC,
              m.created_at DESC
@@ -1300,10 +1307,15 @@ router.get("/search", requireAuth, searchLimiter, validate({ query: SearchQueryS
     JOIN conversations c ON c.id = m.conversation_id
     WHERE m.tenant_id = ${tenantId}
       AND m.deleted_at IS NULL
+      -- Membership AND the history fence in one predicate: a message is
+      -- visible only if the searcher is a member *and* the message post-dates
+      -- their join. Splitting these let global search return pre-join content
+      -- from every conversation the user had ever been added to (H-5).
       AND EXISTS (
         SELECT 1 FROM conversation_members cm
         WHERE cm.conversation_id = m.conversation_id
           AND cm.user_id = ${user.id}
+          AND m.created_at >= cm.joined_at
       )
       AND (m.plain_content ILIKE ${likePattern} OR m.plain_content % ${q})
     ORDER BY GREATEST(similarity(m.plain_content, ${q}), 0) DESC,
