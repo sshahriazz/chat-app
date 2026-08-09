@@ -84,16 +84,37 @@ export const TiptapDocSchema = z
 
 // ─── Conversations ───────────────────────────────────────────
 
+/** Single emoji, including multi-codepoint sequences (skin tone, ZWJ). */
+const emojiField = z.string().min(1).max(16).nullish();
+/** Hex colour. Constrained so a client cannot store arbitrary CSS. */
+const colorField = z
+  .string()
+  .regex(/^#[0-9a-fA-F]{6}$/, "color must be a #rrggbb hex string")
+  .nullish();
+
 export const CreateConversationBodySchema = z
   .object({
     type: z.enum(["direct", "group"]),
     name: z.string().min(1).max(100).optional(),
+    emoji: emojiField,
+    color: colorField,
     memberIds: z.array(z.string().min(1)).min(1).max(50),
   })
   .meta({ id: "CreateConversationBody" });
 
+/**
+ * Update a conversation's presentation. Every field optional — sending only
+ * `color` must not clear the name.
+ */
 export const RenameConversationBodySchema = z
-  .object({ name: z.string().min(1).max(100) })
+  .object({
+    name: z.string().min(1).max(100).optional(),
+    emoji: emojiField,
+    color: colorField,
+  })
+  .refine((b) => Object.keys(b).length > 0, {
+    message: "at least one of name, emoji or color is required",
+  })
   .meta({ id: "RenameConversationBody" });
 
 export const AddMembersBodySchema = z

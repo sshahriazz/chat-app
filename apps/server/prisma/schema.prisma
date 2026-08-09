@@ -205,6 +205,19 @@ model Conversation {
   tenantId   String           @map("tenant_id")
   type       ConversationType
   name       String?
+  /// Presentation, shared by every member.
+  ///
+  /// Lived in the client before this: tenants encoded an emoji as a leading
+  /// grapheme inside `name` ("🚀 Launch plan") because there was nowhere else
+  /// to put it, and colour was kept in each browser's localStorage — so no two
+  /// people saw the same one. Both are properties of the room, not of a
+  /// viewer, so they belong here.
+  ///
+  /// Meaningful for groups. A direct conversation is titled and coloured by
+  /// the other participant, so these stay null.
+  emoji      String?
+  /// Hex colour, e.g. "#4F46E5".
+  color      String?
   createdBy  String           @map("created_by")
   createdAt  DateTime         @default(now()) @map("created_at")
   updatedAt  DateTime         @updatedAt @map("updated_at")

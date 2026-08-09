@@ -136,6 +136,8 @@ const CONVERSATION_EVENT_SELECT = {
   id: true,
   type: true,
   name: true,
+  emoji: true,
+  color: true,
   createdBy: true,
   createdAt: true,
   updatedAt: true,
@@ -211,9 +213,11 @@ router.post(
   validate({ body: CreateConversationBodySchema }),
   async (req, res) => {
   const { user, tenantId, scope } = req as AuthenticatedRequest;
-  const { type, name, memberIds } = req.body as {
+  const { type, name, emoji, color, memberIds } = req.body as {
     type: "direct" | "group";
     name?: string;
+    emoji?: string | null;
+    color?: string | null;
     memberIds: string[];
   };
 
@@ -358,9 +362,11 @@ router.post(
   validate({ body: CreateConversationBodySchema }),
   async (req, res) => {
     const { user, tenantId } = req as AuthenticatedRequest;
-    const { type, name, memberIds } = req.body as {
+    const { type, name, emoji, color, memberIds } = req.body as {
       type: "direct" | "group";
       name?: string;
+      emoji?: string | null;
+      color?: string | null;
       memberIds: string[];
     };
 
@@ -418,6 +424,10 @@ router.post(
           tenantId,
           type,
           name: type === "group" ? name : null,
+          // A direct conversation is titled and coloured by the other
+          // participant, so presentation on it would never be read.
+          emoji: type === "group" ? (emoji ?? null) : null,
+          color: type === "group" ? (color ?? null) : null,
           createdBy: user.id,
           members: {
             create: allMemberIds.map((userId) => ({
@@ -507,7 +517,11 @@ router.get("/conversations/:id", requireAuth, async (req, res) => {
 router.put("/conversations/:id", requireAuth, validate({ body: RenameConversationBodySchema }), async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
   const id = idParam(req.params.id);
-  const { name } = req.body as { name: string };
+  const { name, emoji, color } = req.body as {
+    name?: string;
+    emoji?: string | null;
+    color?: string | null;
+  };
 
   // `findFirst` with the tenantId filter guarantees we can't hop
   // tenants via a guessed conversation id even if a ConversationMember
@@ -538,14 +552,23 @@ router.put("/conversations/:id", requireAuth, validate({ body: RenameConversatio
   const conversation = await withRealtime(async (rt) => {
     const updated = await rt.tx.conversation.update({
       where: { id },
-      data: { name, version: { increment: 1 } },
+      // Only touch what was sent. Spreading the whole body would let a
+      // colour change clear the name.
+      data: {
+        ...(name !== undefined ? { name } : {}),
+        ...(emoji !== undefined ? { emoji } : {}),
+        ...(color !== undefined ? { color } : {}),
+        version: { increment: 1 },
+      },
       select: CONVERSATION_EVENT_SELECT,
     });
 
     await rt.createSystemMessage(
       id,
       user.id,
-      `${user.name} renamed the group from "${oldName}" to "${name}"`,
+      name !== undefined && name !== oldName
+        ? `${user.name} renamed the group from "${oldName}" to "${name}"`
+        : `${user.name} updated the group`,
     );
 
     await rt.enqueueToConversation(
