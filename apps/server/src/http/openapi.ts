@@ -204,6 +204,23 @@ const uploadUrlResponseSchema = z
   })
   .meta({ id: "UploadUrlResponse" });
 
+/**
+ * Response shape shared by `GET /attachments/{id}/view` and
+ * `GET /attachments/{id}/download`.
+ *
+ * Both return JSON rather than a 302. The bucket is private and this API is
+ * bearer-authenticated, so an `<img src>` / `<a href>` cannot carry the
+ * Authorization header — the client fetches this through the authenticated
+ * API client, then points the element at the returned signed URL, which
+ * needs no auth of its own.
+ */
+const signedUrlResponseSchema = z
+  .object({
+    url: z.string().url(),
+    expiresIn: z.number().int().positive(),
+  })
+  .meta({ id: "SignedAttachmentUrlResponse" });
+
 const connectionTokenResponseSchema = z
   .object({ token: z.string() })
   .meta({ id: "CentrifugoConnectionToken" });
@@ -953,23 +970,41 @@ export function buildOpenApiDocument() {
           },
         },
       },
+      "/attachments/{id}/view": {
+        parameters: [
+          { name: "id", in: "path", required: true, schema: { type: "string" } },
+        ],
+        get: {
+          tags: ["Attachments"],
+          summary: "Signed URL for inline rendering",
+          description:
+            "Returns a short-lived signed URL for rendering an attachment inline (`<img>` / `<video>` / `<audio>`). Membership-checked. Only inline-safe content types get an inline-disposition URL; anything else (PDF, zip, text) is signed as a forced download so it can never execute script in the bucket origin.",
+          requestParams: sessionCookie,
+          responses: {
+            "200": jsonResponse("Signed URL minted", signedUrlResponseSchema),
+            "400": commonResponses.BadRequest,
+            "401": commonResponses.Unauthorized,
+            "404": commonResponses.NotFound,
+            "429": commonResponses.TooManyRequests,
+          },
+        },
+      },
       "/attachments/{id}/download": {
         parameters: [
           { name: "id", in: "path", required: true, schema: { type: "string" } },
         ],
         get: {
           tags: ["Attachments"],
-          summary: "302-redirect to an authenticated download URL",
+          summary: "Signed URL for a forced download",
           description:
-            "Issues a short-lived signed URL with Content-Disposition: attachment so the browser downloads instead of rendering inline.",
+            "Returns a short-lived signed URL carrying Content-Disposition: attachment, a pinned Content-Type and nosniff, so the browser saves the file instead of rendering it. Membership-checked.",
           requestParams: sessionCookie,
           responses: {
-            "302": {
-              description: "Redirect to presigned download URL",
-            },
+            "200": jsonResponse("Signed URL minted", signedUrlResponseSchema),
+            "400": commonResponses.BadRequest,
             "401": commonResponses.Unauthorized,
-            "403": commonResponses.Forbidden,
             "404": commonResponses.NotFound,
+            "429": commonResponses.TooManyRequests,
           },
         },
       },
