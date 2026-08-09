@@ -18,9 +18,44 @@
  * test` in CI without a stack stays green); wire a stack in CI to make it
  * run. Override the target with TEST_SERVER_URL.
  */
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, it, expect, beforeAll } from "vitest";
 
 const SERVER = process.env.TEST_SERVER_URL ?? "http://localhost:3001";
+
+/**
+ * Dev-route credential.
+ *
+ * `/api/dev/*` is master-key gated whenever `MASTER_API_KEY` is set (see
+ * routes/dev.ts). The local stack loads one from the repo-root `.env`, but
+ * vitest runs on the host and does not read that file — so every dev-route
+ * call 401'd and the whole suite failed at `beforeAll` with a bare
+ * "mint failed: 401". Read the key the same way the stack does, so
+ * `make dev && pnpm test tenant-isolation` works with no extra step.
+ *
+ * An explicit `MASTER_API_KEY` in the environment wins, so CI can inject it
+ * without a file.
+ */
+function readMasterKey(): string | undefined {
+  if (process.env.MASTER_API_KEY) return process.env.MASTER_API_KEY;
+  try {
+    const here = path.dirname(new URL(import.meta.url).pathname);
+    const envFile = readFileSync(path.resolve(here, "../../../.env"), "utf8");
+    const match = envFile.match(/^\s*MASTER_API_KEY\s*=\s*(.*)$/m);
+    const value = match?.[1]?.trim().replace(/^["']|["']$/g, "");
+    return value || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const MASTER_KEY = readMasterKey();
+
+/** Headers for `/api/dev/*`. Empty when the gate is not configured. */
+const devHeaders: Record<string, string> = MASTER_KEY
+  ? { Authorization: `Bearer ${MASTER_KEY}` }
+  : {};
 
 // Reachability probe at collection time -> skip cleanly if no stack.
 const reachable = await fetch(`${SERVER}/api/livez`)
@@ -43,7 +78,7 @@ type Persona = (typeof PERSONAS)[keyof typeof PERSONAS];
 async function mint(p: Persona): Promise<string> {
   const res = await fetch(`${SERVER}/api/dev/mint-token`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...devHeaders },
     body: JSON.stringify({
       tenantId: p.tenant,
       externalId: p.externalId,
@@ -96,7 +131,21 @@ if (!reachable) {
 d("cross-tenant / cross-scope isolation", () => {
   beforeAll(async () => {
     // Seed the demo tenants, then mint + activate every persona used below.
-    await fetch(`${SERVER}/api/dev/seed-demo`, { method: "POST" });
+    const seeded = await fetch(`${SERVER}/api/dev/seed-demo`, {
+      method: "POST",
+      headers: devHeaders,
+    });
+    // Fail loudly and specifically: a 401 here means MASTER_API_KEY is set
+    // on the server but not readable by the test, which is a setup problem,
+    // not an isolation failure.
+    if (!seeded.ok) {
+      throw new Error(
+        `seed-demo failed: ${seeded.status}` +
+          (seeded.status === 401
+            ? " — /api/dev is master-key gated. Export MASTER_API_KEY or keep it in the repo-root .env."
+            : ""),
+      );
+    }
     for (const [key, p] of Object.entries(PERSONAS)) {
       tokens[key] = await mint(p);
       await activate(tokens[key]);
@@ -178,5 +227,99 @@ d("cross-tenant / cross-scope isolation", () => {
     // Carlos (project_beta, same tenant) must still be denied.
     const get = await api(tokens.carlos, "GET", `/api/conversations/${convId}`);
     expect([403, 404]).toContain(get.status);
+  });
+
+  /**
+   * History fence (H-5).
+   *
+   * A member added to an existing conversation must not be able to read what
+   * was said before they joined. `GET /conversations/:id/messages` fences on
+   * `member.joinedAt` and was the ONLY path that did — both search endpoints
+   * checked membership and nothing else, so search returned the fenced
+   * content verbatim, with sender and timestamp. That made the fence on
+   * /messages decorative.
+   *
+   * This asserts all three read paths agree, and that the fence is not
+   * over-broad: a message sent AFTER the join must still be visible.
+   */
+  it("history fence: a late-added member cannot read pre-join messages via messages OR search", async () => {
+    const BEFORE = "fencecanary-before-join-xyzzy";
+    const AFTER = "fencecanary-after-join-plugh";
+
+    // Eli (tenant-wide) starts a conversation with Alice only.
+    const [alice] = await searchUsers(tokens.eli, "Alice");
+    expect(alice?.name).toBe("Alice Chen");
+    const created = await api(tokens.eli, "POST", "/api/conversations", {
+      type: "group",
+      name: "history-fence-probe",
+      memberIds: [alice.id],
+    });
+    expect(created.ok).toBe(true);
+    const convId = (await created.json()).id as string;
+
+    // Something secret is said while Bob is NOT a member.
+    const said = await api(tokens.eli, "POST", `/api/conversations/${convId}/messages`, {
+      content: {
+        type: "doc",
+        content: [{ type: "paragraph", content: [{ type: "text", text: BEFORE }] }],
+      },
+    });
+    expect(said.ok).toBe(true);
+
+    // Bob (same scope as Alice, so addable) joins afterwards.
+    const [bob] = await searchUsers(tokens.eli, "Bob");
+    const added = await api(tokens.eli, "POST", `/api/conversations/${convId}/members`, {
+      userIds: [bob.id],
+    });
+    expect(added.ok).toBe(true);
+
+    // ...and something else is said now that he IS a member.
+    const said2 = await api(tokens.eli, "POST", `/api/conversations/${convId}/messages`, {
+      content: {
+        type: "doc",
+        content: [{ type: "paragraph", content: [{ type: "text", text: AFTER }] }],
+      },
+    });
+    expect(said2.ok).toBe(true);
+
+    const bodyOf = async (res: Response) => JSON.stringify(await res.json());
+
+    // 1. Paginated read — already fenced before this change.
+    const msgs = await api(tokens.bob, "GET", `/api/conversations/${convId}/messages`);
+    expect(msgs.status).toBe(200);
+    const msgBody = await bodyOf(msgs);
+    expect(msgBody).not.toContain(BEFORE);
+    expect(msgBody).toContain(AFTER);
+
+    // 2. In-conversation search — leaked BEFORE this change.
+    const inConv = await api(
+      tokens.bob,
+      "GET",
+      `/api/conversations/${convId}/search?q=${encodeURIComponent("fencecanary")}`,
+    );
+    expect(inConv.status).toBe(200);
+    const inConvBody = await bodyOf(inConv);
+    expect(inConvBody).not.toContain(BEFORE);
+    expect(inConvBody).toContain(AFTER);
+
+    // 3. Global search — leaked BEFORE this change, across every
+    //    conversation the searcher had ever been added to.
+    const global = await api(
+      tokens.bob,
+      "GET",
+      `/api/search?q=${encodeURIComponent("fencecanary")}`,
+    );
+    expect(global.status).toBe(200);
+    const globalBody = await bodyOf(global);
+    expect(globalBody).not.toContain(BEFORE);
+    expect(globalBody).toContain(AFTER);
+
+    // Sanity: the message really is there — Eli, a member since creation,
+    // must still see it. Otherwise the assertions above would pass against
+    // a conversation where nothing was ever written.
+    const eliSees = await bodyOf(
+      await api(tokens.eli, "GET", `/api/conversations/${convId}/messages`),
+    );
+    expect(eliSees).toContain(BEFORE);
   });
 });
