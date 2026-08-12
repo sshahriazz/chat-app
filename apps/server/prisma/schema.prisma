@@ -320,6 +320,21 @@ model Attachment {
   size        Int
   width       Int?
   height      Int?
+  // Poster image for this attachment, produced on the uploader's device and
+  // stored beside the original. Every viewer then renders a few kilobytes
+  // instead of the whole file: a 12 MP photo shown in a 320px card used to
+  // cost 8 MB, and a video card downloaded the entire clip to find a frame.
+  //
+  // The device generates it because that is the only place the decoded file
+  // already exists — the server would have to fetch and re-decode what the
+  // sender just had in memory. It is the same shape as WhatsApp's
+  // `jpegThumbnail` and Slack's `thumb_*` fields.
+  //
+  // Nullable throughout: older rows have none, and a client that cannot
+  // produce one (an unusual codec, a failed decode) still uploads the file.
+  thumbnailKey    String? @map("thumbnail_key")
+  thumbnailWidth  Int?    @map("thumbnail_width")
+  thumbnailHeight Int?    @map("thumbnail_height")
   createdAt   DateTime @default(now()) @map("created_at")
 
   tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)

@@ -89,14 +89,21 @@ router.post(
   validate({ body: UploadUrlBodySchema }),
   async (req, res) => {
     const { user, tenantId } = req as AuthenticatedRequest;
-    const { filename, contentType, size, width, height, purpose } = req.body as {
-      filename: string;
-      contentType: string;
-      size: number;
-      width?: number;
-      height?: number;
-      purpose: "attachment" | "avatar";
-    };
+    const { filename, contentType, size, width, height, purpose, thumbnail } =
+      req.body as {
+        filename: string;
+        contentType: string;
+        size: number;
+        width?: number;
+        height?: number;
+        purpose: "attachment" | "avatar";
+        thumbnail?: {
+          contentType: "image/jpeg" | "image/webp";
+          size: number;
+          width: number;
+          height: number;
+        };
+      };
 
     // Schema enforces size / content-type / dimension bounds + filename
     // sanitization — this handler just carries out the side effects.
@@ -124,6 +131,23 @@ router.post(
       contentType,
       contentLength: size,
     });
+
+    // The poster image, if the device made one. Keyed off the same UUID as
+    // the original so the pair is obvious in the bucket and a delete of one
+    // prefix takes both.
+    const wantsThumbnail = purpose === "attachment" && !!thumbnail;
+    const thumbnailKey = wantsThumbnail
+      ? `${key.replace(/(\.[^.]+)?$/, "")}_thumb${extForContentType(thumbnail!.contentType)}`
+      : null;
+    const signedThumbnail =
+      wantsThumbnail && thumbnailKey
+        ? await createUploadUrl({
+            userId: user.id,
+            key: thumbnailKey,
+            contentType: thumbnail!.contentType,
+            contentLength: thumbnail!.size,
+          })
+        : null;
 
     // Avatars are NOT tracked in the attachments table: they have no
     // message link, no GC need (a User row carries the URL on `image`
@@ -155,7 +179,10 @@ router.post(
         _sum: { size: true },
       });
       const userUsed = userAgg._sum.size ?? 0;
-      if (userUsed + size > PER_USER_QUOTA_BYTES) {
+      // The thumbnail occupies real bytes in the bucket, so it counts. Small,
+      // but a quota that ignores a category of object is a quota that drifts.
+      const reserved = size + (thumbnail?.size ?? 0);
+      if (userUsed + reserved > PER_USER_QUOTA_BYTES) {
         throw new PayloadTooLargeError(
           `per-user storage quota exceeded (used ${userUsed} / ${PER_USER_QUOTA_BYTES} bytes)`,
         );
@@ -172,7 +199,7 @@ router.post(
           _sum: { size: true },
         });
         const tenantUsed = tenantAgg._sum.size ?? 0;
-        if (BigInt(tenantUsed) + BigInt(size) > tenantQuota) {
+        if (BigInt(tenantUsed) + BigInt(reserved) > tenantQuota) {
           throw new PayloadTooLargeError(
             `tenant storage quota exceeded (used ${tenantUsed} / ${tenantQuota} bytes)`,
           );
@@ -190,6 +217,13 @@ router.post(
           size,
           width: attWidth,
           height: attHeight,
+          // Recorded now, before the bytes exist. A client that fails to
+          // complete the thumbnail upload leaves a key pointing at nothing —
+          // which `/view` handles by omitting the URL rather than 404ing, the
+          // same way it already tolerates a missing original.
+          thumbnailKey,
+          thumbnailWidth: thumbnail?.width ?? null,
+          thumbnailHeight: thumbnail?.height ?? null,
         },
       });
     }));
@@ -201,6 +235,17 @@ router.post(
       upload: { url: signed.url, fields: signed.fields },
       publicUrl: signed.publicUrl,
       expiresIn: signed.expiresIn,
+      // Second presigned POST for the poster image. The client uploads both
+      // and may skip this one on failure — the attachment is still valid
+      // without it.
+      ...(signedThumbnail
+        ? {
+            thumbnailUpload: {
+              url: signedThumbnail.url,
+              fields: signedThumbnail.fields,
+            },
+          }
+        : {}),
     });
   },
 );
@@ -239,7 +284,30 @@ router.get("/:id/view", requireAuth, generalLimiter, async (req, res) => {
       });
 
   res.setHeader("Cache-Control", "no-store");
-  res.json({ url: signed.url, expiresIn: signed.expiresIn });
+  // The poster image, when the uploader's device produced one.
+  //
+  // Signed in the same round-trip as the original rather than behind its own
+  // endpoint: a card needs both to render and to be openable, and splitting
+  // them would double the per-attachment request count that is already the
+  // costliest part of opening a thread.
+  //
+  // Always inline-safe. The upload schema constrains a thumbnail to JPEG or
+  // WebP, so unlike the original it can never be a type that renders script —
+  // which is why this does not go through the isInlineSafeContentType branch
+  // above.
+  const thumbnail = attachment.thumbnailKey
+    ? await createViewUrl({
+        key: attachment.thumbnailKey,
+        filename: attachment.filename,
+        contentType: "image/jpeg",
+      })
+    : null;
+
+  res.json({
+    url: signed.url,
+    expiresIn: signed.expiresIn,
+    ...(thumbnail ? { thumbnailUrl: thumbnail.url } : {}),
+  });
 });
 
 // GET /api/attachments/:id/download — returns a short-lived signed URL

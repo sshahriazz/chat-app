@@ -844,6 +844,12 @@ const MESSAGE_INCLUDE = {
       size: true,
       width: true,
       height: true,
+      // Dimensions only — the URL is signed on demand by
+      // /attachments/:id/view. Sending them with the message lets the client
+      // reserve the right box before any image loads, so a thread does not
+      // reflow as thumbnails arrive.
+      thumbnailWidth: true,
+      thumbnailHeight: true,
     },
   },
 } as const;
@@ -1449,6 +1455,8 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
           size: true,
           width: true,
           height: true,
+          thumbnailWidth: true,
+          thumbnailHeight: true,
         },
       },
     },

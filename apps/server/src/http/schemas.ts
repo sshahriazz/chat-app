@@ -266,6 +266,30 @@ function sanitizeFilename(raw: string): string {
  *  user can't park a 10 MB blob in the public `avatars/*` prefix. */
 export const MAX_AVATAR_SIZE = 2 * 1024 * 1024;
 
+/**
+ * Ceiling for a device-generated poster image.
+ *
+ * A 480px JPEG at quality 0.7 lands around 30-60 KB, so 512 KB is roomy for a
+ * detailed frame and still far too small to be useful as free storage. The cap
+ * matters because the thumbnail is uploaded on the client's say-so: nothing
+ * server-side has looked at those bytes.
+ */
+export const MAX_THUMBNAIL_SIZE = 512 * 1024;
+
+/**
+ * A poster image the uploader's device produced for the file it is uploading.
+ *
+ * JPEG and WebP only. The thumbnail is rendered inline by every viewer, so the
+ * type has to be one that cannot carry script — which rules out SVG, the one
+ * image type that can.
+ */
+export const ThumbnailSchema = z.object({
+  contentType: z.enum(["image/jpeg", "image/webp"]),
+  size: z.number().int().positive().max(MAX_THUMBNAIL_SIZE),
+  width: z.number().int().positive().max(4096),
+  height: z.number().int().positive().max(4096),
+});
+
 export const UploadUrlBodySchema = z
   .object({
     filename: z
@@ -286,6 +310,12 @@ export const UploadUrlBodySchema = z
      *    Stricter type+size constraints; NOT tracked in the attachments
      *    table — the URL lives on User.image. */
     purpose: z.enum(["attachment", "avatar"]).default("attachment"),
+    /**
+     * Present when the client has a poster frame to upload alongside the file.
+     * Optional in both directions: an older client sends none, and a newer one
+     * omits it for a type it cannot render.
+     */
+    thumbnail: ThumbnailSchema.optional(),
   })
   .refine(
     (b) =>
@@ -296,6 +326,12 @@ export const UploadUrlBodySchema = z
       path: ["purpose"],
     },
   )
+  .refine((b) => !(b.purpose === "avatar" && b.thumbnail), {
+    // An avatar is already a small image and is not tracked in the
+    // attachments table, so it has nowhere to record a thumbnail key.
+    message: "Avatars cannot carry a thumbnail",
+    path: ["thumbnail"],
+  })
   .meta({ id: "UploadUrlBody" });
 
 // ─── Centrifugo ──────────────────────────────────────────────
