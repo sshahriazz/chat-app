@@ -1,0 +1,72 @@
+name: CI
+
+# Type-check and unit tests. `security.yml` covers dependency and secret
+# scanning; this covers whether the code compiles and behaves.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # Prisma's client is generated, not committed, and the server's types
+      # do not resolve without it — a type-check before this step fails on
+      # every model reference for reasons that have nothing to do with the
+      # change being tested.
+      - name: Generate Prisma client
+        run: pnpm --filter @chat-app/server exec prisma generate
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+
+      - name: Type-check
+        run: pnpm type-check
+
+      - name: Server tests
+        run: pnpm --filter @chat-app/server test
+
+  # NOT GATED YET, deliberately.
+  #
+  # `apps/web` has three pre-existing lint errors — "Calling setState
+  # synchronously within an effect can trigger cascading renders" — that are
+  # real findings rather than style noise, and fixing them is a change to
+  # rendering behaviour that wants its own review. This job reports them
+  # without failing the build, so they stay visible instead of being silently
+  # excluded and forgotten.
+  #
+  # Delete `continue-on-error` once those three are resolved.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
