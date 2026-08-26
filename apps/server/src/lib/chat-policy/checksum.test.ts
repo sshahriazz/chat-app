@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 const CANONICAL_FILES = ["types.ts", "capabilities.ts", "can.ts"] as const;
 
 const POLICY_CHECKSUM =
-  "8ccf26ed9917fd00064a987b82d722811ef4f96e1070b7d70cea5efca3aa7a1b";
+  "c34de991e2a1de5b259f652702e11bfc175360e983fc9a940f1ecf01b6c90191";
 
 describe("vendored chat policy", () => {
   it("matches the canonical copy", () => {

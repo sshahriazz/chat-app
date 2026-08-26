@@ -485,4 +485,59 @@ d("cross-tenant / cross-scope isolation", () => {
     ).text();
     expect(bobSees).not.toContain(SECRET);
   });
+
+  it("H-2 — staff cannot add a second client into a client conversation", async () => {
+    // Eli is tenant-wide staff and the room's owner, so every actor-vs-target
+    // and role check passes. This is precisely the case H-1 leaves open:
+    // `userScopeFilter(null)` returns `{}`, so a tenant-wide identity has no
+    // restriction on who it may add.
+    //
+    // Alice is project_alpha, Carlos is project_beta — two different clients.
+    const alice = { id: await userIdOf("Alice") };
+    const carlos = { id: await userIdOf("Carlos") };
+
+    const created = await api(tokens.eli, "POST", "/api/conversations", {
+      type: "group",
+      name: "h2-canary",
+      memberIds: [alice.id],
+    });
+    expect(created.status).toBe(201);
+    const convId = (await created.json()).id;
+
+    const mixing = await api(
+      tokens.eli,
+      "POST",
+      `/api/conversations/${convId}/members`,
+      { userIds: [carlos.id] },
+    );
+    expect(mixing.status).toBe(403);
+
+    // The room is unchanged — Carlos must not have landed anyway.
+    const after = await (
+      await api(tokens.eli, "GET", `/api/conversations/${convId}`)
+    ).text();
+    expect(after).not.toContain(carlos.id);
+  });
+
+  it("H-2 — staff may still add more staff to a client conversation", async () => {
+    // Guards against closing the hole by breaking the feature: a client room
+    // must still accept additional staff.
+    const alice = { id: await userIdOf("Alice") };
+    const eliId = (await (await api(tokens.eli, "GET", "/api/me")).json()).id;
+
+    const created = await api(tokens.bob, "POST", "/api/conversations", {
+      type: "group",
+      name: "h2-staff-ok",
+      memberIds: [alice.id],
+    });
+    const convId = (await created.json()).id;
+
+    const addStaff = await api(
+      tokens.bob,
+      "POST",
+      `/api/conversations/${convId}/members`,
+      { userIds: [eliId] },
+    );
+    expect(addStaff.status).toBe(200);
+  });
 });

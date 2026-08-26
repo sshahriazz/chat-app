@@ -630,7 +630,15 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
       userId: user.id,
       conversation: { tenantId },
     },
-    include: { conversation: { include: { tenant: true } } },
+    include: {
+      conversation: {
+        include: {
+          tenant: true,
+          // Needed to answer "does this room already belong to a client".
+          members: { select: { user: { select: { scope: true } } } },
+        },
+      },
+    },
   });
 
   if (!member) {
@@ -638,34 +646,6 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
   }
 
   const wasDirect = member.conversation.type === "direct";
-
-  // H-1. Adding a member used to require nothing beyond being one.
-  //
-  // `DELETE .../members/:userId` has always required owner or admin, so a
-  // plain member could not remove anyone but could add anyone. The pairing was
-  // incoherent, and it was wrong in the dangerous direction: widening a
-  // conversation's audience is the operation that needs the check, because
-  // everyone already in it is affected and none of them are asked.
-  //
-  // Promoting a direct conversation to a group is exempt. That path has no
-  // owner to appeal to — both participants are equal, and refusing it would
-  // mean a 1:1 could never become a group at all. `member:add`'s
-  // direct-conversation rule denies it, so the check runs only for groups and
-  // promotion is authorised by being in the conversation.
-  if (!wasDirect) {
-    authorize(
-      actorFrom(user.id, scope, member),
-      "member:add",
-      {
-        conversation: {
-          id,
-          type: "group",
-          fullHistoryForNewMembers:
-            member.conversation.tenant.fullHistoryForNewMembers,
-        },
-      }
-    );
-  }
   // Name only has meaning on promotion; ignored for groups (use PUT to rename).
   const promotionName = wasDirect && name?.trim() ? name.trim() : null;
 
@@ -701,7 +681,7 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
         id: { in: trulyNewIds },
         AND: [userScopeFilter(scope)],
       },
-      select: { id: true, name: true },
+      select: { id: true, name: true, scope: true },
     });
 
     if (newUsers.length === 0) {
@@ -710,6 +690,36 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
 
     if (newUsers.length !== trulyNewIds.length) {
       throw new BadRequestError("One or more userIds are invalid");
+    }
+
+    // H-1 and H-2, in one place.
+    //
+    // Deliberately after the targets are resolved rather than beside the
+    // membership lookup: the scope invariant needs each candidate's own
+    // scope, and splitting the two halves across the handler is how add and
+    // remove came to disagree in the first place.
+    //
+    // Per candidate, because a batch that mixes an allowed and a disallowed
+    // user must fail rather than partially apply.
+    const memberScopes = member.conversation.members.map((m) => m.user.scope);
+    for (const candidate of newUsers) {
+      authorize(actorFrom(user.id, scope, member), "member:add", {
+        conversation: {
+          id,
+          // The state being added *to*, not the state it becomes. Promotion
+          // is adding to a direct conversation, and the policy models that
+          // directly rather than making this route special-case it.
+          type: wasDirect ? "direct" : "group",
+          fullHistoryForNewMembers:
+            member.conversation.tenant.fullHistoryForNewMembers,
+          memberScopes,
+        },
+        targetMember: {
+          userId: candidate.id,
+          role: null,
+          scope: candidate.scope,
+        },
+      });
     }
 
     // Enforce per-group membership cap under the conversation lock above.

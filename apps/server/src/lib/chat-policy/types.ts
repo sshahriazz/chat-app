@@ -41,6 +41,20 @@ export interface ChatConversation {
   id: string;
   type: 'direct' | 'group';
   /**
+   * Scopes already present in the room, one per member.
+   *
+   * `null` is a tenant-wide identity — staff, who belong to the business
+   * rather than to any one client. A non-null scope confines its holder to
+   * others sharing it, which is how one client is kept from discovering
+   * another.
+   *
+   * Needed because "may this person be added" is not answerable from the
+   * actor and target alone. Staff are tenant-wide, so any actor-vs-target
+   * check passes for them — and that is exactly the case where adding the
+   * wrong person exposes one client's thread to another.
+   */
+  memberScopes?: (string | null)[];
+  /**
    * Whether the tenant lets members read messages sent before they joined.
    * `Tenant.fullHistoryForNewMembers` — a business's client thread says yes,
    * a private group chat says no.

@@ -3,6 +3,7 @@ import {
   deny,
   type ChatAction,
   type ChatActor,
+  type ChatConversation,
   type ChatResource,
   type Decision,
 } from './types';
@@ -44,6 +45,15 @@ const mustManageMembers: Rule = (actor) =>
 const scopesCompatible = (a: string | null, b: string | null) =>
   a === null || b === null || a === b;
 
+/**
+ * The client scope a conversation already belongs to, if any.
+ *
+ * Staff carry `null` and belong to the business, so they never define which
+ * client a room is about. At most one scoped identity should ever be present.
+ */
+const clientScopeOf = (conversation: ChatConversation): string | null =>
+  conversation.memberScopes?.find((s) => s !== null) ?? null;
+
 /* ---- The matrix -------------------------------------------------------- */
 
 export const capabilities: Record<ChatAction, Rule[]> = {
@@ -76,13 +86,59 @@ export const capabilities: Record<ChatAction, Rule[]> = {
    */
   'member:add': [
     mustBeMember,
-    mustBeGroup,
-    mustManageMembers,
+
+    /**
+     * Role is required for a group, and deliberately not for a direct
+     * conversation.
+     *
+     * Adding someone to a 1:1 is how it becomes a group, and a direct
+     * conversation has no owner to appeal to — both participants are equal.
+     * Requiring owner/admin there would mean a 1:1 could never be promoted at
+     * all. An earlier version modelled this as "cannot add to a direct
+     * conversation", which forced the route to special-case promotion around
+     * the policy — the exact thing this file exists to prevent.
+     */
+    (actor, resource) =>
+      resource.conversation.type === 'group' ? mustManageMembers(actor, resource) : null,
+
+    /**
+     * H-2, actor against target. A client cannot reach past their own scope.
+     */
     (actor, resource) =>
       resource.targetMember &&
       !scopesCompatible(actor.scope, resource.targetMember.scope)
         ? deny('scope-mismatch')
         : null,
+
+    /**
+     * H-2, and the half the role check cannot reach.
+     *
+     * Requiring owner/admin stops a bystander widening the room. It does not
+     * stop the owner adding the *wrong* person, and for staff that check
+     * passes trivially: `userScopeFilter(null)` returns `{}`, so a tenant-wide
+     * identity has no restriction on who they may add.
+     *
+     * The invariant that closes it is a property of the room, not of the two
+     * people: a conversation belongs to at most one client. Staff are
+     * tenant-wide and never define which client a room is about; a second
+     * distinct client scope is what turns one customer's thread into a place
+     * another customer can read.
+     *
+     * D-1 made this sharper rather than milder. With full history on, a
+     * wrongly-added client would not merely see what comes next — they would
+     * see the entire relationship.
+     *
+     * Applies to promotion too: promoting a 1:1 that belongs to one client by
+     * adding another is the same leak wearing a different hat.
+     */
+    (_actor, resource) => {
+      const target = resource.targetMember;
+      if (!target?.scope) return null;
+      const existing = clientScopeOf(resource.conversation);
+      return existing && existing !== target.scope
+        ? deny('scope-mismatch')
+        : null;
+    },
     () => allow,
   ],
 
