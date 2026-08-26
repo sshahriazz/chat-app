@@ -233,6 +233,18 @@ const CONVERSATION_EVENT_SELECT = {
           email: true,
           image: true,
           lastActiveAt: true,
+          // Which side of the tenant someone is on. `null` is a tenant-wide
+          // identity; a value confines them to others sharing it.
+          //
+          // Exposed so a client can be told who else can read a conversation
+          // (G-6). Without it the member list is names with no indication that
+          // half of them work for a different organisation — and since D-1
+          // turned full history on, that is a disclosure someone deciding what
+          // to write is entitled to before they write it.
+          //
+          // Not sensitive: you can already see who is in a room you belong to.
+          // This says which side they are on, not who else exists.
+          scope: true,
         },
       },
     },
@@ -595,7 +607,7 @@ router.get("/conversations/:id", requireAuth, async (req, res) => {
     include: {
       members: {
         include: {
-          user: { select: { id: true, name: true, email: true, image: true, lastActiveAt: true } },
+          user: { select: { id: true, name: true, email: true, image: true, lastActiveAt: true, scope: true } },
         },
       },
     },
@@ -2245,6 +2257,7 @@ async function getConversationsWithUnread(
                   email: true,
                   image: true,
                   lastActiveAt: true,
+                  scope: true,
                 },
               },
             },
