@@ -53,6 +53,23 @@ model Tenant {
   // (bytes). NULL = no tenant-level cap (per-user cap still applies).
   // Enforced atomically at presign time under an advisory lock.
   storageQuotaBytes BigInt? @map("storage_quota_bytes")
+  /// Whether a member can read messages sent before they joined.
+  ///
+  /// Two products want opposite answers and both are right for their case. A
+  /// private group chat should fence history: joining a room does not
+  /// retroactively grant you what was said in it. A business's shared client
+  /// conversation should not: the conversation belongs to the company, and a
+  /// new account manager who inherits the relationship needs the relationship,
+  /// not a blank thread.
+  ///
+  /// So the server holds neither opinion and asks the tenant. `false` — the
+  /// fence stays on — is the default, because that is the choice that cannot
+  /// leak anything by accident.
+  ///
+  /// Turning it on is a disclosure decision, not a convenience one: the people
+  /// already in the conversation said things before the newcomer arrived. A
+  /// tenant that enables it should also announce joins in-thread.
+  fullHistoryForNewMembers Boolean @default(false) @map("full_history_for_new_members")
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
 

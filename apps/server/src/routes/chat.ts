@@ -69,6 +69,35 @@ import {
 const router: Router = Router();
 
 /**
+ * The earliest message a member is allowed to read in a conversation.
+ *
+ * `null` means no fence — every message, including those sent before they
+ * joined.
+ *
+ * The default is fenced: joining a room does not retroactively grant you what
+ * was said in it, and a user who left and was re-added must not be able to
+ * page back through the period they were absent. `joinedAt` is fresh on every
+ * (re)join because removal deletes the row.
+ *
+ * A tenant can opt out. A business's shared client conversation belongs to the
+ * company rather than to whoever happens to be assigned this quarter, and a
+ * successor who inherits the relationship needs the relationship — a blank
+ * thread just makes the client repeat themselves. That is a disclosure
+ * decision the tenant makes deliberately, not something this server assumes.
+ */
+async function historyFenceFor(
+  tenantId: string,
+  joinedAt: Date
+): Promise<Date | null> {
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    select: { fullHistoryForNewMembers: true },
+  });
+  return tenant?.fullHistoryForNewMembers ? null : joinedAt;
+}
+
+
+/**
  * Extract a single string param (Express 5 params can be string |
  * string[]). Fails closed: an absent/empty value throws rather than
  * becoming `undefined`, which Prisma would treat as "omit predicate"
@@ -1274,6 +1303,7 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
   }
 
   // Escape LIKE wildcards in q so `%`/`_` are literal (no full-scan abuse).
+  const searchFence = await historyFenceFor(tenantId, member.joinedAt);
   const likePattern = `%${escapeLike(q)}%`;
   // History fence — MUST match GET /conversations/:id/messages.
   //
@@ -1298,7 +1328,10 @@ router.get("/conversations/:id/search", requireAuth, searchLimiter, validate({ q
     WHERE m.conversation_id = ${id}
       AND m.tenant_id = ${tenantId}
       AND m.deleted_at IS NULL
-      AND m.created_at >= ${member.joinedAt}
+      -- Same fence the /messages route applies, and for the same reason:
+      -- search must not become the way to read what /messages refuses to
+      -- return. A null fence means the tenant allows full history.
+      AND (${searchFence}::timestamptz IS NULL OR m.created_at >= ${searchFence})
       AND (m.plain_content ILIKE ${likePattern} OR m.plain_content % ${q})
     ORDER BY GREATEST(similarity(m.plain_content, ${q}), 0) DESC,
              m.created_at DESC
@@ -1409,8 +1442,9 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
   // added to an existing group — from using `anchor`/`before` to read
   // history from a period they weren't a member of. `member.joinedAt`
   // is fresh on every (re)join because removal deletes the row.
-  const joinedAtFence = member.joinedAt;
-  const createdAtFilter: { gte: Date; lt?: Date } = { gte: joinedAtFence };
+  const joinedAtFence = await historyFenceFor(tenantId, member.joinedAt);
+  const createdAtFilter: { gte?: Date; lt?: Date } = {};
+  if (joinedAtFence) createdAtFilter.gte = joinedAtFence;
   if (seqMin === null && cursorDate) {
     createdAtFilter.lt = cursorDate;
   }
@@ -1419,7 +1453,9 @@ router.get("/conversations/:id/messages", requireAuth, generalLimiter, validate(
     where: {
       conversationId: id,
       tenantId,
-      createdAt: createdAtFilter,
+      ...(Object.keys(createdAtFilter).length
+        ? { createdAt: createdAtFilter }
+        : {}),
       ...(seqMin !== null && seqMax !== null
         ? { seq: { gte: seqMin, lte: seqMax } }
         : {}),
