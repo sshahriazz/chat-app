@@ -405,6 +405,32 @@ export const UsersDeletedWebhookBodySchema = z
 
 // ─── Admin (operator → us, MASTER_API_KEY) ───────────────────
 
+/**
+ * An operator granting someone membership of a conversation.
+ *
+ * Distinct from `POST /conversations/:id/members`, which is a participant
+ * acting inside a room they belong to and is bound by the membership policy.
+ * This is the platform acting on a tenant's behalf — onboarding a new
+ * administrator, repairing membership after a handoff — and it is deliberately
+ * a different door with a different key.
+ *
+ * `requestedBy` and `reason` are required rather than optional. The failure
+ * this replaces was not a permission hole but an attribution one: the grant
+ * was authorised with the business creator's minted token, so the audit trail
+ * and the in-thread system message both named someone who had not done it and
+ * may not have been awake. An operator grant that cannot say who asked for it
+ * is the same defect with a different label.
+ */
+export const AdminGrantMembershipBodySchema = z
+  .object({
+    /** Tenant-local ids, the same `externalId` a token carries. */
+    userExternalIds: z.array(z.string().min(1)).min(1).max(50),
+    /** The person on whose authority this is happening. */
+    requestedBy: z.string().min(1).max(200),
+    reason: z.string().min(1).max(500),
+  })
+  .meta({ id: "AdminGrantMembershipBody" });
+
 export const CreateTenantBodySchema = z
   .object({
     name: z.string().min(1).max(128),
