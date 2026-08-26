@@ -322,4 +322,81 @@ d("cross-tenant / cross-scope isolation", () => {
     );
     expect(eliSees).toContain(BEFORE);
   });
+
+  // ─── H-1: adding a member requires the role removing already required ──
+
+  it("H-1 — a plain member cannot add anyone to a group", async () => {
+    // Eli creates, so Eli is owner and Alice joins as a plain member.
+    const alice = (await searchUsers(tokens.eli, "Alice"))[0];
+    const bob = (await searchUsers(tokens.eli, "Bob"))[0];
+
+    const created = await api(tokens.eli, "POST", "/api/conversations", {
+      type: "group",
+      name: "h1-canary",
+      memberIds: [alice.id],
+    });
+    expect(created.status).toBe(201);
+    const convId = (await created.json()).id;
+
+    // Before this fix Alice could widen the room's audience despite having
+    // no standing to remove anyone from it.
+    const asMember = await api(
+      tokens.alice,
+      "POST",
+      `/api/conversations/${convId}/members`,
+      { userIds: [bob.id] },
+    );
+    expect(asMember.status).toBe(403);
+
+    // And the room is unchanged — the denial is not merely cosmetic.
+    const after = await (
+      await api(tokens.eli, "GET", `/api/conversations/${convId}`)
+    ).text();
+    expect(after).not.toContain(bob.id);
+  });
+
+  it("H-1 — an owner still can", async () => {
+    // Guards against fixing the hole by breaking the feature.
+    const alice = (await searchUsers(tokens.eli, "Alice"))[0];
+    const bob = (await searchUsers(tokens.eli, "Bob"))[0];
+
+    const created = await api(tokens.eli, "POST", "/api/conversations", {
+      type: "group",
+      name: "h1-owner-canary",
+      memberIds: [alice.id],
+    });
+    const convId = (await created.json()).id;
+
+    const asOwner = await api(
+      tokens.eli,
+      "POST",
+      `/api/conversations/${convId}/members`,
+      { userIds: [bob.id] },
+    );
+    expect(asOwner.status).toBe(200);
+  });
+
+  it("H-1 — promoting a 1:1 to a group is still allowed to either side", async () => {
+    // The exemption that keeps the feature working. A direct conversation has
+    // no owner to appeal to: both participants are equal, so requiring
+    // owner/admin would mean a 1:1 could never become a group at all.
+    const alice = (await searchUsers(tokens.eli, "Alice"))[0];
+    const carlos = (await searchUsers(tokens.eli, "Carlos"))[0];
+
+    const dm = await api(tokens.eli, "POST", "/api/conversations", {
+      type: "direct",
+      memberIds: [alice.id],
+    });
+    const dmId = (await dm.json()).id;
+
+    // Alice is not the creator, so under the group rule she would be a plain
+    // member and denied.
+    const promoted = await api(
+      tokens.alice,
+      "POST",
+      `/api/conversations/${dmId}/members`,
+      { userIds: [carlos.id], name: "promoted by a non-creator" },
+    );
+    expect(promoted.status).toBe(200);
+  });
 });

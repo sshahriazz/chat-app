@@ -11,6 +11,7 @@ import {
 import { invalidateConversationMeta } from "../lib/conversation-cache";
 import { invalidateUserProfile } from "../lib/user-cache";
 import { userScopeFilter } from "../lib/scope-filter";
+import { actorFrom, authorize } from "../lib/policy-bridge";
 import { escapeLike } from "../lib/like-escape";
 import { acquireDmLock } from "../lib/dm-lock";
 import { requireTenantWide } from "../middleware/require-tenant-wide";
@@ -629,7 +630,7 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
       userId: user.id,
       conversation: { tenantId },
     },
-    include: { conversation: true },
+    include: { conversation: { include: { tenant: true } } },
   });
 
   if (!member) {
@@ -637,6 +638,34 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
   }
 
   const wasDirect = member.conversation.type === "direct";
+
+  // H-1. Adding a member used to require nothing beyond being one.
+  //
+  // `DELETE .../members/:userId` has always required owner or admin, so a
+  // plain member could not remove anyone but could add anyone. The pairing was
+  // incoherent, and it was wrong in the dangerous direction: widening a
+  // conversation's audience is the operation that needs the check, because
+  // everyone already in it is affected and none of them are asked.
+  //
+  // Promoting a direct conversation to a group is exempt. That path has no
+  // owner to appeal to — both participants are equal, and refusing it would
+  // mean a 1:1 could never become a group at all. `member:add`'s
+  // direct-conversation rule denies it, so the check runs only for groups and
+  // promotion is authorised by being in the conversation.
+  if (!wasDirect) {
+    authorize(
+      actorFrom(user.id, scope, member),
+      "member:add",
+      {
+        conversation: {
+          id,
+          type: "group",
+          fullHistoryForNewMembers:
+            member.conversation.tenant.fullHistoryForNewMembers,
+        },
+      }
+    );
+  }
   // Name only has meaning on promotion; ignored for groups (use PUT to rename).
   const promotionName = wasDirect && name?.trim() ? name.trim() : null;
 
