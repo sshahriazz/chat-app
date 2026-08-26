@@ -82,3 +82,45 @@ describe("isInlineSafeContentType", () => {
     expect(isInlineSafeContentType("application/xhtml+xml")).toBe(false);
   });
 });
+
+describe("Office and OpenDocument containers (L-8)", () => {
+  const DOCX =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  const XLSX =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  const ODT = "application/vnd.oasis.opendocument.text";
+
+  // Every one of these is a ZIP container, so PK\x03\x04 is the signature.
+  const zip = buf(0x50, 0x4b, 0x03, 0x04, 0x14, 0x00);
+
+  it("accepts a zip signature for each Office type", () => {
+    // Before this, the client had nothing truthful to declare and sent
+    // `application/zip`. The upload worked, but the stored content type was a
+    // fabrication that download disposition was then decided from.
+    for (const type of [DOCX, XLSX, ODT]) {
+      expect(bytesMatchContentType(zip, type), type).toBe(true);
+    }
+  });
+
+  it("rejects non-zip bytes declared as an Office type", () => {
+    // The check is still a real one: it proves the file is a zip container.
+    // It cannot prove a .docx is a .docx — that is the honest limit of a
+    // magic-byte test on a container format.
+    expect(bytesMatchContentType(ascii("<html>"), DOCX)).toBe(false);
+    expect(bytesMatchContentType(ascii("%PDF-1.7"), XLSX)).toBe(false);
+  });
+
+  it("maps each to the extension a human expects", () => {
+    // The object key's extension comes from the declared MIME, never the
+    // filename — so a .docx stored as application/zip was keyed `.zip`.
+    expect(extForContentType(DOCX)).toBe(".docx");
+    expect(extForContentType(XLSX)).toBe(".xlsx");
+    expect(extForContentType(ODT)).toBe(".odt");
+  });
+
+  it("never serves them inline", () => {
+    for (const type of [DOCX, XLSX, ODT]) {
+      expect(isInlineSafeContentType(type), type).toBe(false);
+    }
+  });
+});

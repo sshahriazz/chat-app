@@ -222,6 +222,23 @@ const ALLOWED_CONTENT_TYPES = [
   "text/csv",
   "application/zip",
   "application/x-zip-compressed",
+  // Office Open XML and OpenDocument.
+  //
+  // Absent from this list, the OneSuite client had nothing truthful to
+  // declare for a .docx and sent `application/zip` instead. The upload
+  // succeeded — a .docx really is a zip, so the signature check passed — but
+  // the stored content type was a fabrication, and `isInlineSafeContentType`
+  // then decided download disposition from it. Accepting the real types is
+  // the fix; making the client lie better is not.
+  //
+  // None of these are inline-safe: `isInlineSafeContentType` allows only
+  // image, video and audio, so they are always served as downloads.
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.oasis.opendocument.text",
+  "application/vnd.oasis.opendocument.spreadsheet",
+  "application/vnd.oasis.opendocument.presentation",
   "video/mp4",
   "video/webm",
   "video/quicktime",

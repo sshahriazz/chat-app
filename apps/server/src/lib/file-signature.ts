@@ -27,6 +27,18 @@ const MIME_TO_EXT: Record<string, string> = {
   "text/csv": ".csv",
   "application/zip": ".zip",
   "application/x-zip-compressed": ".zip",
+  // Office Open XML and OpenDocument. All of them are ZIP containers, which
+  // is why they were previously uploaded *as* `application/zip` — the client
+  // had no accepted type to declare. That made the stored content type a
+  // fabrication, and disposition is decided from it.
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    ".docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+    ".pptx",
+  "application/vnd.oasis.opendocument.text": ".odt",
+  "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+  "application/vnd.oasis.opendocument.presentation": ".odp",
   "video/mp4": ".mp4",
   "video/webm": ".webm",
   "video/quicktime": ".mov",
@@ -68,6 +80,21 @@ export function isInlineSafeContentType(contentType: string): boolean {
 
 type Matcher = (buf: Buffer) => boolean;
 
+/**
+ * Every Office Open XML and OpenDocument file is a ZIP archive, so the
+ * signature check for all of them is the ZIP one.
+ *
+ * This does not prove a `.docx` is a `.docx` — only that it is a zip. That is
+ * the same guarantee the previous `application/zip` declaration gave, and it
+ * is the honest limit of a magic-byte check on a container format. What
+ * changes is that the *stored* type is now what the user actually sent, so
+ * download disposition is decided from a real value rather than a placeholder.
+ */
+const isZipContainer: Matcher = (buf) =>
+  startsWith([0x50, 0x4b, 0x03, 0x04])(buf) ||
+  startsWith([0x50, 0x4b, 0x05, 0x06])(buf) ||
+  startsWith([0x50, 0x4b, 0x07, 0x08])(buf);
+
 const startsWith = (sig: number[], offset = 0): Matcher => (buf) => {
   if (buf.length < offset + sig.length) return false;
   for (let i = 0; i < sig.length; i++) {
@@ -101,10 +128,18 @@ const SIGNATURES: Record<string, Matcher | null> = {
   "application/pdf": startsWith(ascii("%PDF-")),
   "text/plain": null,
   "text/csv": null,
-  "application/zip": (buf) =>
-    startsWith([0x50, 0x4b, 0x03, 0x04])(buf) ||
-    startsWith([0x50, 0x4b, 0x05, 0x06])(buf) ||
-    startsWith([0x50, 0x4b, 0x07, 0x08])(buf),
+  // PK\x03\x04 (local file header), PK\x05\x06 (empty archive) and
+  // PK\x07\x08 (spanned). Shared by every ZIP-container format below.
+  "application/zip": isZipContainer,
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    isZipContainer,
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+    isZipContainer,
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+    isZipContainer,
+  "application/vnd.oasis.opendocument.text": isZipContainer,
+  "application/vnd.oasis.opendocument.spreadsheet": isZipContainer,
+  "application/vnd.oasis.opendocument.presentation": isZipContainer,
   "application/x-zip-compressed": (buf) =>
     startsWith([0x50, 0x4b, 0x03, 0x04])(buf) ||
     startsWith([0x50, 0x4b, 0x05, 0x06])(buf) ||
