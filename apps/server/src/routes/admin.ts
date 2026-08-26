@@ -24,14 +24,17 @@ router.post(
   "/tenants",
   validate({ body: CreateTenantBodySchema }),
   async (req, res) => {
-    const { name } = req.body as { name: string };
-    const tenant = await createTenant(name);
+    const { name, fullHistoryForNewMembers } = req.body as {
+      name: string;
+      fullHistoryForNewMembers?: boolean;
+    };
+    const tenant = await createTenant(name, { fullHistoryForNewMembers });
     // apiKey + jwtSecret are surfaced HERE and nowhere else. Caller
     // MUST persist both; re-rotation is the only recovery path.
     await writeAdminAudit(req, {
       action: "tenant.create",
       tenantId: tenant.id,
-      details: { name },
+      details: { name, fullHistoryForNewMembers: !!fullHistoryForNewMembers },
     });
     res.status(201).json(tenant);
   },

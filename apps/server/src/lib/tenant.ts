@@ -140,7 +140,10 @@ export interface CreatedTenant {
  * Create a fresh tenant with newly-generated api-key + jwt-secret.
  * Caller (admin endpoint) must surface the raw values exactly once.
  */
-export async function createTenant(name: string): Promise<CreatedTenant> {
+export async function createTenant(
+  name: string,
+  options: { fullHistoryForNewMembers?: boolean } = {}
+): Promise<CreatedTenant> {
   const apiKey = generateRandomKey();
   const jwtSecret = generateRandomKey();
   const apiKeyHash = await hashApiKey(apiKey);
@@ -151,6 +154,11 @@ export async function createTenant(name: string): Promise<CreatedTenant> {
       apiKeyHash,
       apiKeyPrefix: prefixOf(apiKey),
       jwtSecret: wrapSecret(jwtSecret),
+      // Defaults to false in the schema; only set when the caller asks, so an
+      // omitted flag can never quietly turn the fence off.
+      ...(options.fullHistoryForNewMembers
+        ? { fullHistoryForNewMembers: true }
+        : {}),
     },
     select: { id: true, name: true },
   });

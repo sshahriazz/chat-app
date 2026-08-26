@@ -406,5 +406,17 @@ export const UsersDeletedWebhookBodySchema = z
 // ─── Admin (operator → us, MASTER_API_KEY) ───────────────────
 
 export const CreateTenantBodySchema = z
-  .object({ name: z.string().min(1).max(128) })
+  .object({
+    name: z.string().min(1).max(128),
+    /**
+     * Let members read messages sent before they joined.
+     *
+     * Omitted means fenced, which is the answer that cannot leak anything by
+     * accident. A tenant only sets this when the conversations belong to an
+     * organisation rather than to their individual participants — a business's
+     * shared client thread, where a successor inherits the relationship — and
+     * it should be paired with announcing joins in-thread.
+     */
+    fullHistoryForNewMembers: z.boolean().optional(),
+  })
   .meta({ id: "CreateTenantBody" });
