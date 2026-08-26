@@ -122,6 +122,24 @@ async function searchUsers(token: string, q: string): Promise<Array<{ id: string
 
 const tokens: Record<string, string> = {};
 
+/**
+ * Resolve a demo persona's chat user id, once.
+ *
+ * `/users/search` is rate limited, and the CH-06 tests below each need the
+ * same two or three ids — enough repeat lookups to trip it and fail for a
+ * reason that has nothing to do with what is being tested.
+ */
+const userIdCache = new Map<string, string>();
+async function userIdOf(name: string): Promise<string> {
+  const cached = userIdCache.get(name);
+  if (cached) return cached;
+  const found = (await searchUsers(tokens.eli, name))[0];
+  if (!found) throw new Error(`no demo user matching ${name}`);
+  userIdCache.set(name, found.id);
+  return found.id;
+}
+
+
 const d = reachable ? describe : describe.skip;
 if (!reachable) {
   // eslint-disable-next-line no-console
@@ -327,8 +345,8 @@ d("cross-tenant / cross-scope isolation", () => {
 
   it("H-1 — a plain member cannot add anyone to a group", async () => {
     // Eli creates, so Eli is owner and Alice joins as a plain member.
-    const alice = (await searchUsers(tokens.eli, "Alice"))[0];
-    const bob = (await searchUsers(tokens.eli, "Bob"))[0];
+    const alice = { id: await userIdOf("Alice") };
+    const bob = { id: await userIdOf("Bob") };
 
     const created = await api(tokens.eli, "POST", "/api/conversations", {
       type: "group",
@@ -357,8 +375,8 @@ d("cross-tenant / cross-scope isolation", () => {
 
   it("H-1 — an owner still can", async () => {
     // Guards against fixing the hole by breaking the feature.
-    const alice = (await searchUsers(tokens.eli, "Alice"))[0];
-    const bob = (await searchUsers(tokens.eli, "Bob"))[0];
+    const alice = { id: await userIdOf("Alice") };
+    const bob = { id: await userIdOf("Bob") };
 
     const created = await api(tokens.eli, "POST", "/api/conversations", {
       type: "group",
@@ -380,8 +398,8 @@ d("cross-tenant / cross-scope isolation", () => {
     // The exemption that keeps the feature working. A direct conversation has
     // no owner to appeal to: both participants are equal, so requiring
     // owner/admin would mean a 1:1 could never become a group at all.
-    const alice = (await searchUsers(tokens.eli, "Alice"))[0];
-    const carlos = (await searchUsers(tokens.eli, "Carlos"))[0];
+    const alice = { id: await userIdOf("Alice") };
+    const carlos = { id: await userIdOf("Carlos") };
 
     const dm = await api(tokens.eli, "POST", "/api/conversations", {
       type: "direct",
@@ -398,5 +416,73 @@ d("cross-tenant / cross-scope isolation", () => {
       { userIds: [carlos.id], name: "promoted by a non-creator" },
     );
     expect(promoted.status).toBe(200);
+  });
+
+  it("H-6 — the sidebar preview never shows a message the viewer cannot open", async () => {
+    const bob = { id: await userIdOf("Bob") };
+    const alice = { id: await userIdOf("Alice") };
+    const SECRET = "h6canary-before-bob-joined";
+
+    const created = await api(tokens.eli, "POST", "/api/conversations", {
+      type: "group",
+      name: "h6-canary",
+      memberIds: [alice.id],
+    });
+    const convId = (await created.json()).id;
+
+    const sent = await api(tokens.eli, "POST", `/api/conversations/${convId}/messages`, {
+      content: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: SECRET }] }] },
+      clientMessageId: "h6-1",
+    });
+    const secretId = (await sent.json()).id;
+
+    await api(tokens.eli, "POST", `/api/conversations/${convId}/members`, {
+      userIds: [bob.id],
+    });
+
+    // Delete the "Eli added Bob" system message.
+    //
+    // This is what makes the test discriminating. Adding a member writes a
+    // system message at join time, which is newer than anything pre-join and
+    // therefore becomes the preview — masking the bug entirely. An earlier
+    // version of this test passed with the fix reverted for exactly that
+    // reason, which made it worthless.
+    //
+    // Removing it is a plausible thing to do (system noise gets tidied) and
+    // leaves the pre-join message as the newest undeleted one, which is the
+    // only state in which the leak is observable.
+    const listing = JSON.parse(
+      await (await api(tokens.eli, "GET", `/api/conversations/${convId}/messages`)).text(),
+    );
+    const systemMsg = listing.messages.find((m: any) => m.type === "system");
+    expect(systemMsg, "expected a join system message to exist").toBeTruthy();
+    const del = await api(
+      tokens.eli,
+      "DELETE",
+      `/api/conversations/${convId}/messages/${systemMsg.id}`,
+    );
+    // Asserted, not assumed. A wrong path here 404s silently and leaves the
+    // system message in place, which masks the very thing being tested — this
+    // test passed against the unfixed server twice before that was caught.
+    expect(del.status, "deleting the join system message must succeed").toBe(200);
+
+    // Now the newest undeleted message predates Bob's membership.
+    const bobListing = await (await api(tokens.bob, "GET", "/api/init?limit=50")).text();
+    expect(bobListing).toContain(convId);
+    expect(bobListing).not.toContain(SECRET);
+
+    // Controls: the message is really there, Eli can see it, and Bob is
+    // refused it through /messages too — the guarantee the preview must not
+    // quietly undercut.
+    expect(secretId).toBeTruthy();
+    const eliSees = await (
+      await api(tokens.eli, "GET", `/api/conversations/${convId}/messages`)
+    ).text();
+    expect(eliSees).toContain(SECRET);
+
+    const bobSees = await (
+      await api(tokens.bob, "GET", `/api/conversations/${convId}/messages`)
+    ).text();
+    expect(bobSees).not.toContain(SECRET);
   });
 });

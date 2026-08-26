@@ -2182,12 +2182,71 @@ async function getConversationsWithUnread(
   const hasMore = memberships.length > take;
   const pageRows = hasMore ? memberships.slice(0, take) : memberships;
 
-  const conversations = pageRows.map((m) => ({
-    ...m.conversation,
-    unreadCount: m.unreadCount,
-    muted: m.muted,
-    lastMessage: m.conversation.messages[0] ?? null,
-  }));
+  // H-6. The sidebar preview used to be the newest message, full stop — so a
+  // member received a `lastMessage` they were not permitted to open. Search
+  // had the same shape of bug (H-5), which is why the fence now lives in one
+  // helper rather than being re-derived per call site.
+  //
+  // The fence is per membership: each row has its own `joinedAt`. Prisma's
+  // nested `where` can only take literals, so it cannot express "newest
+  // message at or after *this row's* joinedAt" in the query above. Hence the
+  // repair pass below.
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    select: { fullHistoryForNewMembers: true },
+  });
+
+  const previews = new Map<string, (typeof pageRows)[number]["conversation"]["messages"][number] | null>();
+  for (const m of pageRows) {
+    previews.set(m.conversationId, m.conversation.messages[0] ?? null);
+  }
+
+  if (!tenant?.fullHistoryForNewMembers) {
+    // Only conversations whose newest message predates the viewer's join need
+    // repairing. In the common case — a member who has been there since the
+    // conversation started — this list is empty and nothing extra runs.
+    const stale = pageRows.filter((m) => {
+      const newest = m.conversation.messages[0];
+      return newest && newest.createdAt < m.joinedAt;
+    });
+
+    for (const m of stale) {
+      // Blank it first: if there is no visible message, the preview must be
+      // empty rather than the pre-join one it was showing.
+      previews.set(m.conversationId, null);
+
+      const visible = await prisma.message.findFirst({
+        where: {
+          conversationId: m.conversationId,
+          tenantId,
+          deletedAt: null,
+          createdAt: { gte: m.joinedAt },
+        },
+        orderBy: { createdAt: "desc" },
+        include: { sender: { select: { id: true, name: true } } },
+      });
+      if (visible) previews.set(m.conversationId, visible);
+    }
+  }
+
+  const conversations = pageRows.map((m) => {
+    // `messages` is dropped, not passed through. It is the raw include used to
+    // derive the preview, and spreading the conversation carried it into the
+    // response alongside the fenced `lastMessage` — so the unfenced newest
+    // message travelled anyway, one key over. Fencing `lastMessage` while
+    // leaking `messages` is not a fix, and it is exactly what the first
+    // version of this did.
+    //
+    // No client reads it: the contract exposes `lastMessage`, and
+    // `conversationSchema` has no `messages` field.
+    const { messages: _rawMessages, ...conversation } = m.conversation;
+    return {
+      ...conversation,
+      unreadCount: m.unreadCount,
+      muted: m.muted,
+      lastMessage: previews.get(m.conversationId) ?? null,
+    };
+  });
 
   const nextCursor =
     hasMore && pageRows.length > 0
