@@ -13,7 +13,8 @@ import { invalidateUserProfile } from "../lib/user-cache";
 import { userScopeFilter } from "../lib/scope-filter";
 import { actorFrom, authorize } from "../lib/policy-bridge";
 import { escapeLike } from "../lib/like-escape";
-import { acquireDmLock } from "../lib/dm-lock";
+import { acquireDmLock, acquireTenantLock } from "../lib/dm-lock";
+import type { TxClient } from "../infra/prisma";
 import { requireTenantWide } from "../middleware/require-tenant-wide";
 import { pushToUsers } from "../lib/push";
 import { redis } from "../infra/redis";
@@ -156,6 +157,57 @@ function ensureGroupCap(currentCount: number, addingCount: number): void {
   }
 }
 
+/**
+ * How many group conversations one scoped identity may belong to.
+ *
+ * Applies to scoped users only. A tenant-wide identity — staff — is in every
+ * client's room by design, so a cap on their membership count would be a cap
+ * on how many customers the business may have.
+ *
+ * For a scoped user it bounds what OneSuite calls topics per client
+ * relationship, which is the thing anyone actually wants limited: a
+ * relationship with hundreds of rooms is a filing system, not a conversation,
+ * and the sidebar stops being scannable long before the number gets silly.
+ */
+const MAX_GROUPS_PER_SCOPE = 100;
+
+/**
+ * Enforce that cap for every scoped user about to join a group.
+ *
+ * Takes the transaction so the count sees this transaction's own pending
+ * writes, and must be called under the per-tenant advisory lock — otherwise
+ * two concurrent creates both read N and both insert, which is how the
+ * previous client-side check could be beaten by two browser tabs.
+ */
+async function ensureScopeGroupCap(
+  tx: TxClient,
+  tenantId: string,
+  userIds: string[],
+): Promise<void> {
+  if (userIds.length === 0) return;
+
+  const scoped = await tx.user.findMany({
+    where: { tenantId, id: { in: userIds }, scope: { not: null } },
+    select: { id: true, name: true },
+  });
+  if (scoped.length === 0) return;
+
+  for (const u of scoped) {
+    const count = await tx.conversationMember.count({
+      where: {
+        tenantId,
+        userId: u.id,
+        conversation: { type: "group" },
+      },
+    });
+    if (count >= MAX_GROUPS_PER_SCOPE) {
+      throw new BadRequestError(
+        `${u.name} is already in the maximum of ${MAX_GROUPS_PER_SCOPE} group conversations`,
+      );
+    }
+  }
+}
+
 
 /**
  * Selects and shapes the conversation payload used by `conversation_updated`
@@ -287,6 +339,20 @@ router.post(
   let wasExisting = false;
 
   const conversation = await withRealtime(async (rt) => {
+    // H-9. The topic cap used to live in the OneSuite proxy, which called
+    // `/init` with no `limit` — so the server returned its default 50 and the
+    // count could never reach the cap of 100. The limit was dead code, topics
+    // were effectively unbounded, and it cost an extra round trip per
+    // creation.
+    //
+    // Server-side and under the per-tenant advisory lock, so two concurrent
+    // creates cannot both read the same count and both insert. That race was
+    // reachable from two browser tabs.
+    if (type === "group") {
+      await acquireTenantLock(rt.tx, tenantId, "group-cap");
+      await ensureScopeGroupCap(rt.tx, tenantId, allMemberIds);
+    }
+
     if (type === "direct") {
       // Serialize same-pair direct creates across concurrent requests.
       // The dedup check + create that follows both run under the lock,
@@ -728,6 +794,13 @@ router.post("/conversations/:id/members", requireAuth, validate({ body: AddMembe
       where: { conversationId: id },
     });
     ensureGroupCap(currentCount, newUsers.length);
+    // Same per-scope cap as creation. Adding a client to their hundredth room
+    // is the same thing as creating it, from the client's point of view.
+    await ensureScopeGroupCap(
+      rt.tx,
+      tenantId,
+      newUsers.map((u) => u.id),
+    );
 
     if (wasDirect) {
       // Promote the *other* original direct member from "member" → "admin"
