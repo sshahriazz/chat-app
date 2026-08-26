@@ -164,6 +164,24 @@ d("cross-tenant / cross-scope isolation", () => {
             : ""),
       );
     }
+    // Start from the same place every run.
+    //
+    // These tests create conversations and never removed them, so the demo
+    // personas accumulated memberships indefinitely. Harmless until
+    // `MAX_GROUPS_PER_SCOPE` landed (H-9) — then the scoped personas crossed
+    // 100 group memberships and eight tests began failing on a cap that was
+    // working exactly as intended.
+    //
+    // A suite whose result depends on how many times it has been run before
+    // is not measuring what it claims to.
+    const reset = await fetch(`${SERVER}/api/dev/reset-demo`, {
+      method: "POST",
+      headers: devHeaders,
+    });
+    if (!reset.ok) {
+      throw new Error(`reset-demo failed: ${reset.status}`);
+    }
+
     for (const [key, p] of Object.entries(PERSONAS)) {
       tokens[key] = await mint(p);
       await activate(tokens[key]);

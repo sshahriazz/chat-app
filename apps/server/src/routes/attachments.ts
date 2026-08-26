@@ -13,7 +13,10 @@ import { extForContentType, isInlineSafeContentType } from "../lib/file-signatur
 import { acquireTenantLock } from "../lib/dm-lock";
 import { generalLimiter, uploadUrlLimiter } from "../middleware/rate-limit";
 import { validate } from "../http/validate";
-import { UploadUrlBodySchema } from "../http/schemas";
+import {
+  AttachmentViewsBodySchema,
+  UploadUrlBodySchema,
+} from "../http/schemas";
 import { BadRequestError, NotFoundError, PayloadTooLargeError } from "../http/errors";
 
 const router: Router = Router();
@@ -263,6 +266,105 @@ router.post(
 // audio) get an inline-disposition URL; anything else (PDF, zip, text)
 // is signed as a forced download so it can never execute script in the
 // bucket origin.
+// POST /api/attachments/views — resolve many signed URLs in one request.
+//
+// Same authorisation as `/:id/view`, applied per attachment: linked
+// attachments need conversation membership, orphan uploads belong to their
+// uploader. What changes is the number of round trips, not who may see what.
+//
+// The per-item work was never the presigning — that is local crypto. It was
+// the request and the two queries behind it, repeated once per image in the
+// thread (M-20). Both queries are done once here for the whole batch.
+//
+// Ids that do not exist, or that this caller may not see, are simply absent
+// from the response. That is the same information a 404 gives, without
+// letting one bad id fail the other forty-nine.
+router.post(
+  "/views",
+  requireAuth,
+  generalLimiter,
+  validate({ body: AttachmentViewsBodySchema }),
+  async (req, res) => {
+    const { user, tenantId } = req as AuthenticatedRequest;
+    const { ids } = req.body as { ids: string[] };
+
+    const attachments = await prisma.attachment.findMany({
+      where: { id: { in: ids }, tenantId },
+      include: { message: { select: { conversationId: true } } },
+    });
+
+    // One membership lookup for every conversation involved, rather than one
+    // per attachment — a thread's images all belong to the same conversation,
+    // so this is usually a single row.
+    const conversationIds = Array.from(
+      new Set(
+        attachments
+          .map((a) => a.message?.conversationId)
+          .filter((c): c is string => !!c),
+      ),
+    );
+    const memberOf = new Set(
+      conversationIds.length === 0
+        ? []
+        : (
+            await prisma.conversationMember.findMany({
+              where: {
+                conversationId: { in: conversationIds },
+                userId: user.id,
+                conversation: { tenantId },
+              },
+              select: { conversationId: true },
+            })
+          ).map((m) => m.conversationId),
+    );
+
+    const results: Record<
+      string,
+      { url: string; expiresIn: number; thumbnailUrl?: string }
+    > = {};
+
+    for (const attachment of attachments) {
+      const conversationId = attachment.message?.conversationId;
+      const permitted = conversationId
+        ? memberOf.has(conversationId)
+        : attachment.uploaderId === user.id;
+      if (!permitted) continue;
+
+      const key = resolveKey(attachment);
+      if (!key) continue;
+
+      const signed = isInlineSafeContentType(attachment.contentType)
+        ? await createViewUrl({
+            key,
+            filename: attachment.filename,
+            contentType: attachment.contentType,
+          })
+        : await createDownloadUrl({
+            key,
+            filename: attachment.filename,
+            contentType: attachment.contentType,
+          });
+
+      const thumbnail = attachment.thumbnailKey
+        ? await createViewUrl({
+            key: attachment.thumbnailKey,
+            filename: attachment.filename,
+            contentType: "image/jpeg",
+          })
+        : null;
+
+      results[attachment.id] = {
+        url: signed.url,
+        expiresIn: signed.expiresIn,
+        ...(thumbnail ? { thumbnailUrl: thumbnail.url } : {}),
+      };
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ attachments: results });
+  },
+);
+
 router.get("/:id/view", requireAuth, generalLimiter, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
   const id = paramId(req);

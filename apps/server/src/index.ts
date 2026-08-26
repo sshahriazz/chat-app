@@ -21,7 +21,7 @@ import { logger } from "./infra/logger";
 import { prisma } from "./infra/prisma";
 import { redis } from "./infra/redis";
 import { requestId } from "./middleware/request-id";
-import { preAuthIpLimiter } from "./middleware/rate-limit";
+import { devIpLimiter, preAuthIpLimiter } from "./middleware/rate-limit";
 import healthRoutes from "./routes/health";
 import centrifugoRoutes from "./routes/centrifugo";
 import chatRoutes from "./routes/chat";
@@ -299,7 +299,7 @@ app.use("/api/admin", preAuthIpLimiter, express.json({ limit: "4kb" }), adminRou
 // Dev-only mint-token endpoint. Router-level middleware returns 404
 // in prod unconditionally; pre-auth limit applies in non-prod to
 // keep abuse manageable on shared staging environments.
-app.use("/api/dev", preAuthIpLimiter, express.json({ limit: "4kb" }), devRoutes);
+app.use("/api/dev", devIpLimiter, express.json({ limit: "4kb" }), devRoutes);
 // Chat catch-all registered last so more specific prefixes above match
 // first. 512 KB covers the worst-case serialized Tiptap doc (50K plain
 // chars × ~3× markup overhead) plus request-shape overhead.

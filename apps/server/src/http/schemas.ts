@@ -448,6 +448,21 @@ export const AdminGrantMembershipBodySchema = z
   })
   .meta({ id: "AdminGrantMembershipBody" });
 
+/**
+ * Resolve several attachments' signed URLs at once.
+ *
+ * Opening a thread with forty images cost forty authenticated round trips,
+ * each of which re-ran the same membership check. The work is not the
+ * presigning — that is local crypto — it is the request and the two queries
+ * behind it (M-20).
+ *
+ * Capped at 50: a page of messages cannot reference more, and an unbounded
+ * list is a way to make one request do arbitrary work.
+ */
+export const AttachmentViewsBodySchema = z
+  .object({ ids: z.array(z.string().min(1)).min(1).max(50) })
+  .meta({ id: "AttachmentViewsBody" });
+
 export const CreateTenantBodySchema = z
   .object({
     name: z.string().min(1).max(128),

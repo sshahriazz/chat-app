@@ -158,6 +158,28 @@ router.get("/personas", (_req, res) => {
   res.json({ tenants: DEMO_TENANTS });
 });
 
+// POST /api/dev/reset-demo — delete the demo tenants' conversations.
+//
+// The isolation suite creates conversations on every run and never removed
+// them, so the demo personas accumulated memberships indefinitely. That was
+// invisible until `MAX_GROUPS_PER_SCOPE` landed (H-9): the scoped personas
+// crossed 100 group memberships and eight tests began failing on a cap that
+// was working exactly as intended.
+//
+// A suite whose result depends on how many times it has been run before is
+// not measuring what it claims to. This makes each run start from the same
+// place.
+//
+// Tenants, users and their credentials survive — only conversations go, and
+// the cascade takes messages, members and attachments with them.
+router.post("/reset-demo", async (_req, res) => {
+  const tenantIds = DEMO_TENANTS.map((t) => t.tenantId);
+  const { count } = await prisma.conversation.deleteMany({
+    where: { tenantId: { in: tenantIds } },
+  });
+  res.json({ deletedConversations: count });
+});
+
 router.post("/seed-demo", async (_req, res) => {
   const results: Array<{ tenantId: string; created: boolean }> = [];
   for (const t of DEMO_TENANTS) {

@@ -171,5 +171,29 @@ export const preAuthIpLimiter = rateLimit({
     json413(res, options.windowMs),
 });
 
+/**
+ * Pre-auth limit for the dev-only router.
+ *
+ * Same purpose as `preAuthIpLimiter` — the dev router is hard-killed in
+ * production but reachable on shared staging, so abuse should still be
+ * bounded. The 60/min ceiling was set for endpoints a human hits; the
+ * isolation suite mints a token per persona and seeds and resets on every
+ * run, so two runs inside a minute exhausted it and the second failed at
+ * `seed-demo` with a 429.
+ *
+ * A test suite that fails depending on how recently it last ran teaches
+ * people to re-run it rather than read it. 300/min is still a bound, and
+ * still far below what abuse would need.
+ */
+export const devIpLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 300,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  keyGenerator: (req: Request) => ipKeyGenerator(req.ip ?? ""),
+  store: makeStore("dev"),
+  handler: (req, res, _next, options) => json413(res, options.windowMs),
+});
+
 /** Re-export so routes can apply it only when a user is authenticated. */
 export type Limiter = (req: Request, res: Response, next: NextFunction) => void;
