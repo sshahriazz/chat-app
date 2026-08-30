@@ -32,6 +32,7 @@ import {
 } from "../generated/zod/schemas/variants/pure";
 import { commonResponses, errorResponseSchema } from "./openapi-shared";
 import {
+  AttachmentViewsBodySchema,
   AddMembersBodySchema,
   CreateConversationBodySchema,
   CreateTenantBodySchema,
@@ -220,6 +221,26 @@ const signedUrlResponseSchema = z
     expiresIn: z.number().int().positive(),
   })
   .meta({ id: "SignedAttachmentUrlResponse" });
+
+/**
+ * `POST /attachments/views` — many signed URLs in one answer.
+ *
+ * Keyed by attachment id. Ids the caller may not see, or that do not exist,
+ * are simply absent: the same information a 404 gives, without letting one
+ * bad id fail the rest of the batch.
+ */
+const attachmentViewsResponseSchema = z
+  .object({
+    attachments: z.record(
+      z.string(),
+      z.object({
+        url: z.string().url(),
+        expiresIn: z.number().int().positive(),
+        thumbnailUrl: z.string().url().optional(),
+      }),
+    ),
+  })
+  .meta({ id: "AttachmentViewsResponse" });
 
 const connectionTokenResponseSchema = z
   .object({ token: z.string() })
@@ -966,6 +987,25 @@ export function buildOpenApiDocument() {
               description: "Content type not allow-listed",
               content: { "application/json": { schema: errorResponseSchema } },
             },
+            "429": commonResponses.TooManyRequests,
+          },
+        },
+      },
+      "/attachments/views": {
+        post: {
+          tags: ["Attachments"],
+          summary: "Signed URLs for many attachments",
+          description:
+            "Resolves signed URLs for up to 50 attachments in one request. Authorisation is identical to `GET /attachments/{id}/view` and applied per attachment; what changes is the number of round trips, not who may see what. Ids that do not exist or that the caller may not see are absent from the response rather than failing it.",
+          requestParams: sessionCookie,
+          requestBody: jsonBody(AttachmentViewsBodySchema),
+          responses: {
+            "200": jsonResponse(
+              "Signed URLs minted",
+              attachmentViewsResponseSchema,
+            ),
+            "400": commonResponses.BadRequest,
+            "401": commonResponses.Unauthorized,
             "429": commonResponses.TooManyRequests,
           },
         },
