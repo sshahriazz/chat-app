@@ -281,7 +281,7 @@ router.get("/init", requireAuth, async (req, res) => {
   const { user, tenantId } = req as AuthenticatedRequest;
   const limit = Number(req.query.limit) || 50;
 
-  const [page, token] = await Promise.all([
+  const [page, token, unreadAggregate] = await Promise.all([
     getConversationsWithUnread(user.id, tenantId, { limit }),
     Promise.resolve(
       // Do not include `email` — `info` is broadcast via Centrifugo
@@ -290,12 +290,24 @@ router.get("/init", requireAuth, async (req, res) => {
         name: user.name,
       }),
     ),
+    // Unread across EVERY conversation, not just the first page. A client
+    // that sums the page it was given under-reports its own badge as soon as
+    // the user has more conversations than fit in one response.
+    prisma.conversationMember.aggregate({
+      _sum: { unreadCount: true },
+      where: {
+        userId: user.id,
+        muted: false,
+        conversation: { tenantId },
+      },
+    }),
   ]);
 
   res.json({
     conversations: page.conversations,
     nextCursor: page.nextCursor,
     centrifugoToken: token,
+    totalUnread: unreadAggregate._sum.unreadCount ?? 0,
   });
 });
 
