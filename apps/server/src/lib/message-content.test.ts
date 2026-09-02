@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   canonicalizeFromJson,
+  renderToHtml,
   canonicalizeMentionLabels,
   extractMentions,
   extractPlainText,
@@ -20,6 +21,84 @@ import {
  *   - plain-text extraction stays consistent with what we persist in
  *     `plain_content` for the trigram index.
  */
+
+/**
+ * The `link` mark was deliberately disabled until link previews landed,
+ * precisely because href handling is the classic XSS vector here. It is now
+ * on with a protocol allowlist, so these lock that allowlist down.
+ */
+describe("link mark (protocol allowlist)", () => {
+  const docWithLink = (href: string) => ({
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          {
+            type: "text",
+            text: "click me",
+            marks: [{ type: "link", attrs: { href } }],
+          },
+        ],
+      },
+    ],
+  });
+
+  const hrefsIn = (html: string) =>
+    Array.from(html.matchAll(/href="([^"]*)"/g)).map((m) => m[1]);
+
+  it.each([
+    "javascript:alert(1)",
+    "JavaScript:alert(1)",
+    "  javascript:alert(1)",
+    "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+    "vbscript:msgbox(1)",
+    "file:///etc/passwd",
+  ])("strips a %s href, keeping the text", (href) => {
+    const html = renderToHtml(canonicalizeFromJson(docWithLink(href)));
+    expect(hrefsIn(html)).toEqual([]);
+    expect(html).toContain("click me");
+  });
+
+  it.each(["https://example.com/a?b=c", "http://example.com"])(
+    "keeps %s",
+    (href) => {
+      const html = renderToHtml(canonicalizeFromJson(docWithLink(href)));
+      expect(hrefsIn(html)).toEqual([href]);
+    }
+  );
+
+  it("never emits an inline event handler from link attrs", () => {
+    const html = renderToHtml(
+      canonicalizeFromJson({
+        type: "doc",
+        content: [
+          {
+            type: "paragraph",
+            content: [
+              {
+                type: "text",
+                text: "x",
+                marks: [
+                  {
+                    type: "link",
+                    attrs: {
+                      href: "https://example.com",
+                      onclick: "alert(1)",
+                      onmouseover: "alert(2)",
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      })
+    );
+    expect(html).not.toMatch(/on[a-z]+=/i);
+  });
+});
+
 
 describe("canonicalizeFromJson", () => {
   it("round-trips a minimal doc", () => {

@@ -1,6 +1,8 @@
 import { generateHTML, generateJSON } from "@tiptap/html/server";
 import StarterKit from "@tiptap/starter-kit";
 import Mention from "@tiptap/extension-mention";
+import { Highlight } from "@tiptap/extension-highlight";
+import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import type { JSONContent } from "@tiptap/core";
 
 /**
@@ -10,10 +12,22 @@ import type { JSONContent } from "@tiptap/core";
  */
 const messageExtensions = [
   StarterKit.configure({
-    // `link` is intentionally off — adds href-validation attack surface
-    // (javascript:, data:, open-redirect) and we don't have link previews.
-    link: false,
+    // Links allowed with a hard protocol allowlist — anything but http(s)
+    // (javascript:, data:, vbscript:, file:) is rejected at canonicalization
+    // and the mark is stripped. Rendering clients add rel/noopener on top.
+    link: {
+      openOnClick: false,
+      autolink: false,
+      protocols: ["http", "https"],
+      shouldAutoLink: () => false,
+      isAllowedUri: (url: string) => /^https?:\/\//i.test(url),
+    },
   }),
+  Highlight.configure({ multicolor: true }),
+  Table,
+  TableRow,
+  TableCell,
+  TableHeader,
   Mention.configure({
     HTMLAttributes: { class: "mention" },
   }),
