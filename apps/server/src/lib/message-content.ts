@@ -3,6 +3,7 @@ import StarterKit from "@tiptap/starter-kit";
 import Mention from "@tiptap/extension-mention";
 import { Highlight } from "@tiptap/extension-highlight";
 import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
+import { TextAlign } from "@tiptap/extension-text-align";
 import type { JSONContent } from "@tiptap/core";
 
 /**
@@ -28,6 +29,10 @@ const messageExtensions = [
   TableRow,
   TableCell,
   TableHeader,
+  // Must mirror the composer: an attribute the schema does not know about is
+  // dropped at canonicalization, so alignment set while typing would vanish
+  // the moment the message was saved.
+  TextAlign.configure({ types: ["heading", "paragraph"] }),
   Mention.configure({
     HTMLAttributes: { class: "mention" },
   }),

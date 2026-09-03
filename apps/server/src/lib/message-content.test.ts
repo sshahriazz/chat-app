@@ -27,6 +27,54 @@ import {
  * precisely because href handling is the classic XSS vector here. It is now
  * on with a protocol allowlist, so these lock that allowlist down.
  */
+describe("table + alignment round-trip", () => {
+  const cellDoc = (align?: string) => ({
+    type: "doc",
+    content: [
+      {
+        type: "table",
+        content: [
+          {
+            type: "tableRow",
+            content: [
+              {
+                type: "tableHeader",
+                content: [
+                  {
+                    type: "paragraph",
+                    ...(align ? { attrs: { textAlign: align } } : {}),
+                    content: [{ type: "text", text: "Header" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  it("keeps a header cell's alignment through canonicalization", () => {
+    // The composer sets this attribute; a schema that does not declare it
+    // silently drops it, so alignment chosen while typing disappears on save.
+    const html = renderToHtml(canonicalizeFromJson(cellDoc("right")));
+    expect(html).toContain("<th");
+    expect(html).toMatch(/text-align:\s*right/);
+  });
+
+  it("leaves an unaligned cell alone", () => {
+    const html = renderToHtml(canonicalizeFromJson(cellDoc()));
+    expect(html).toContain("<th");
+    expect(html).not.toMatch(/text-align:\s*(left|right|center)/);
+  });
+
+  it("rejects an alignment value outside the allowed set", () => {
+    const html = renderToHtml(canonicalizeFromJson(cellDoc("justify-all-wrong")));
+    expect(html).not.toContain("justify-all-wrong");
+  });
+});
+
+
 describe("link mark (protocol allowlist)", () => {
   const docWithLink = (href: string) => ({
     type: "doc",

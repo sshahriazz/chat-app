@@ -275,6 +275,37 @@ async function broadcastToConversation(
   await centrifugo.broadcast(channels, data, { idempotencyKey });
 }
 
+// ─── Unread summary ──────────────────────────────────────────
+//
+// Deliberately narrower than /init: no conversation payload and no
+// Centrifugo token, just the two numbers a nav badge needs. Callers that
+// only want to know "is there anything waiting" (the client portal's
+// Messages tab, for instance) should not have to pull a page of
+// conversations and mint a realtime token to find out.
+
+router.get("/unread-summary", requireAuth, async (req, res) => {
+  const { user, tenantId } = req as AuthenticatedRequest;
+
+  // Muted conversations are excluded from both numbers, matching what the
+  // in-app badges already show — a muted thread should not light up a tab.
+  const rows = await prisma.conversationMember.findMany({
+    where: {
+      userId: user.id,
+      muted: false,
+      unreadCount: { gt: 0 },
+      conversation: { tenantId },
+    },
+    select: { unreadCount: true },
+  });
+
+  res.json({
+    // How many threads are waiting.
+    conversationsWithUnread: rows.length,
+    // How many messages are waiting across all of them.
+    totalUnread: rows.reduce((sum, row) => sum + row.unreadCount, 0),
+  });
+});
+
 // ─── Init (single call on app startup) ───────────────────────
 
 router.get("/init", requireAuth, async (req, res) => {
