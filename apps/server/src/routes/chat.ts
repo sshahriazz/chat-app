@@ -2073,6 +2073,12 @@ router.post("/conversations/:id/messages/:messageId/reactions", requireAuth, rea
         type: "reaction_added",
         conversationId: id,
         messageId,
+        // The author travels with the event so a client can tell whether the
+        // reaction landed on ITS message without holding that message in
+        // memory — reactions on a thread you don't currently have open are
+        // exactly the case worth notifying, and there the message is not
+        // loaded.
+        messageSenderId: message.senderId,
         reaction: {
           id: r.id,
           emoji: r.emoji,

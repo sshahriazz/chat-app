@@ -185,6 +185,8 @@ export interface ReactionAddedEvent {
   type: "reaction_added";
   conversationId: string;
   messageId: string;
+  /** Author of the reacted message. Optional: older servers omit it. */
+  messageSenderId?: string;
   reaction: { id: string; emoji: string; userId: string; userName: string };
 }
 
