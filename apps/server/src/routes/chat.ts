@@ -295,7 +295,11 @@ router.get("/unread-summary", requireAuth, async (req, res) => {
       unreadCount: { gt: 0 },
       conversation: { tenantId },
     },
-    select: { unreadCount: true },
+    select: {
+      unreadCount: true,
+      conversationId: true,
+      conversation: { select: { name: true, type: true } },
+    },
   });
 
   res.json({
@@ -303,6 +307,19 @@ router.get("/unread-summary", requireAuth, async (req, res) => {
     conversationsWithUnread: rows.length,
     // How many messages are waiting across all of them.
     totalUnread: rows.reduce((sum, row) => sum + row.unreadCount, 0),
+    // The per-thread breakdown behind those two numbers, so a badge can say
+    // WHICH conversations are waiting rather than only how many. Capped and
+    // ordered by weight — this backs a hover summary, not a second inbox.
+    conversations: rows
+      .slice()
+      .sort((a, b) => b.unreadCount - a.unreadCount)
+      .slice(0, 8)
+      .map((row) => ({
+        id: row.conversationId,
+        name: row.conversation?.name ?? null,
+        type: row.conversation?.type ?? "group",
+        unreadCount: row.unreadCount,
+      })),
   });
 });
 
